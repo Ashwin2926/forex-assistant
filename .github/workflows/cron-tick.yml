@@ -1,0 +1,15 @@
+name: cron-tick
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit /cron/tick
+        run: |
+          curl -sf -X POST https://forex-assistant.fastapicloud.dev/cron/tick \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"

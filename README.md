@@ -41,6 +41,53 @@ uvicorn app.main:app --reload
 ```
 Server runs at `http://localhost:8000`. Interactive API docs at `http://localhost:8000/docs`.
 
+## Deploying (FastAPI Cloud)
+
+FastAPI Cloud reads dependencies from `pyproject.toml` when present (`requirements.txt`
+is kept too, for local `pip install -r requirements.txt`). The entrypoint is pinned via
+`[tool.fastapi] entrypoint = "app.main:app"` so FastAPI Cloud always finds the app
+regardless of auto-detection.
+
+```bash
+pip install fastapi-cloud-cli   # or: pip install "fastapi[standard]"
+fastapi login
+fastapi deploy
+```
+
+Before deploying, sanity-check the entrypoint locally with `fastapi dev` (no args) — if
+that boots the app, `fastapi deploy` will find it too. Set `MONGODB_URI`,
+`TWELVE_DATA_API_KEY`, etc. (see `.env.example`) as environment variables/secrets in the
+FastAPI Cloud project settings — `.env` files aren't uploaded.
+
+### Free (Hobby) tier: scale-to-zero and the scheduler
+
+The Hobby plan scales the app to zero when idle, which kills the in-process APScheduler
+job (`auto_ingest_and_score`, normally running every 15 min) between requests — nothing
+is left running to fire on schedule. Fix:
+
+1. Set `ENABLE_SCHEDULER=false` and `CRON_SECRET=<a random secret>` in the FastAPI Cloud
+   project's environment variables.
+2. Point an external scheduler at `POST /cron/tick` (with header `X-Cron-Secret: <same
+   secret>`) every ~15 minutes — this both wakes the app from scale-to-zero *and* runs
+   the same ingest-then-score cycle the internal job used to. A free GitHub Actions cron
+   works well:
+
+   ```yaml
+   # .github/workflows/cron-tick.yml
+   on:
+     schedule:
+       - cron: "*/15 * * * *"
+   jobs:
+     tick:
+       runs-on: ubuntu-latest
+       steps:
+         - run: |
+             curl -X POST https://<your-app>.fastapicloud.app/cron/tick \
+               -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"
+   ```
+
+   Add `CRON_SECRET` as a matching repo secret (same value as step 1).
+
 ## Using it
 
 **Step 1 — pull historical data** (need 200+ candles for EMA200 to be meaningful):

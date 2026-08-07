@@ -1,5 +1,5 @@
 import logging
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from typing import Optional
@@ -36,21 +36,29 @@ SCHEDULER_INTERVAL_MINUTES = 15
 scheduler = AsyncIOScheduler()
 
 
-async def auto_ingest_and_score():
+async def auto_ingest_and_score() -> dict:
     """Keeps candle data fresh and resolves pending live signals against it — the two
     halves of live outcome scoring only work together (scoring has nothing to check
-    without fresh candles arriving)."""
+    without fresh candles arriving). Called by the in-process scheduler when
+    ENABLE_SCHEDULER=true, and directly by POST /cron/tick for hosts (e.g. FastAPI
+    Cloud free tier) where nothing keeps the process alive to run a schedule itself."""
+    ingest_results = {}
     for interval in AUTO_INTERVALS:
         for pair in settings.pairs_list:
+            key = f"{pair}/{interval}"
             try:
-                await fetch_and_store(pair, interval, output_size=5)
+                count = await fetch_and_store(pair, interval, output_size=5)
+                ingest_results[key] = f"{count} candles stored"
             except Exception as e:
-                logger.warning(f"auto-ingest failed for {pair}/{interval}: {e}")
+                logger.warning(f"auto-ingest failed for {key}: {e}")
+                ingest_results[key] = f"error: {e}"
     try:
         tally = await score_pending_signals()
         logger.info(f"auto-score: {tally}")
     except Exception as e:
         logger.warning(f"auto-score failed: {e}")
+        tally = {"error": str(e)}
+    return {"ingest": ingest_results, "score": tally}
 
 # Default grid for /backtest/optimize when no configs are supplied — covers the knobs
 # backtesting has actually shown to matter (EMA responsiveness, RSI sensitivity, and
@@ -84,20 +92,42 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await init_indexes()
-    scheduler.add_job(
-        auto_ingest_and_score, "interval", minutes=SCHEDULER_INTERVAL_MINUTES, id="auto_ingest_and_score",
-    )
-    scheduler.start()
+    if settings.enable_scheduler:
+        scheduler.add_job(
+            auto_ingest_and_score, "interval", minutes=SCHEDULER_INTERVAL_MINUTES, id="auto_ingest_and_score",
+        )
+        scheduler.start()
+    else:
+        logger.info("ENABLE_SCHEDULER=false — skipping in-process scheduler; drive POST /cron/tick externally.")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    scheduler.shutdown(wait=False)
+    if settings.enable_scheduler:
+        scheduler.shutdown(wait=False)
 
 
 @app.get("/")
 async def root():
     return {"status": "ok", "pairs": settings.pairs_list}
+
+
+@app.post("/cron/tick")
+async def cron_tick(x_cron_secret: str = Header(default="")):
+    """
+    Runs the same ingest-then-score cycle as the in-process scheduler, for hosts where
+    nothing keeps the app alive between requests to run a schedule itself (e.g. FastAPI
+    Cloud's free tier, which scales to zero on idle) — point an external scheduler
+    (GitHub Actions cron, cron-job.org, etc.) at this every ~15 minutes instead.
+
+    Requires CRON_SECRET to be set and passed back via the X-Cron-Secret header — each
+    call spends Twelve Data quota, so this can't be left open to anyone who finds the URL.
+    """
+    if not settings.cron_secret:
+        raise HTTPException(status_code=503, detail="CRON_SECRET is not configured on this server.")
+    if x_cron_secret != settings.cron_secret:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Cron-Secret header.")
+    return await auto_ingest_and_score()
 
 
 @app.post("/ingest/{interval}")

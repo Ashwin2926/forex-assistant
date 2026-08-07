@@ -17,6 +17,16 @@ class Settings(BaseSettings):
     deriv_app_id: str = "1089"
     deriv_api_token: str = ""
 
+    # Ingestion/scoring scheduling. The in-process APScheduler job (ENABLE_SCHEDULER=true)
+    # only works on a host that stays alive between requests — it's useless on FastAPI
+    # Cloud's free tier, which scales the app to zero on idle and kills any in-memory job.
+    # Set ENABLE_SCHEDULER=false there and drive POST /cron/tick from an external scheduler
+    # instead (e.g. GitHub Actions cron) so a request actually arrives on a schedule.
+    # CRON_SECRET guards that endpoint from being triggered by anyone who finds the URL —
+    # each ingest call spends Twelve Data quota, so it can't be left open.
+    enable_scheduler: bool = True
+    cron_secret: str = ""
+
     @property
     def pairs_list(self) -> list[str]:
         return [p.strip() for p in self.forex_pairs.split(",")]

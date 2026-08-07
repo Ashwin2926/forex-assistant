@@ -1,0 +1,38 @@
+[project]
+name = "forex-assistant"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi[standard]==0.115.0",
+    "uvicorn==0.30.6",
+    "motor==3.6.0",
+    "pymongo==4.9.1",
+    "pydantic==2.9.2",
+    "pydantic-settings==2.5.2",
+    "httpx==0.27.2",
+    "pandas==2.2.3",
+    "numpy==2.1.1",
+    "python-dotenv==1.0.1",
+    "apscheduler==3.10.4",
+    "python_deriv_api==0.1.6",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Repo root also holds frontend/ (a Next.js app) alongside app/ (this backend) —
+# without this, setuptools' flat-layout auto-discovery finds both top-level
+# directories and refuses to guess which one is the package.
+include = ["app*"]
+
+[tool.fastapi]
+entrypoint = "app.main:app"
+
+[tool.uv]
+# python_deriv_api==0.1.6 hard-pins websockets==10.3, which conflicts with
+# fastapi[standard]'s uvicorn[standard] (needs websockets>=10.4). Force the
+# minimum version uvicorn requires — a patch bump python_deriv_api's plain
+# websocket-client usage is expected to tolerate.
+override-dependencies = ["websockets==10.4"]
