@@ -171,5 +171,5 @@ export interface CandlePoint {
 }
 
 export const PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"] as const;
-export const INTERVALS = ["5min", "15min", "1h", "4h", "1day"] as const;
+export const INTERVALS = ["5min", "10min", "15min", "1h", "4h", "1day"] as const;
 export const PROFILES: Profile[] = ["intraday", "swing"];

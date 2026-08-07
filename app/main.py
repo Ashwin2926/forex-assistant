@@ -1,7 +1,9 @@
 import logging
+from datetime import datetime
 from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from typing import Optional
 import pandas as pd
 
@@ -14,8 +16,8 @@ from app.core.database import (
     backtest_runs_collection,
     paper_trades_collection,
 )
-from app.models.schemas import RuleConfig
-from app.services.data_fetcher import fetch_and_store
+from app.models.schemas import RuleConfig, Signal
+from app.services.data_fetcher import fetch_and_store, build_synthetic_10min
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for
 from app.services.backtester import run_backtest
@@ -27,38 +29,130 @@ logger = logging.getLogger("forex_assistant.scheduler")
 settings = get_settings()
 app = FastAPI(title="Forex Trading Assistant")
 
-# Intervals kept fresh automatically — matches the two backtested profiles (intraday/15min,
-# swing/1h). 4 pairs x 2 intervals every 15 minutes is 32 Twelve Data calls/hour (~768/day
-# if run continuously) — close to the 800/day free-tier ceiling; widen SCHEDULER_INTERVAL_MINUTES
-# or trim AUTO_INTERVALS if you're also hitting /ingest manually.
-AUTO_INTERVALS = ["15min", "1h"]
+# Each profile's own validated timeframes (see signal_engine.PROFILE_DEFAULTS for why —
+# intraday's RuleConfig was backtested on 15min, swing's on 1h). 10min has no native Twelve
+# Data feed and is built from 5min candles instead (see build_synthetic_10min).
+PROFILE_INTERVALS: dict[str, list[str]] = {
+    "intraday": ["5min", "10min", "15min"],
+    "swing": ["1h", "4h", "1day"],
+}
+AUTO_INTERVALS = [i for intervals in PROFILE_INTERVALS.values() for i in intervals]
+
+# Ticks land on wall-clock :00/:15/:30/:45 (GitHub Actions cron, and the in-process
+# scheduler below via CronTrigger) — each interval is only re-fetched as often as a new
+# candle for it can actually exist. Fetching every interval every tick would blow past
+# Twelve Data's 800 calls/day free-tier ceiling (4 pairs x 6 intervals x 96 ticks/day is
+# ~2300/day); this schedule keeps total volume to roughly 700/day. output_size gives each
+# interval enough padding to catch up if a tick is skipped or delayed, without overfetching.
+AUTO_OUTPUT_SIZE = {"5min": 8, "15min": 5, "1h": 3, "4h": 2, "1day": 2}
+
+
+def _due_now(interval: str, now: datetime) -> bool:
+    if interval == "15min":
+        return True
+    if interval == "5min":
+        return now.minute in (0, 30)
+    if interval == "1h":
+        return now.minute == 0
+    if interval == "4h":
+        return now.minute == 0 and now.hour % 4 == 0
+    if interval == "1day":
+        return now.minute == 0 and now.hour == 0
+    return False
+
+
 SCHEDULER_INTERVAL_MINUTES = 15
 scheduler = AsyncIOScheduler()
 
 
+async def _generate_and_store_signal(
+    pair: str, interval: str, profile: str, config: RuleConfig,
+    target_atr_mult: Optional[float] = None, stop_atr_mult: Optional[float] = None,
+) -> Signal:
+    """
+    Shared by POST /signals/{interval}/{profile} (one-off, manual) and the auto-ingest
+    cycle below (every pair/interval/profile, every tick) so both paths compute a signal
+    identically — a live trade's setup should never depend on which caller triggered it.
+    Raises ValueError if there isn't enough candle history yet.
+    """
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
+    docs = await cursor.to_list(length=500)
+
+    min_needed = config.ema_slow
+    if len(docs) < min_needed:
+        raise ValueError(
+            f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for the slow EMA "
+            f"({profile} profile). Run /ingest/{interval} first."
+        )
+
+    df = pd.DataFrame(docs)
+    signal = generate_signal(df, pair, interval, profile, config)
+
+    if signal.direction in ("BUY", "SELL"):
+        atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+        signal.target_price, signal.stop_price = compute_atr_target_stop(
+            signal.price_at_signal, atr_val, signal.direction,
+            target_atr_mult if target_atr_mult is not None else config.target_atr_mult,
+            stop_atr_mult if stop_atr_mult is not None else config.stop_atr_mult,
+        )
+
+    await signals_collection.insert_one(signal.model_dump())
+    return signal
+
+
 async def auto_ingest_and_score() -> dict:
-    """Keeps candle data fresh and resolves pending live signals against it — the two
-    halves of live outcome scoring only work together (scoring has nothing to check
-    without fresh candles arriving). Called by the in-process scheduler when
-    ENABLE_SCHEDULER=true, and directly by POST /cron/tick for hosts (e.g. FastAPI
-    Cloud free tier) where nothing keeps the process alive to run a schedule itself."""
+    """Keeps candle data fresh, generates a signal for every pair/interval/profile
+    combination, and resolves pending live signals against newly-arrived candles — the
+    full live cycle that used to require a manual "Generate signal" click per pair, now
+    run automatically. Called by the in-process scheduler when ENABLE_SCHEDULER=true, and
+    directly by POST /cron/tick for hosts (e.g. FastAPI Cloud free tier) where nothing
+    keeps the process alive to run a schedule itself."""
+    now = datetime.utcnow()
     ingest_results = {}
     for interval in AUTO_INTERVALS:
+        if interval == "10min" or not _due_now(interval, now):
+            continue
         for pair in settings.pairs_list:
             key = f"{pair}/{interval}"
             try:
-                count = await fetch_and_store(pair, interval, output_size=5)
+                count = await fetch_and_store(pair, interval, output_size=AUTO_OUTPUT_SIZE[interval])
                 ingest_results[key] = f"{count} candles stored"
             except Exception as e:
                 logger.warning(f"auto-ingest failed for {key}: {e}")
                 ingest_results[key] = f"error: {e}"
+
+    if _due_now("5min", now):
+        for pair in settings.pairs_list:
+            key = f"{pair}/10min"
+            try:
+                count = await build_synthetic_10min(pair)
+                ingest_results[key] = f"{count} candles stored (synthetic)"
+            except Exception as e:
+                logger.warning(f"synthetic 10min build failed for {pair}: {e}")
+                ingest_results[key] = f"error: {e}"
+
+    signal_results = {}
+    for profile, intervals in PROFILE_INTERVALS.items():
+        config = default_config_for(profile)
+        for interval in intervals:
+            for pair in settings.pairs_list:
+                key = f"{pair}/{interval}/{profile}"
+                try:
+                    signal = await _generate_and_store_signal(pair, interval, profile, config)
+                    signal_results[key] = signal.direction
+                except ValueError as e:
+                    signal_results[key] = f"skipped: {e}"
+                except Exception as e:
+                    logger.warning(f"auto-signal failed for {key}: {e}")
+                    signal_results[key] = f"error: {e}"
+
     try:
         tally = await score_pending_signals()
         logger.info(f"auto-score: {tally}")
     except Exception as e:
         logger.warning(f"auto-score failed: {e}")
         tally = {"error": str(e)}
-    return {"ingest": ingest_results, "score": tally}
+    return {"ingest": ingest_results, "signals": signal_results, "score": tally}
 
 # Default grid for /backtest/optimize when no configs are supplied — covers the knobs
 # backtesting has actually shown to matter (EMA responsiveness, RSI sensitivity, and
@@ -93,8 +187,11 @@ app.add_middleware(
 async def startup():
     await init_indexes()
     if settings.enable_scheduler:
+        # CronTrigger (not an interval trigger) so ticks land on wall-clock :00/:15/:30/:45 —
+        # _due_now's per-interval cadence gating assumes that alignment, same as the external
+        # GitHub Actions cron hitting POST /cron/tick.
         scheduler.add_job(
-            auto_ingest_and_score, "interval", minutes=SCHEDULER_INTERVAL_MINUTES, id="auto_ingest_and_score",
+            auto_ingest_and_score, CronTrigger(minute=f"*/{SCHEDULER_INTERVAL_MINUTES}"), id="auto_ingest_and_score",
         )
         scheduler.start()
     else:
@@ -134,15 +231,22 @@ async def cron_tick(x_cron_secret: str = Header(default="")):
 async def ingest(interval: str, output_size: int = 300):
     """
     Pull latest candles for all configured pairs at the given interval.
-    interval: '5min', '15min', '1h', '4h', '1day'
+    interval: '5min', '10min', '15min', '1h', '4h', '1day'
     output_size: candles to fetch per pair (Twelve Data allows up to 5000 on the free tier).
     Backtest optimization (train/test split) needs more history than a single live signal
     does — raise this when you want a meaningful split, e.g. ?output_size=2000.
+
+    interval='10min' is synthetic (no native Twelve Data feed) — built from already-stored
+    5min candles instead of fetched, so run /ingest/5min first if 5min history is thin;
+    output_size is ignored for it (bounded by 5min history already on hand).
     """
     results = {}
     for pair in settings.pairs_list:
         try:
-            count = await fetch_and_store(pair, interval, output_size=output_size)
+            if interval == "10min":
+                count = await build_synthetic_10min(pair, lookback=output_size)
+            else:
+                count = await fetch_and_store(pair, interval, output_size=output_size)
             results[pair] = f"{count} candles stored"
         except Exception as e:
             results[pair] = f"error: {e}"
@@ -167,32 +271,10 @@ async def create_signal(
     values (RuleConfig.target_atr_mult/stop_atr_mult — see signal_engine.PROFILE_DEFAULTS).
     """
     config = default_config_for(profile)
-    cursor = candles_collection.find(
-        {"pair": pair, "interval": interval}
-    ).sort("timestamp", 1)
-    docs = await cursor.to_list(length=500)
-
-    min_needed = config.ema_slow
-    if len(docs) < min_needed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for the slow EMA "
-                    f"({profile} profile). Run /ingest/{interval} first."
-        )
-
-    df = pd.DataFrame(docs)
-    signal = generate_signal(df, pair, interval, profile, config)
-
-    if signal.direction in ("BUY", "SELL"):
-        atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
-        signal.target_price, signal.stop_price = compute_atr_target_stop(
-            signal.price_at_signal, atr_val, signal.direction,
-            target_atr_mult if target_atr_mult is not None else config.target_atr_mult,
-            stop_atr_mult if stop_atr_mult is not None else config.stop_atr_mult,
-        )
-
-    await signals_collection.insert_one(signal.model_dump())
-    return signal
+    try:
+        return await _generate_and_store_signal(pair, interval, profile, config, target_atr_mult, stop_atr_mult)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/signals")

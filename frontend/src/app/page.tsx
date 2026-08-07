@@ -97,8 +97,12 @@ export default function SignalFeedPage() {
     setGeneratingAll(true);
     setActionMessage(null);
     const combos: { interval: string; profile: Profile }[] = [
-      { interval: "1h", profile: "swing" },
+      { interval: "5min", profile: "intraday" },
+      { interval: "10min", profile: "intraday" },
       { interval: "15min", profile: "intraday" },
+      { interval: "1h", profile: "swing" },
+      { interval: "4h", profile: "swing" },
+      { interval: "1day", profile: "swing" },
     ];
     const jobs = PAIRS.flatMap((pair) => combos.map((c) => ({ pair, ...c })));
     const results: string[] = [];
@@ -185,9 +189,9 @@ export default function SignalFeedPage() {
             onClick={handleGenerateAll}
             disabled={busy !== null || generatingAll}
             className="btn-secondary"
-            title="Generates a signal for every pair, both profiles (8 total) — ingest candles first if you haven't."
+            title="Generates a signal for every pair across each profile's natural timeframes (24 total) — ingest candles first if you haven't."
           >
-            {generatingAll ? "Generating all…" : "Generate all (8)"}
+            {generatingAll ? "Generating all…" : "Generate all (24)"}
           </button>
         </div>
         {generateAllProgress && (

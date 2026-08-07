@@ -69,8 +69,9 @@ is left running to fire on schedule. Fix:
    project's environment variables.
 2. Point an external scheduler at `POST /cron/tick` (with header `X-Cron-Secret: <same
    secret>`) every ~15 minutes — this both wakes the app from scale-to-zero *and* runs
-   the same ingest-then-score cycle the internal job used to. A free GitHub Actions cron
-   works well:
+   the full live cycle: ingest fresh candles (per-interval cadence, see below), generate a
+   signal for every pair/interval/profile combination, then score pending signals against
+   whatever candles arrived. A free GitHub Actions cron works well:
 
    ```yaml
    # .github/workflows/cron-tick.yml
@@ -361,10 +362,15 @@ frontend/            # Next.js dashboard (signal feed + live accuracy, chart, ba
 - The Backtesting page's "Optimize" UI runs the default grid (now includes both target/stop
   ratios, EMA/RSI variations) — it still has no input for a fully custom `configs` JSON
   body, so an exhaustive search still needs curl (see "Intraday vs swing" above)
-- The scheduler (`AUTO_INTERVALS`/`SCHEDULER_INTERVAL_MINUTES` in `main.py`) ingests all 4
-  pairs x 2 intervals every 15 minutes by default — ~768 Twelve Data calls/day if run
-  continuously, close to the free tier's 800/day ceiling. Widen the interval if you're also
-  calling `/ingest` manually elsewhere
+- The scheduler (`PROFILE_INTERVALS`/`_due_now` in `main.py`) ingests all 4 pairs across
+  6 intervals (5min/10min/15min for intraday, 1h/4h/1day for swing) every 15-minute tick,
+  each on its own cadence (`_due_now`) so total volume stays ~700 Twelve Data calls/day —
+  close to the free tier's 800/day ceiling. 10min is synthetic (built from 5min, no extra
+  calls). Widen the cadence in `_due_now` if you're also calling `/ingest` manually
+  elsewhere. New intervals (5min/10min/4h/1day) need a one-time backfill via
+  `/ingest/{interval}?output_size=...` before signals can generate — the auto-ingest
+  cadence only keeps them fresh, it doesn't build up the `ema_slow`-length history a
+  first signal needs
 - No auth/rate-limiting on any endpoint — fine for local dev, not for exposing this publicly
 
 ## Disclaimer
