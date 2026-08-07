@@ -1,0 +1,20 @@
+# env / secrets
+.env
+.env.local
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# node (frontend has its own, kept as belt-and-suspenders)
+node_modules/
+.next/
+out/
+
+# editor / tooling
+.claude/
+.vscode/

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "stock-analysis": {
+      "source": "gracefullight/stock-checker",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/stock-analysis/SKILL.md",
+      "computedHash": "095b89fb6c8ed3c5a01803f18749997ae3c8efbaa938637ebc694f8594ef4b6e"
+    },
+    "trading-signal": {
+      "source": "binance/binance-skills-hub",
+      "sourceType": "github",
+      "skillPath": "skills/binance-web3/trading-signal/SKILL.md",
+      "computedHash": "ab9ce2059f0007cc0195d331cb58cda14484a48ab8130d1aebc01b4dd696087b"
+    },
+    "trading-strategies": {
+      "source": "agentmc15/polymarket-trader",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/trading-strategies/SKILL.md",
+      "computedHash": "6e1f4ba1ad82ef825935bb3821eee699b7e6cd75f33214cae894ac2aaa3d8fb9"
+    }
+  }
+}

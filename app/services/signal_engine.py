@@ -1,0 +1,265 @@
+import pandas as pd
+from datetime import datetime
+from typing import Optional
+from app.models.schemas import Signal, SignalReason, RuleConfig
+from app.services.indicators import add_all_indicators
+
+
+def apply_rules(
+    latest: pd.Series, prev: pd.Series, config: RuleConfig = RuleConfig()
+) -> tuple[list[SignalReason], int, int, int, dict[str, str]]:
+    """
+    Core rule logic, isolated from indicator computation and dataframe slicing so
+    both the live engine and the backtester evaluate the exact same decision code
+    against a row of already-computed indicators. Returns (reasons, bullish_votes,
+    bearish_votes, total_rules, rule_votes) where rule_votes maps each rule that
+    fired to the direction ("BUY"/"SELL") it voted for — used by the backtester to
+    score which specific rules were pulling their weight vs. dead weight.
+    """
+    reasons: list[SignalReason] = []
+    rule_votes: dict[str, str] = {}
+    bullish_votes = 0
+    bearish_votes = 0
+    total_rules = 0
+
+    # Rule 1: Trend - price vs fast/slow EMA
+    total_rules += 1
+    if latest["ema_fast"] > latest["ema_slow"]:
+        bullish_votes += 1
+        rule_votes["trend_ema"] = "BUY"
+        reasons.append(SignalReason(
+            rule="trend_ema", passed=True,
+            detail=f"EMA{config.ema_fast} ({latest['ema_fast']:.5f}) above EMA{config.ema_slow} "
+                   f"({latest['ema_slow']:.5f}) — uptrend context"
+        ))
+    elif latest["ema_fast"] < latest["ema_slow"]:
+        bearish_votes += 1
+        rule_votes["trend_ema"] = "SELL"
+        reasons.append(SignalReason(
+            rule="trend_ema", passed=True,
+            detail=f"EMA{config.ema_fast} ({latest['ema_fast']:.5f}) below EMA{config.ema_slow} "
+                   f"({latest['ema_slow']:.5f}) — downtrend context"
+        ))
+    else:
+        reasons.append(SignalReason(rule="trend_ema", passed=False, detail="EMAs flat, no clear trend"))
+
+    # Rule 2: Momentum - RSI
+    total_rules += 1
+    if latest["rsi"] < config.rsi_oversold:
+        bullish_votes += 1
+        rule_votes["rsi_oversold"] = "BUY"
+        reasons.append(SignalReason(
+            rule="rsi_oversold", passed=True,
+            detail=f"RSI at {latest['rsi']:.1f} — oversold, potential bounce"
+        ))
+    elif latest["rsi"] > config.rsi_overbought:
+        bearish_votes += 1
+        rule_votes["rsi_overbought"] = "SELL"
+        reasons.append(SignalReason(
+            rule="rsi_overbought", passed=True,
+            detail=f"RSI at {latest['rsi']:.1f} — overbought, potential pullback"
+        ))
+    else:
+        reasons.append(SignalReason(
+            rule="rsi_neutral", passed=False, detail=f"RSI at {latest['rsi']:.1f} — no extreme"
+        ))
+
+    # Rule 3: MACD crossover
+    total_rules += 1
+    macd_cross_up = prev["macd"] <= prev["macd_signal"] and latest["macd"] > latest["macd_signal"]
+    macd_cross_down = prev["macd"] >= prev["macd_signal"] and latest["macd"] < latest["macd_signal"]
+    if macd_cross_up:
+        bullish_votes += 1
+        rule_votes["macd_cross"] = "BUY"
+        reasons.append(SignalReason(rule="macd_cross", passed=True, detail="MACD crossed above signal line"))
+    elif macd_cross_down:
+        bearish_votes += 1
+        rule_votes["macd_cross"] = "SELL"
+        reasons.append(SignalReason(rule="macd_cross", passed=True, detail="MACD crossed below signal line"))
+    else:
+        reasons.append(SignalReason(rule="macd_cross", passed=False, detail="No recent MACD crossover"))
+
+    # Rule 4: Volatility filter - skip signals when ATR indicates dead market
+    atr_pct = (latest["atr"] / latest["close"]) * 100
+    volatility_ok = atr_pct > config.volatility_threshold_pct
+    reasons.append(SignalReason(
+        rule="volatility_filter", passed=volatility_ok,
+        detail=f"ATR is {atr_pct:.4f}% of price — {'sufficient' if volatility_ok else 'too low, likely illiquid session'}"
+    ))
+
+    # Rule 5: Session filter (intraday only) - skip signals outside the highest-liquidity
+    # window. Not a vote — like volatility_filter, a failure here forces HOLD regardless
+    # of what rules 1-3 say. Swing profile leaves this disabled and always passes.
+    session_ok = True
+    if config.session_filter_enabled:
+        hour = pd.Timestamp(latest["timestamp"]).hour
+        session_ok = config.session_start_hour_utc <= hour < config.session_end_hour_utc
+        reasons.append(SignalReason(
+            rule="session_filter", passed=session_ok,
+            detail=f"{hour:02d}:00 UTC — {'within' if session_ok else 'outside'} the "
+                   f"{config.session_start_hour_utc:02d}:00-{config.session_end_hour_utc:02d}:00 UTC window"
+        ))
+
+    return reasons, bullish_votes, bearish_votes, total_rules, rule_votes
+
+
+def decide(bullish_votes: int, bearish_votes: int, total_rules: int, gate_ok: bool) -> tuple[str, float]:
+    """
+    Turn rule votes into a direction + confidence. gate_ok combines every pass/fail
+    gating condition (volatility_filter and, for intraday, session_filter) — if any
+    gate fails, force HOLD regardless of vote counts. Shared by live engine and backtester.
+    """
+    confidence = round((max(bullish_votes, bearish_votes) / total_rules) * 100, 1)
+
+    if not gate_ok:
+        return "HOLD", 0.0
+    elif bullish_votes > bearish_votes:
+        return "BUY", confidence
+    elif bearish_votes > bullish_votes:
+        return "SELL", confidence
+    else:
+        return "HOLD", confidence
+
+
+def compute_atr_target_stop(
+    entry_price: float, atr: float, direction: str, target_atr_mult: float = 1.5, stop_atr_mult: float = 1.0
+) -> tuple[float, float]:
+    """
+    Shared by the backtester and any live execution path (paper trading) so a
+    BUY/SELL signal's target/stop are always derived the same way regardless of
+    where it's used — a live trade's risk parameters should never drift from
+    what was actually backtested.
+    """
+    if direction == "BUY":
+        return entry_price + target_atr_mult * atr, entry_price - stop_atr_mult * atr
+    elif direction == "SELL":
+        return entry_price - target_atr_mult * atr, entry_price + stop_atr_mult * atr
+    raise ValueError(f"No target/stop for direction={direction!r}; only BUY/SELL have one.")
+
+
+def label_outcome(
+    future_candles: pd.DataFrame, direction: str, target_price: float, stop_price: float, max_lookforward: int,
+) -> tuple[str, Optional[float], Optional[datetime], Optional[int]]:
+    """
+    Walk forward through future_candles (strictly after the signal, ascending by timestamp)
+    checking for target/stop hit. Shared by the backtester (which always has the full
+    max_lookforward window available, since it's replaying fixed history) and live outcome
+    scoring (which may only have a handful of real candles so far and needs to know whether
+    to keep waiting).
+
+    Returns (status, outcome_price, outcome_timestamp, candles_to_outcome):
+      "hit" / "miss"   — target or stop touched; outcome_price is that level exactly.
+      "expired"        — max_lookforward candles passed with neither touched; outcome_price
+                          is the close of the max_lookforward-th candle.
+      "pending"        — fewer than max_lookforward candles available yet and neither has
+                          been touched — caller should check again once more data arrives.
+
+    If a single candle's range contains both target and stop, it's counted as a miss —
+    OHLC data alone can't tell us which was touched first intra-candle, so we assume the
+    worse outcome rather than the optimistic one.
+    """
+    for j, (_, candle) in enumerate(future_candles.iterrows(), start=1):
+        if j > max_lookforward:
+            break
+        if direction == "BUY":
+            stop_hit = candle["low"] <= stop_price
+            target_hit = candle["high"] >= target_price
+        else:
+            stop_hit = candle["high"] >= stop_price
+            target_hit = candle["low"] <= target_price
+
+        if stop_hit:
+            return "miss", stop_price, candle["timestamp"], j
+        elif target_hit:
+            return "hit", target_price, candle["timestamp"], j
+
+    if len(future_candles) >= max_lookforward:
+        final_candle = future_candles.iloc[max_lookforward - 1]
+        return "expired", float(final_candle["close"]), final_candle["timestamp"], max_lookforward
+
+    return "pending", None, None, None
+
+
+def generate_signal(
+    df: pd.DataFrame, pair: str, interval: str, profile: str, config: RuleConfig = RuleConfig()
+) -> Signal:
+    """
+    Rule-based signal generation. Fully deterministic and explainable -
+    every decision is logged as a SignalReason so you can audit *why*
+    a signal fired, and later score whether it was right.
+
+    df: OHLCV dataframe, ascending by timestamp, at least config.ema_slow rows for the
+    slow EMA to be meaningful.
+    """
+    df = add_all_indicators(df, config)
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    reasons, bullish_votes, bearish_votes, total_rules, _rule_votes = apply_rules(latest, prev, config)
+    volatility_ok = next(r.passed for r in reasons if r.rule == "volatility_filter")
+    session_ok = next((r.passed for r in reasons if r.rule == "session_filter"), True)
+    direction, confidence = decide(bullish_votes, bearish_votes, total_rules, volatility_ok and session_ok)
+
+    return Signal(
+        pair=pair,
+        profile=profile,
+        interval=interval,
+        timestamp=datetime.utcnow(),
+        direction=direction,
+        confidence=confidence,
+        reasons=reasons,
+        price_at_signal=float(latest["close"]),
+    )
+
+
+# Per-profile defaults, validated (not guessed) via /backtest/optimize with a train/test
+# split — see README "Intraday vs swing" for the numbers. Re-run optimize and update these
+# if the ruleset changes or a wider candle sample tells a different story; don't hand-edit
+# them back to a guess.
+#
+# intraday: cross-pair validated on 15min data, 5000 candles/pair (all 4 majors) — an
+# earlier pass on only 2000 candles/pair had picked EMA 12/26 based on EUR/USD alone and
+# didn't hold up cross-pair (see README "Intraday vs swing" for that history). With enough
+# data, all four pairs converge on EMA 9/21 + session filter (12:00-16:00 UTC) + a tighter
+# volatility_threshold_pct=0.02, each clearly beating swing's ~30% baseline with a believable
+# 4-6pt train->test drop: EUR/USD 37.9%/32.4%, GBP/USD 44.6%/38.6%, USD/JPY 41.9%/37.7%,
+# AUD/USD 37.4%/31.3%.
+# swing: EUR/USD 1h, 1780 candles — EMA 50/200 (hit-rate winner) still won on hit_rate_pct,
+# but adding expectancy_pct (mean pct_move per signal, not just win/loss-bucket averages)
+# revealed the ORIGINAL target_atr_mult=1.5/stop_atr_mult=1.0 was negative-expectancy on
+# every single grid candidate, on every pair — a 29-31% hit-rate looks plausible in
+# isolation but is well under the 40% breakeven that ratio requires (stop/(target+stop)).
+# target/stop themselves are now RuleConfig fields (not fixed endpoint params) specifically
+# so /backtest/optimize can search them. Sweeping found target=0.5/stop=1.25 (a much closer
+# target, a more generous stop) as a real, cross-pair-validated improvement: EUR/USD went
+# clearly positive (train +0.0024%/test +0.0051%, 486 test signals), GBP/USD went from
+# -0.004% to roughly breakeven (-0.0001%/+0.0002%), USD/JPY improved but stayed negative
+# (-0.0072%/-0.0046% — consistent both sides, a real pair-specific shortfall, not noise),
+# AUD/USD showed a train/test sign flip (+0.007%/-0.0032%) — the same overfitting signature
+# as the earlier intraday lesson, so don't fully trust that pair's number. Net: strictly
+# better than the original 1.5/1.0 (negative everywhere) on every pair, genuinely profitable
+# on EUR/USD, but swing is not uniformly profitable across all four pairs yet — per-pair
+# target/stop tuning is a real, still-open gap, not a solved problem.
+PROFILE_DEFAULTS: dict[str, RuleConfig] = {
+    "intraday": RuleConfig(
+        ema_fast=9,
+        ema_slow=21,
+        rsi_period=14,
+        atr_period=14,
+        volatility_threshold_pct=0.02,
+        session_filter_enabled=True,
+        session_start_hour_utc=12,
+        session_end_hour_utc=16,
+        # target_atr_mult/stop_atr_mult left at RuleConfig's own 1.5/1.0 default — already
+        # modestly positive and consistent (train +0.0005%/test +0.0002%, no sign flip on
+        # EUR/USD), unlike swing this didn't need retuning.
+    ),
+    "swing": RuleConfig(
+        target_atr_mult=0.5,
+        stop_atr_mult=1.25,
+    ),
+}
+
+
+def default_config_for(profile: str) -> RuleConfig:
+    return PROFILE_DEFAULTS.get(profile, RuleConfig())
