@@ -75,7 +75,7 @@ DEFAULT_OPTIMIZE_GRID = [
 # Local Next.js dev server needs to call this API directly from the browser.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "https://forex-assistant-five.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
