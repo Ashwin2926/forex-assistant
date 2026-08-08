@@ -370,16 +370,33 @@ frontend/            # Next.js dashboard (signal feed + live accuracy, chart, ba
 ```
 
 ## What's next (not built yet)
-- Per-pair swing tuning (target/stop, then EMA/RSI) is done for all four pairs — see
-  "Per-pair swing target/stop tuning" and its "EMA/RSI tuning" follow-up above. EUR/USD
-  is genuinely profitable (0.75/1.25, EMA 50/200). GBP/USD (0.75/1.5) and USD/JPY
-  (EMA 10/50, RSI 25/75, 0.75/2.0) are both still net-negative even at their own best
-  found config — narrower than before, not solved. AUD/USD has no override at all: every
-  candidate tried across two full grid rounds (target/stop, then EMA/RSI) flipped sign
-  between train and test. Remaining ideas not yet tried: MACD period tuning (untouched
-  by either grid so far), a volatility_threshold_pct sweep for swing (intraday's default
-  was retuned, swing's never was), or accepting that AUD/USD swing may not have an edge
-  in this rule set at all rather than continuing to search for one
+
+Current state after two rounds of per-pair swing tuning (see "Per-pair swing target/stop
+tuning" and its "EMA/RSI tuning" follow-up above): EUR/USD is genuinely profitable
+(0.75/1.25, EMA 50/200). GBP/USD (0.75/1.5) and USD/JPY (EMA 10/50, RSI 25/75, 0.75/2.0)
+are both still net-negative even at their own best found config — narrower than before,
+not solved. AUD/USD has no override at all: every candidate tried across two full grid
+rounds (target/stop, then EMA/RSI) flipped sign between train and test.
+
+Next steps, roughly in order:
+1. **MACD period tuning for swing** — untouched by both grid rounds so far (only
+   EMA/RSI/target/stop were searched). Candidate for GBP/USD, USD/JPY, and AUD/USD
+   specifically, using the same train/test-with-sign-check discipline as rounds 1-2 —
+   reject any winner that flips sign on test, same as EUR/USD's and GBP/USD's EMA
+   candidates were rejected this round.
+2. **`volatility_threshold_pct` sweep for swing** — intraday's default was retuned
+   (0.02) during its own validation pass; swing has never had this searched at all and
+   still runs on `RuleConfig`'s untouched default.
+3. **Re-evaluate AUD/USD after (1) and (2)** — if MACD and volatility tuning also
+   produce only sign-flipped "winners," that's real evidence swing may not have an edge
+   for this pair in this rule set at all, not just an under-searched grid. Worth
+   accepting that conclusion rather than continuing to search indefinitely.
+4. **Revisit ML only after (1)-(3)** — decided against ML for now in favor of
+   exhausting the rule-based search space first (the rule engine's failure modes — small
+   samples, train/test sign flips — are easy to see and reason about; a model's failure
+   modes usually aren't). Once MACD and volatility tuning are done, that's the point
+   where diminishing returns from grid search would make revisiting the ML question
+   actually informed rather than premature.
 - The Backtesting page's "Optimize" UI runs the default grid (now includes both target/stop
   ratios, EMA/RSI variations) — it still has no input for a fully custom `configs` JSON
   body, so an exhaustive search still needs curl (see "Intraday vs swing" above)
