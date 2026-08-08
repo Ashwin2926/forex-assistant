@@ -1,6 +1,6 @@
 import type { BacktestRun, CandlePoint, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RuleConfig, Signal, SignalAccuracy } from "./types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant-five.vercel.app";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
 
 class ApiError extends Error {
   constructor(
