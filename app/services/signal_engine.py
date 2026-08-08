@@ -260,6 +260,31 @@ PROFILE_DEFAULTS: dict[str, RuleConfig] = {
     ),
 }
 
+# Per-pair swing target/stop overrides, closing the gap the global 0.5/1.25 default left
+# open (see README "Per-pair swing target/stop tuning"). Found via /backtest/optimize with
+# a target/stop-only grid (EMA 50/200 held fixed) on ~2500-2700 candles/pair train slice,
+# 1h, train_frac=0.7. Only overriding where train and test *agree in sign* — a pair whose
+# best train candidate flips sign on the untouched test slice is the same overfitting
+# signature already documented for AUD/USD's intraday result, and is not trustworthy just
+# because one slice looks good:
+#   EUR/USD 0.75/1.25 — train +0.0025%/test +0.0037% (2518/1260 signals): real improvement,
+#     same sign, better than the 0.5/1.25 global default's +0.0006% here.
+#   GBP/USD 0.75/1.5  — train -0.0002%/test -0.0012% (2564/1133 signals): still negative,
+#     but consistent and less negative than the global default's -0.0046% here.
+#   USD/JPY 0.5/2.0   — train -0.0074%/test -0.0023% (2566/1151 signals): still negative,
+#     but consistent and meaningfully better than the global default's -0.0123% here.
+# AUD/USD deliberately has no override: its best train candidate (1.0/1.25, -0.0023%)
+# flipped positive on test (+0.0021%, 2681/1249 signals) — a sign flip, not a validated
+# improvement — so it stays on the global 0.5/1.25 default rather than chasing that noise.
+SWING_PAIR_OVERRIDES: dict[str, dict] = {
+    "EUR/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.25},
+    "GBP/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.5},
+    "USD/JPY": {"target_atr_mult": 0.5, "stop_atr_mult": 2.0},
+}
 
-def default_config_for(profile: str) -> RuleConfig:
-    return PROFILE_DEFAULTS.get(profile, RuleConfig())
+
+def default_config_for(profile: str, pair: Optional[str] = None) -> RuleConfig:
+    config = PROFILE_DEFAULTS.get(profile, RuleConfig())
+    if profile == "swing" and pair in SWING_PAIR_OVERRIDES:
+        config = config.model_copy(update=SWING_PAIR_OVERRIDES[pair])
+    return config

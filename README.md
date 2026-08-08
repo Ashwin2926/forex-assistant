@@ -255,6 +255,37 @@ tuning for swing is a real, still-open gap**, same as intraday's history — thi
 the "every candidate is doomed by the same bad ratio" bug, it doesn't claim swing is
 uniformly profitable now.
 
+### Per-pair swing target/stop tuning
+
+The gap above — one global target/stop ratio applied to every pair — is now closed for
+three of four pairs. Re-ingested to ~2500-2700 1h candles/pair (Twelve Data's actual
+free-tier ceiling for 1h history, not a deliberate choice) and ran `/backtest/optimize`
+per pair with a target/stop-only grid (13 candidates spanning 0.25-1.0x target, 1.0-2.0x
+stop; EMA held at swing's 50/200), `train_frac=0.7`:
+
+| Pair | Winner | Train | Test | vs. global 0.5/1.25 default (train) |
+|---|---|---|---|---|
+| EUR/USD | 0.75/1.25 | +0.0025% (2518 signals) | **+0.0037%** (1260 signals) | +0.0006% |
+| GBP/USD | 0.75/1.5 | -0.0002% (2564 signals) | -0.0012% (1133 signals) | -0.0046% |
+| USD/JPY | 0.5/2.0 | -0.0074% (2566 signals) | -0.0023% (1151 signals) | -0.0123% |
+| AUD/USD | *(no override — see below)* | — | — | -0.0047% |
+
+EUR/USD, GBP/USD, and USD/JPY all got a same-sign train→test result strictly better than
+the shared default, so `signal_engine.SWING_PAIR_OVERRIDES` now applies each pair's own
+winner instead of the one-size-fits-all 0.5/1.25 — `default_config_for(profile, pair)`
+looks up the override when `profile="swing"` and the pair has one. GBP/USD and USD/JPY are
+**still net-negative** even at their own best ratio; the override just makes them less bad,
+it doesn't make them profitable. USD/JPY in particular remains a real pair-specific
+shortfall that target/stop tuning alone doesn't fix — it likely needs its own EMA/RSI
+tuning too, which this grid didn't search (out of scope for this pass; see "What's next").
+
+AUD/USD deliberately keeps the global default. Its best train candidate (1.0/1.25) scored
+-0.0023% on train but **flipped to +0.0021% on test** — the identical train→test
+sign-flip signature already seen for AUD/USD's intraday result above. Adopting it would
+mean picking a config because it happened to win on one slice of history, exactly the
+failure mode this project's own optimize/train-test split exists to catch. Per-pair tuning
+for AUD/USD stays an open gap rather than papering over it with an untrustworthy number.
+
 **How that intraday default was actually reached — including a mistake worth keeping.** The
 first pass (EUR/USD only, 2000 15min candles) found EMA 12/26 + session filter looking great
 (40.0% train / 45.2% test) and it went straight into `PROFILE_DEFAULTS`. Checking the other
@@ -308,9 +339,12 @@ frontend/            # Next.js dashboard (signal feed + live accuracy, chart, ba
 ```
 
 ## What's next (not built yet)
-- Per-pair swing target/stop tuning — USD/JPY stays expectancy-negative even after the fix,
-  and AUD/USD's result is overfit-flagged (train→test sign flip); a single global swing
-  default doesn't fit every pair, same conclusion the intraday history already reached
+- Per-pair swing target/stop tuning is done for EUR/USD, GBP/USD, and USD/JPY (see
+  "Per-pair swing target/stop tuning" above) — but GBP/USD and USD/JPY are still
+  expectancy-negative even at their own best ratio, and AUD/USD has no override at all
+  (its best candidate was overfit-flagged, train→test sign flip). Next step for the
+  still-negative pairs is likely EMA/RSI tuning per pair, not just target/stop — this
+  pass only searched target/stop and held EMA at 50/200 for all four pairs
 - The Backtesting page's "Optimize" UI runs the default grid (now includes both target/stop
   ratios, EMA/RSI variations) — it still has no input for a fully custom `configs` JSON
   body, so an exhaustive search still needs curl (see "Intraday vs swing" above)

@@ -136,7 +136,7 @@ async def create_signal(
     target_atr_mult/stop_atr_mult: explicit override; omit to use that profile's config
     values (RuleConfig.target_atr_mult/stop_atr_mult — see signal_engine.PROFILE_DEFAULTS).
     """
-    config = default_config_for(profile)
+    config = default_config_for(profile, pair)
     cursor = candles_collection.find(
         {"pair": pair, "interval": interval}
     ).sort("timestamp", 1)
@@ -228,7 +228,7 @@ async def get_candles(interval: str, pair: str, profile: str = "swing", limit: i
     by timestamp. Indicators need config.ema_slow rows of preceding history to be
     meaningful; the earliest rows in a short result may show as null for that reason.
     """
-    config = default_config_for(profile)
+    config = default_config_for(profile, pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
     if not docs:
@@ -276,7 +276,7 @@ async def backtest(
     cutoffs) — omit to use that profile's default RuleConfig (see signal_engine.PROFILE_DEFAULTS).
     For comparing several configs against the same data in one call, use /backtest/sweep instead.
     """
-    config = config or default_config_for(profile)
+    config = config or default_config_for(profile, pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
     docs = await cursor.to_list(length=None)
 
@@ -577,7 +577,7 @@ async def paper_trade(
     target_atr_mult/stop_atr_mult: explicit override — omit to use the profile's own
     config values.
     """
-    config = default_config_for(profile)
+    config = default_config_for(profile, pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
     docs = await cursor.to_list(length=500)
 
