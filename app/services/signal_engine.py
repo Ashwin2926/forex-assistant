@@ -260,26 +260,51 @@ PROFILE_DEFAULTS: dict[str, RuleConfig] = {
     ),
 }
 
-# Per-pair swing target/stop overrides, closing the gap the global 0.5/1.25 default left
-# open (see README "Per-pair swing target/stop tuning"). Found via /backtest/optimize with
-# a target/stop-only grid (EMA 50/200 held fixed) on ~2500-2700 candles/pair train slice,
-# 1h, train_frac=0.7. Only overriding where train and test *agree in sign* — a pair whose
-# best train candidate flips sign on the untouched test slice is the same overfitting
-# signature already documented for AUD/USD's intraday result, and is not trustworthy just
-# because one slice looks good:
+# Per-pair swing overrides, closing the gap the global 0.5/1.25 default left open (see
+# README "Per-pair swing target/stop tuning"). Found via /backtest/optimize on
+# ~2500-2700 candles/pair, 1h, train_frac=0.7. Only overriding where train and test
+# *agree in sign* — a pair whose best train candidate flips sign on the untouched test
+# slice is the same overfitting signature already documented for AUD/USD's intraday
+# result, and is not trustworthy just because one slice looks good.
+#
+# Round 1 (target/stop only, EMA 50/200 held fixed):
 #   EUR/USD 0.75/1.25 — train +0.0025%/test +0.0037% (2518/1260 signals): real improvement,
 #     same sign, better than the 0.5/1.25 global default's +0.0006% here.
 #   GBP/USD 0.75/1.5  — train -0.0002%/test -0.0012% (2564/1133 signals): still negative,
 #     but consistent and less negative than the global default's -0.0046% here.
 #   USD/JPY 0.5/2.0   — train -0.0074%/test -0.0023% (2566/1151 signals): still negative,
 #     but consistent and meaningfully better than the global default's -0.0123% here.
-# AUD/USD deliberately has no override: its best train candidate (1.0/1.25, -0.0023%)
+# AUD/USD had no override after round 1: its best train candidate (1.0/1.25, -0.0023%)
 # flipped positive on test (+0.0021%, 2681/1249 signals) — a sign flip, not a validated
-# improvement — so it stays on the global 0.5/1.25 default rather than chasing that noise.
+# improvement.
+#
+# Round 2 (EMA x RSI grid, each pair's round-1 target/stop held fixed): tested 9
+# combinations (EMA 50/200, 20/100, 10/50 x RSI 30/70, 25/75, 35/65) per pair.
+#   EUR/USD's best (EMA 20/100) flipped sign: train +0.0045%/test -0.0016% — rejected,
+#     kept EMA 50/200.
+#   GBP/USD's best (EMA 10/50, RSI 35/65) flipped sign: train +0.0017%/test -0.0053% —
+#     rejected, kept EMA 50/200.
+#   AUD/USD's best was just the unmodified global default re-evaluated (EMA 50/200,
+#     RSI 30/70) and still flipped sign (train -0.0047%/test +0.0033%) — still no
+#     override, same open gap as round 1.
+#   USD/JPY's best (EMA 10/50, RSI 25/75) held sign: train -0.0045%/test -0.0011%
+#     (2709/1160 signals) — a real improvement over round 1's -0.0074%/-0.0023%, so
+#     re-ran a target/stop refinement under this new EMA/RSI (round 3 below) instead of
+#     stopping here.
+#
+# Round 3 (USD/JPY only — target/stop refined under its new EMA 10/50 + RSI 25/75):
+#   0.75/2.0 won: train -0.0030%/test -0.0014% (2709/1160 signals) — same sign, the best
+#   result found for USD/JPY across all three rounds. Still net-negative — this is a
+#   real, still-open pair-specific shortfall, not a solved problem — but each round made
+#   it measurably less bad without ever trusting a sign-flipped "winner."
 SWING_PAIR_OVERRIDES: dict[str, dict] = {
     "EUR/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.25},
     "GBP/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.5},
-    "USD/JPY": {"target_atr_mult": 0.5, "stop_atr_mult": 2.0},
+    "USD/JPY": {
+        "ema_fast": 10, "ema_slow": 50,
+        "rsi_oversold": 25, "rsi_overbought": 75,
+        "target_atr_mult": 0.75, "stop_atr_mult": 2.0,
+    },
 }
 
 

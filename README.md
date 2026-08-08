@@ -286,6 +286,37 @@ mean picking a config because it happened to win on one slice of history, exactl
 failure mode this project's own optimize/train-test split exists to catch. Per-pair tuning
 for AUD/USD stays an open gap rather than papering over it with an untrustworthy number.
 
+**Follow-up: EMA/RSI tuning for the pairs still net-negative.** The table above only
+searched target/stop, holding EMA at swing's structural 50/200 — flagged above as
+"likely needs its own EMA/RSI tuning too." Ran a second grid (EMA 50/200 / 20/100 / 10/50
+x RSI 30/70 / 25/75 / 35/65, 9 combinations, each pair's own target/stop from the table
+above held fixed) to check:
+
+| Pair | Best candidate | Train | Test | Verdict |
+|---|---|---|---|---|
+| EUR/USD | EMA 20/100 | +0.0045% | -0.0016% | **Sign flip — rejected**, kept EMA 50/200 |
+| GBP/USD | EMA 10/50, RSI 35/65 | +0.0017% | -0.0053% | **Sign flip — rejected**, kept EMA 50/200 |
+| USD/JPY | EMA 10/50, RSI 25/75 | -0.0045% | -0.0011% | Same sign, real improvement — kept |
+| AUD/USD | EMA 50/200 (i.e. unchanged) | -0.0047% | +0.0033% | **Sign flip — still no override** |
+
+Three of four candidates looked *better on train* than the config already in production —
+and three of four would have been the wrong call, because the improvement didn't survive
+the untouched test slice. Only USD/JPY's held its sign, so it's the only pair that got an
+EMA/RSI change. With its target/stop (0.5/2.0) now stale for the new EMA/RSI, re-ran the
+target/stop grid once more under EMA 10/50 + RSI 25/75:
+
+| Round | Config | Train | Test |
+|---|---|---|---|
+| 1 (target/stop only, EMA 50/200) | 0.5/2.0 | -0.0074% | -0.0023% |
+| 2 (+ EMA 10/50, RSI 25/75, same target/stop) | 0.5/2.0 | -0.0045% | -0.0011% |
+| 3 (target/stop re-tuned for new EMA/RSI) | **0.75/2.0** | **-0.0030%** | **-0.0014%** |
+
+USD/JPY is still net-negative — three rounds of honest tuning narrowed it from -0.0123%
+to -0.0030% (train) without ever adopting a sign-flipped "winner," but didn't flip it
+profitable. That's the expected outcome, not a failure of the method: some pairs may
+simply not have an edge in this rule set, and a train/test split whose whole purpose is
+to reject overfit "improvements" should occasionally do exactly that.
+
 **How that intraday default was actually reached — including a mistake worth keeping.** The
 first pass (EUR/USD only, 2000 15min candles) found EMA 12/26 + session filter looking great
 (40.0% train / 45.2% test) and it went straight into `PROFILE_DEFAULTS`. Checking the other
@@ -339,12 +370,16 @@ frontend/            # Next.js dashboard (signal feed + live accuracy, chart, ba
 ```
 
 ## What's next (not built yet)
-- Per-pair swing target/stop tuning is done for EUR/USD, GBP/USD, and USD/JPY (see
-  "Per-pair swing target/stop tuning" above) — but GBP/USD and USD/JPY are still
-  expectancy-negative even at their own best ratio, and AUD/USD has no override at all
-  (its best candidate was overfit-flagged, train→test sign flip). Next step for the
-  still-negative pairs is likely EMA/RSI tuning per pair, not just target/stop — this
-  pass only searched target/stop and held EMA at 50/200 for all four pairs
+- Per-pair swing tuning (target/stop, then EMA/RSI) is done for all four pairs — see
+  "Per-pair swing target/stop tuning" and its "EMA/RSI tuning" follow-up above. EUR/USD
+  is genuinely profitable (0.75/1.25, EMA 50/200). GBP/USD (0.75/1.5) and USD/JPY
+  (EMA 10/50, RSI 25/75, 0.75/2.0) are both still net-negative even at their own best
+  found config — narrower than before, not solved. AUD/USD has no override at all: every
+  candidate tried across two full grid rounds (target/stop, then EMA/RSI) flipped sign
+  between train and test. Remaining ideas not yet tried: MACD period tuning (untouched
+  by either grid so far), a volatility_threshold_pct sweep for swing (intraday's default
+  was retuned, swing's never was), or accepting that AUD/USD swing may not have an edge
+  in this rule set at all rather than continuing to search for one
 - The Backtesting page's "Optimize" UI runs the default grid (now includes both target/stop
   ratios, EMA/RSI variations) — it still has no input for a fully custom `configs` JSON
   body, so an exhaustive search still needs curl (see "Intraday vs swing" above)
