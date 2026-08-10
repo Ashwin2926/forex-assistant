@@ -1,0 +1,25 @@
+name: Keep candle data fresh
+
+# Replaces the in-process APScheduler job that used to run inside the FastAPI Cloud
+# app (see app/main.py history). That approach silently stopped working whenever the
+# instance scaled to zero between requests — the scheduler dies with the process and
+# only resumes on the next cold start, so candle data could go stale for days without
+# any error being raised. Driving ingestion from here instead means it runs on a
+# schedule GitHub controls, independent of whether the backend instance is asleep.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ingest-and-score:
+    runs-on: ubuntu-latest
+    env:
+      API_BASE: https://forex-assistant.fastapicloud.dev
+    steps:
+      - name: Ingest 15min candles
+        run: curl -sf -X POST "$API_BASE/ingest/15min?output_size=5"
+      - name: Ingest 1h candles
+        run: curl -sf -X POST "$API_BASE/ingest/1h?output_size=5"
+      - name: Score pending live signals
+        run: curl -sf -X POST "$API_BASE/signals/score"

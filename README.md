@@ -400,10 +400,13 @@ Next steps, roughly in order:
 - The Backtesting page's "Optimize" UI runs the default grid (now includes both target/stop
   ratios, EMA/RSI variations) — it still has no input for a fully custom `configs` JSON
   body, so an exhaustive search still needs curl (see "Intraday vs swing" above)
-- The scheduler (`AUTO_INTERVALS`/`SCHEDULER_INTERVAL_MINUTES` in `main.py`) ingests all 4
-  pairs x 2 intervals every 15 minutes by default — ~768 Twelve Data calls/day if run
-  continuously, close to the free tier's 800/day ceiling. Widen the interval if you're also
-  calling `/ingest` manually elsewhere
+- Ingestion runs via `.github/workflows/keep-fresh.yml`, a GitHub Actions cron every 15
+  minutes hitting `/ingest/15min`, `/ingest/1h`, and `/signals/score` for all 4 pairs —
+  ~768 Twelve Data calls/day if run continuously, close to the free tier's 800/day
+  ceiling. Widen the cron interval if you're also calling `/ingest` manually elsewhere.
+  (This used to be an in-process APScheduler job in `main.py`; moved out because it
+  silently stopped running whenever the FastAPI Cloud instance scaled to zero between
+  requests — the scheduler died with the process and never resumed on its own.)
 - No auth/rate-limiting on any endpoint — fine for local dev, not for exposing this publicly
 
 ## Disclaimer

@@ -9,5 +9,4 @@ httpx==0.27.2
 pandas==2.2.3
 numpy==2.1.1
 python-dotenv==1.0.1
-apscheduler==3.10.4
 python_deriv_api==0.1.6

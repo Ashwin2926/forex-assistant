@@ -1,7 +1,5 @@
-import logging
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from typing import Optional
 import pandas as pd
 
@@ -23,34 +21,8 @@ from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import score_pending_signals
 
-logger = logging.getLogger("forex_assistant.scheduler")
 settings = get_settings()
 app = FastAPI(title="Forex Trading Assistant")
-
-# Intervals kept fresh automatically — matches the two backtested profiles (intraday/15min,
-# swing/1h). 4 pairs x 2 intervals every 15 minutes is 32 Twelve Data calls/hour (~768/day
-# if run continuously) — close to the 800/day free-tier ceiling; widen SCHEDULER_INTERVAL_MINUTES
-# or trim AUTO_INTERVALS if you're also hitting /ingest manually.
-AUTO_INTERVALS = ["15min", "1h"]
-SCHEDULER_INTERVAL_MINUTES = 15
-scheduler = AsyncIOScheduler()
-
-
-async def auto_ingest_and_score():
-    """Keeps candle data fresh and resolves pending live signals against it — the two
-    halves of live outcome scoring only work together (scoring has nothing to check
-    without fresh candles arriving)."""
-    for interval in AUTO_INTERVALS:
-        for pair in settings.pairs_list:
-            try:
-                await fetch_and_store(pair, interval, output_size=5)
-            except Exception as e:
-                logger.warning(f"auto-ingest failed for {pair}/{interval}: {e}")
-    try:
-        tally = await score_pending_signals()
-        logger.info(f"auto-score: {tally}")
-    except Exception as e:
-        logger.warning(f"auto-score failed: {e}")
 
 # Default grid for /backtest/optimize when no configs are supplied — covers the knobs
 # backtesting has actually shown to matter (EMA responsiveness, RSI sensitivity, and
@@ -84,15 +56,6 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await init_indexes()
-    scheduler.add_job(
-        auto_ingest_and_score, "interval", minutes=SCHEDULER_INTERVAL_MINUTES, id="auto_ingest_and_score",
-    )
-    scheduler.start()
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    scheduler.shutdown(wait=False)
 
 
 @app.get("/")
@@ -197,8 +160,8 @@ async def score_signals(max_lookforward: int = 20):
     Checks every pending live signal against candles that have arrived since it fired,
     resolving status to hit/miss/expired wherever enough real data now exists — the live
     equivalent of what the backtester does against fixed history. Run this after each
-    /ingest so newly-arrived candles get checked; the scheduler does both automatically
-    (see startup()), this is for triggering it on demand.
+    /ingest so newly-arrived candles get checked; the .github/workflows/keep-fresh.yml
+    cron does both automatically every 15 minutes, this is for triggering it on demand.
     """
     return await score_pending_signals(max_lookforward=max_lookforward)
 
