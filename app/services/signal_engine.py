@@ -297,9 +297,33 @@ PROFILE_DEFAULTS: dict[str, RuleConfig] = {
 #   result found for USD/JPY across all three rounds. Still net-negative — this is a
 #   real, still-open pair-specific shortfall, not a solved problem — but each round made
 #   it measurably less bad without ever trusting a sign-flipped "winner."
+#
+# Round 4 (MACD period tuning, all 4 pairs except EUR/USD — already profitable, not a
+# tuning target here — each pair's round 1-3 config held fixed; then
+# volatility_threshold_pct sweep, all 4 pairs, same discipline):
+#   MACD: every pair's best candidate either showed a negligible train/test delta
+#   (GBP/USD 8/17/9: train -0.0004%/test -0.0011%, barely different from the 12/26/9
+#   default's train -0.0006%) or flipped sign (USD/JPY 5/13/6: train -0.0028%/test
+#   +0.0005%; AUD/USD 8/17/9: train -0.0038%/test +0.0049%) — no pair got a MACD
+#   override, all keep the RuleConfig default (12/26/9).
+#   volatility_threshold_pct (grid: 0.01/0.02/0.03/0.05, 0.02 is RuleConfig's untouched
+#   default that swing had never actually searched before this round):
+#     EUR/USD 0.05 — train +0.0031%/test +0.0032% (2214/1090 signals): same sign, stable,
+#       a real improvement over 0.02's train +0.0025% here — adopted.
+#     GBP/USD 0.03 — train -0.0001%/test -0.0006% (2477/1058 signals): same sign, both
+#       numbers improved over 0.02's train -0.0006%/test -0.0012% (from round 1) — still
+#       net-negative but measurably less bad — adopted.
+#     USD/JPY 0.05 — train -0.0018%/test +0.0024%: sign flip — rejected, kept vol=0.02.
+#     AUD/USD 0.05 — train -0.0046%/test +0.0049%: sign flip — rejected, kept vol=0.02.
+#   AUD/USD re-evaluation (per README "What's next" item 3): across all four rounds
+#   (EMA/RSI, target/stop, MACD, volatility) every single "winning" candidate for AUD/USD
+#   flipped sign train→test — never once a validated same-sign improvement. Per the plan
+#   set out after round 2, that's accepted as real evidence swing has no edge for this
+#   pair in this rule set, not just an under-searched grid — AUD/USD keeps the global
+#   default with no override, and the search is considered closed rather than open-ended.
 SWING_PAIR_OVERRIDES: dict[str, dict] = {
-    "EUR/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.25},
-    "GBP/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.5},
+    "EUR/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.25, "volatility_threshold_pct": 0.05},
+    "GBP/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.5, "volatility_threshold_pct": 0.03},
     "USD/JPY": {
         "ema_fast": 10, "ema_slow": 50,
         "rsi_oversold": 25, "rsi_overbought": 75,

@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
+import { AuthGuard } from "@/components/AuthGuard";
+import { AuthNav } from "@/components/AuthNav";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -44,9 +46,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                 Paper Trading
               </Link>
             </nav>
+            <AuthNav />
           </div>
         </header>
-        <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">{children}</main>
+        <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">
+          <AuthGuard>{children}</AuthGuard>
+        </main>
       </body>
     </html>
   );

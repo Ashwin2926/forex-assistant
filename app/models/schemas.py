@@ -3,6 +3,11 @@ from datetime import datetime
 from typing import Optional, Literal
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 class Candle(BaseModel):
     pair: str
     interval: str  # e.g. "5min", "1h", "4h"

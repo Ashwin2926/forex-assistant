@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     deriv_app_id: str = "1089"
     deriv_api_token: str = ""
 
+    # Login credentials for the frontend/API. auth_password_hash is a bcrypt hash, never
+    # the plaintext password — generate one with app.core.auth.hash_password. auth_secret_key
+    # signs session tokens; if unset, AuthMiddleware fails closed (nothing can authenticate)
+    # rather than falling back to some default secret.
+    auth_username: str = ""
+    auth_password_hash: str = ""
+    auth_secret_key: str = ""
+
     @property
     def pairs_list(self) -> list[str]:
         return [p.strip() for p in self.forex_pairs.split(",")]

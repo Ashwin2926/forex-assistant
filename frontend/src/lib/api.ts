@@ -1,4 +1,5 @@
 import type { BacktestRun, CandlePoint, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RuleConfig, Signal, SignalAccuracy } from "./types";
+import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
 
@@ -12,11 +13,22 @@ class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getToken();
   const res = await fetch(`${API_URL}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...init?.headers,
+    },
     cache: "no-store",
   });
+  if (res.status === 401 && path !== "/auth/login") {
+    clearToken();
+    if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+      window.location.href = "/login";
+    }
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new ApiError(body.detail ?? `Request failed: ${res.status}`, res.status);
@@ -25,6 +37,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  login(username: string, password: string) {
+    return request<{ access_token: string; token_type: string }>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+  },
+
   ingest(interval: string) {
     return request<Record<string, string>>(`/ingest/${interval}`, { method: "POST" });
   },

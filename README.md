@@ -34,6 +34,9 @@ cp .env.example .env
 Then edit `.env` and fill in:
 - `TWELVE_DATA_API_KEY` — your key from step 1
 - `MONGODB_URI` — `mongodb://localhost:27017` for local, or your Atlas connection string
+- `AUTH_USERNAME`, `AUTH_PASSWORD_HASH`, `AUTH_SECRET_KEY` — see "Auth" below. Every
+  endpoint except `/` and `/auth/login` requires a valid token; leaving these unset
+  fails closed (nothing can log in) rather than leaving the API open.
 
 ### 5. Run the server
 ```bash
@@ -171,6 +174,41 @@ curl -X POST "http://localhost:8000/paper-trade/1h/swing?pair=EUR%2FUSD&stake=10
 curl http://localhost:8000/paper-trade/open       # refreshes + lists open positions
 curl http://localhost:8000/paper-trade/history    # closed positions with final P&L
 ```
+
+## Auth
+
+Every endpoint except `GET /` and `POST /auth/login` requires a bearer token — this is a
+single-user tool with real (demo-account) trade execution behind `/paper-trade` and a
+limited Twelve Data quota behind `/ingest`, both reachable by anyone who finds the URL if
+left open. `app/core/auth.py`'s `AuthMiddleware` checks every request's `Authorization`
+header against a JWT signed with `AUTH_SECRET_KEY`; a missing or invalid token gets a 401
+with CORS headers still attached (so the frontend can actually read the 401 and redirect
+to `/login`, instead of the browser reporting a generic CORS failure — `AuthMiddleware`
+has to be added before `CORSMiddleware` in `main.py` for that to work, since Starlette
+makes the *last*-added middleware the outermost one).
+
+```bash
+curl -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "...", "password": "..."}'
+# -> {"access_token": "...", "token_type": "bearer"}
+curl http://localhost:8000/signals -H "Authorization: Bearer <access_token>"
+```
+
+Setting credentials: `AUTH_PASSWORD_HASH` is a bcrypt hash, never the plaintext —
+generate one with:
+```bash
+python -c "from app.core.auth import hash_password; print(hash_password('your-password'))"
+```
+Put the result in `AUTH_PASSWORD_HASH`, your chosen username in `AUTH_USERNAME`, and a
+random 32+ byte string in `AUTH_SECRET_KEY` (`python -c "import secrets; print(secrets.token_hex(32))"`).
+Tokens are valid for 7 days (`app.core.auth.TOKEN_TTL_SECONDS`); logging in again issues a
+fresh one.
+
+The frontend's login page (`/login`) stores the token in `localStorage` and attaches it to
+every API call (`frontend/src/lib/api.ts`); `AuthGuard` (`frontend/src/components/`)
+redirects unauthenticated visits to `/login`, and a 401 from any API call clears the stored
+token and redirects there too, so an expired token doesn't just fail silently.
 
 ## Paper trading (Deriv)
 
@@ -353,10 +391,11 @@ enough signal to see it.
 ```
 app/
   core/
-    config.py      # env settings (incl. Deriv app_id/token)
+    config.py      # env settings (incl. Deriv app_id/token, auth credentials)
+    auth.py        # login/JWT verification + AuthMiddleware guarding every non-public route
     database.py    # MongoDB connection + collections
   models/
-    schemas.py      # Candle, Signal, BacktestRun, PaperTrade pydantic models
+    schemas.py      # Candle, Signal, BacktestRun, PaperTrade, LoginRequest pydantic models
   services/
     data_fetcher.py    # Twelve Data API -> MongoDB
     indicators.py       # EMA, RSI, MACD, ATR calculations
@@ -365,38 +404,41 @@ app/
     outcome_scoring.py    # resolves pending LIVE signals against real candles as they arrive
     deriv_client.py      # Deriv WebSocket session + virtual-account safety gate
     paper_trading.py     # Signal -> Deriv Multipliers contract execution + sync
-  main.py            # FastAPI app + endpoints (incl. /candles) + APScheduler (auto-ingest + auto-score)
+  main.py            # FastAPI app + endpoints (incl. /candles, /auth/login)
+scripts/              # one-off maintenance scripts (dedupe/cleanup live signals) — run manually, not on any schedule
+.github/workflows/
+  keep-fresh.yml       # GitHub Actions cron: /ingest + /signals/score every 15 minutes
 frontend/            # Next.js dashboard (signal feed + live accuracy, chart, backtesting, paper trading)
 ```
 
 ## What's next (not built yet)
 
-Current state after two rounds of per-pair swing tuning (see "Per-pair swing target/stop
-tuning" and its "EMA/RSI tuning" follow-up above): EUR/USD is genuinely profitable
-(0.75/1.25, EMA 50/200). GBP/USD (0.75/1.5) and USD/JPY (EMA 10/50, RSI 25/75, 0.75/2.0)
-are both still net-negative even at their own best found config — narrower than before,
-not solved. AUD/USD has no override at all: every candidate tried across two full grid
-rounds (target/stop, then EMA/RSI) flipped sign between train and test.
+Current state after four rounds of per-pair swing tuning (see "Per-pair swing target/stop
+tuning" and its follow-ups above, and `signal_engine.SWING_PAIR_OVERRIDES`'s "Round 4"
+comment for the MACD/volatility numbers): EUR/USD is genuinely profitable (0.75/1.25
+target/stop, EMA 50/200, `volatility_threshold_pct=0.05`). GBP/USD (0.75/1.5,
+`vol=0.03`) and USD/JPY (EMA 10/50, RSI 25/75, 0.75/2.0) are both still net-negative at
+their own best found config — narrower than before, not solved. AUD/USD has no override
+at all: every candidate tried across all four rounds (target/stop, EMA/RSI, MACD,
+volatility) flipped sign between train and test — per the plan below, that search is
+now considered closed rather than open-ended.
 
 Next steps, roughly in order:
-1. **MACD period tuning for swing** — untouched by both grid rounds so far (only
-   EMA/RSI/target/stop were searched). Candidate for GBP/USD, USD/JPY, and AUD/USD
-   specifically, using the same train/test-with-sign-check discipline as rounds 1-2 —
-   reject any winner that flips sign on test, same as EUR/USD's and GBP/USD's EMA
-   candidates were rejected this round.
-2. **`volatility_threshold_pct` sweep for swing** — intraday's default was retuned
-   (0.02) during its own validation pass; swing has never had this searched at all and
-   still runs on `RuleConfig`'s untouched default.
-3. **Re-evaluate AUD/USD after (1) and (2)** — if MACD and volatility tuning also
-   produce only sign-flipped "winners," that's real evidence swing may not have an edge
-   for this pair in this rule set at all, not just an under-searched grid. Worth
-   accepting that conclusion rather than continuing to search indefinitely.
-4. **Revisit ML only after (1)-(3)** — decided against ML for now in favor of
-   exhausting the rule-based search space first (the rule engine's failure modes — small
+1. ~~**MACD period tuning for swing**~~ — done. Every pair's best candidate either
+   showed a negligible train/test delta (GBP/USD) or flipped sign (USD/JPY, AUD/USD); no
+   pair got a MACD override, all keep `RuleConfig`'s default (12/26/9).
+2. ~~**`volatility_threshold_pct` sweep for swing**~~ — done. EUR/USD (0.05) and
+   GBP/USD (0.03) got real, same-sign, validated overrides; USD/JPY and AUD/USD's best
+   candidates both flipped sign and were rejected, keeping the default 0.02.
+3. ~~**Re-evaluate AUD/USD after (1) and (2)**~~ — done, and the sign-flip-every-round
+   outcome the plan anticipated is exactly what happened: accepted as real evidence swing
+   has no edge for this pair in this rule set, not just an under-searched grid. Not
+   revisiting with more grid search; would need a materially different approach (new
+   indicators, a different profile entirely) to be worth another pass.
+4. **Revisit ML now that (1)-(3) are done** — was deliberately deferred until the
+   rule-based search space was exhausted (the rule engine's failure modes — small
    samples, train/test sign flips — are easy to see and reason about; a model's failure
-   modes usually aren't). Once MACD and volatility tuning are done, that's the point
-   where diminishing returns from grid search would make revisiting the ML question
-   actually informed rather than premature.
+   modes usually aren't). That point has now been reached for swing.
 - The Backtesting page's "Optimize" UI runs the default grid (now includes both target/stop
   ratios, EMA/RSI variations) — it still has no input for a fully custom `configs` JSON
   body, so an exhaustive search still needs curl (see "Intraday vs swing" above)

@@ -4,6 +4,7 @@ from typing import Optional
 import pandas as pd
 
 from app.core.config import get_settings
+from app.core.auth import AuthMiddleware, create_token, verify_credentials
 from app.core.database import (
     init_indexes,
     candles_collection,
@@ -12,7 +13,7 @@ from app.core.database import (
     backtest_runs_collection,
     paper_trades_collection,
 )
-from app.models.schemas import RuleConfig
+from app.models.schemas import LoginRequest, RuleConfig
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for
@@ -44,6 +45,11 @@ DEFAULT_OPTIMIZE_GRID = [
     RuleConfig(rsi_oversold=25, rsi_overbought=75, target_atr_mult=0.5, stop_atr_mult=1.25),
 ]
 
+# AuthMiddleware added first so CORSMiddleware ends up outermost (Starlette makes the
+# *last*-added middleware the outermost one) — otherwise a 401 from AuthMiddleware would
+# skip CORS entirely and the browser would report a CORS error instead of surfacing 401.
+app.add_middleware(AuthMiddleware)
+
 # Local Next.js dev server needs to call this API directly from the browser.
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +67,13 @@ async def startup():
 @app.get("/")
 async def root():
     return {"status": "ok", "pairs": settings.pairs_list}
+
+
+@app.post("/auth/login")
+async def login(body: LoginRequest):
+    if not verify_credentials(body.username, body.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return {"access_token": create_token(body.username), "token_type": "bearer"}
 
 
 @app.post("/ingest/{interval}")
@@ -117,9 +130,20 @@ async def create_signal(
     df = pd.DataFrame(docs)
     signal = generate_signal(df, pair, interval, profile, config)
 
+    if signal.direction in ("BUY", "SELL"):
+        atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+        signal.target_price, signal.stop_price = compute_atr_target_stop(
+            signal.price_at_signal, atr_val, signal.direction,
+            target_atr_mult if target_atr_mult is not None else config.target_atr_mult,
+            stop_atr_mult if stop_atr_mult is not None else config.stop_atr_mult,
+        )
+
     # The latest stored candle only advances when /ingest brings in a new one — calling
     # this endpoint again before that (e.g. every dashboard load) would otherwise insert
     # an identical duplicate for the same candle, inflating /signals/accuracy's counts.
+    # target_price/stop_price are compared too (not just direction/price) so a repeat call
+    # with different target_atr_mult/stop_atr_mult overrides is treated as a distinct
+    # signal rather than silently returning the first call's target/stop.
     last = await signals_collection.find_one(
         {"pair": pair, "interval": interval, "profile": profile, "source": "live"},
         sort=[("timestamp", -1)],
@@ -128,17 +152,11 @@ async def create_signal(
         last is not None
         and last["direction"] == signal.direction
         and last["price_at_signal"] == signal.price_at_signal
+        and last["target_price"] == signal.target_price
+        and last["stop_price"] == signal.stop_price
     ):
         last["_id"] = str(last["_id"])
         return last
-
-    if signal.direction in ("BUY", "SELL"):
-        atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
-        signal.target_price, signal.stop_price = compute_atr_target_stop(
-            signal.price_at_signal, atr_val, signal.direction,
-            target_atr_mult if target_atr_mult is not None else config.target_atr_mult,
-            stop_atr_mult if stop_atr_mult is not None else config.stop_atr_mult,
-        )
 
     await signals_collection.insert_one(signal.model_dump())
     return signal
