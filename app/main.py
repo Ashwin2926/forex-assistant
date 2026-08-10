@@ -139,8 +139,9 @@ async def create_signal(
     config = default_config_for(profile, pair)
     cursor = candles_collection.find(
         {"pair": pair, "interval": interval}
-    ).sort("timestamp", 1)
+    ).sort("timestamp", -1).limit(500)
     docs = await cursor.to_list(length=500)
+    docs.reverse()  # find() gave newest-first for the limit to bite correctly; generate_signal wants ascending
 
     min_needed = config.ema_slow
     if len(docs) < min_needed:
@@ -152,6 +153,21 @@ async def create_signal(
 
     df = pd.DataFrame(docs)
     signal = generate_signal(df, pair, interval, profile, config)
+
+    # The latest stored candle only advances when /ingest brings in a new one — calling
+    # this endpoint again before that (e.g. every dashboard load) would otherwise insert
+    # an identical duplicate for the same candle, inflating /signals/accuracy's counts.
+    last = await signals_collection.find_one(
+        {"pair": pair, "interval": interval, "profile": profile, "source": "live"},
+        sort=[("timestamp", -1)],
+    )
+    if (
+        last is not None
+        and last["direction"] == signal.direction
+        and last["price_at_signal"] == signal.price_at_signal
+    ):
+        last["_id"] = str(last["_id"])
+        return last
 
     if signal.direction in ("BUY", "SELL"):
         atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
@@ -578,8 +594,9 @@ async def paper_trade(
     config values.
     """
     config = default_config_for(profile, pair)
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
     docs = await cursor.to_list(length=500)
+    docs.reverse()  # find() gave newest-first for the limit to bite correctly; generate_signal wants ascending
 
     min_needed = config.ema_slow
     if len(docs) < min_needed:
