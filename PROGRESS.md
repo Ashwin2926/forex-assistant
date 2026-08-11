@@ -17,8 +17,12 @@ failure mode the cron was built to prevent.
   only if the env var is set (fails closed like `auth_secret_key`, same pattern).
   Workflow now sends that header on all three curl calls.
 - Generated a token, set it as the `AUTOMATION_TOKEN` GitHub Actions secret on this
-  repo. **Still needs the same value set as `AUTOMATION_TOKEN` on FastAPI Cloud** — not
-  done yet, cron will keep failing with 401 until that's set.
+  repo.
+- Backend setting renamed from `automation_token` to `auth_secret_key2` (env var
+  `AUTH_SECRET_KEY2`) to match the variable name the user had already created on
+  FastAPI Cloud — unrelated to the JWT signing key `AUTH_SECRET_KEY` despite the name.
+  Only the token *value* needs to match between the GitHub secret and the FastAPI Cloud
+  var; the names are independent (GitHub secret stays `AUTOMATION_TOKEN`).
 
 ## 2026-08-10
 

@@ -27,8 +27,9 @@ class Settings(BaseSettings):
 
     # Static credential for the GitHub Actions ingestion cron (.github/workflows/keep-fresh.yml)
     # — it can't do an interactive login, so it sends this as X-Service-Token instead of a user
-    # JWT. Unset by default, matching auth_secret_key's fail-closed behavior.
-    automation_token: str = ""
+    # JWT. Named auth_secret_key2 (not automation_token) to match the env var name already set
+    # on FastAPI Cloud. Unset by default, matching auth_secret_key's fail-closed behavior.
+    auth_secret_key2: str = ""
 
     @property
     def pairs_list(self) -> list[str]:

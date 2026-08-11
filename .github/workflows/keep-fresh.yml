@@ -20,8 +20,10 @@ jobs:
     steps:
       # Every route except / and /auth/login requires auth (see app/core/auth.py). This
       # workflow can't do an interactive login, so it authenticates with a static
-      # X-Service-Token instead of a user JWT — same value must be set as AUTOMATION_TOKEN
-      # on FastAPI Cloud.
+      # X-Service-Token instead of a user JWT — same value must be set as AUTH_SECRET_KEY2
+      # on FastAPI Cloud (named to match what's already there, not related to the JWT
+      # signing key AUTH_SECRET_KEY despite the similar name). The secret is named
+      # AUTOMATION_TOKEN here on the GitHub side; only the value has to match, not the name.
       - name: Ingest 15min candles
         run: curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/15min?output_size=5"
       - name: Ingest 1h candles
