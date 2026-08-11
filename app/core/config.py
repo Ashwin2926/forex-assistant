@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     auth_password_hash: str = ""
     auth_secret_key: str = ""
 
+    # Static credential for the GitHub Actions ingestion cron (.github/workflows/keep-fresh.yml)
+    # — it can't do an interactive login, so it sends this as X-Service-Token instead of a user
+    # JWT. Unset by default, matching auth_secret_key's fail-closed behavior.
+    automation_token: str = ""
+
     @property
     def pairs_list(self) -> list[str]:
         return [p.strip() for p in self.forex_pairs.split(",")]

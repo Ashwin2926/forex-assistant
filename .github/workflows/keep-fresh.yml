@@ -16,10 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       API_BASE: https://forex-assistant.fastapicloud.dev
+      AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
     steps:
+      # Every route except / and /auth/login requires auth (see app/core/auth.py). This
+      # workflow can't do an interactive login, so it authenticates with a static
+      # X-Service-Token instead of a user JWT — same value must be set as AUTOMATION_TOKEN
+      # on FastAPI Cloud.
       - name: Ingest 15min candles
-        run: curl -sf -X POST "$API_BASE/ingest/15min?output_size=5"
+        run: curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/15min?output_size=5"
       - name: Ingest 1h candles
-        run: curl -sf -X POST "$API_BASE/ingest/1h?output_size=5"
+        run: curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
       - name: Score pending live signals
-        run: curl -sf -X POST "$API_BASE/signals/score"
+        run: curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/signals/score"

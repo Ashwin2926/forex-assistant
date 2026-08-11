@@ -4,6 +4,22 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-11
+
+**`keep-fresh.yml` cron fixed — was 401ing on every run since auth landed.** The
+GitHub Actions ingestion cron (`.github/workflows/keep-fresh.yml`) had failed on every
+single run since 2026-08-10 06:01, right after the previous day's auth rollout — its
+plain `curl` calls to `/ingest/*` and `/signals/score` had no bearer token, so
+`AuthMiddleware` 401'd them and candle data went stale again for about a day, the exact
+failure mode the cron was built to prevent.
+- Fix: added a second accepted credential to `AuthMiddleware` (`app/core/auth.py`) — a
+  static `AUTOMATION_TOKEN`, sent as `X-Service-Token` instead of a user JWT, checked
+  only if the env var is set (fails closed like `auth_secret_key`, same pattern).
+  Workflow now sends that header on all three curl calls.
+- Generated a token, set it as the `AUTOMATION_TOKEN` GitHub Actions secret on this
+  repo. **Still needs the same value set as `AUTOMATION_TOKEN` on FastAPI Cloud** — not
+  done yet, cron will keep failing with 401 until that's set.
+
 ## 2026-08-10
 
 **Auth added.** Every endpoint except `/` and `/auth/login` now requires a bearer token

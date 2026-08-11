@@ -53,6 +53,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
             return await call_next(request)
 
+        settings = get_settings()
+        service_token = request.headers.get("x-service-token", "")
+        if settings.automation_token and service_token == settings.automation_token:
+            return await call_next(request)
+
         auth_header = request.headers.get("authorization", "")
         if not auth_header.startswith("Bearer ") or not verify_token(auth_header.removeprefix("Bearer ")):
             return JSONResponse({"detail": "Not authenticated"}, status_code=401)
