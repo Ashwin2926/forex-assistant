@@ -4,6 +4,34 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-18 (cont.)
+
+**Found the actual reason `keep-fresh.yml` never worked: invalid YAML, not auth.** After
+the deploy fix above, the cron was still failing on every run — GitHub's UI showed
+`Invalid workflow file ... error in your yaml syntax on line 28`. Every `run:` step with
+an inline `-H "X-Service-Token: $AUTOMATION_TOKEN"` was an unquoted plain scalar
+containing a bare `: ` (colon-space), which YAML disallows outside quotes/block-scalars —
+classic "mapping values are not allowed here" territory once GitHub's parser hits it.
+This line was introduced in commit `0696744` back on 2026-08-10, meaning **the cron has
+never successfully executed a single step since auth was added** — not 401s as assumed,
+every run failed at YAML validation before any code ran at all. Also explains other loose
+threads from earlier: the fallback `.github/workflows/keep-fresh.yml` display name instead
+of `"Keep candle data fresh"`, `workflow_dispatch` rejecting dispatch with "workflow does
+not have that trigger", and the Jobs API returning empty — all downstream of GitHub never
+fully parsing the file. The "push"-triggered failing runs we kept seeing weren't a `push:`
+trigger (the file only ever declared `schedule`/`workflow_dispatch`) — they were GitHub's
+synthetic error-report run, fired on every push to the branch regardless of which files
+changed, for as long as the workflow stayed invalid.
+- Fix: converted every affected `run:` line to YAML's `|` block-literal style, which isn't
+  subject to the same colon restriction (commit `0a237ca`).
+- Same commit adds two new steps, `Generate intraday signals (15min)` and
+  `Generate swing signals (1h)`, looping `POST /signals/{interval}/{profile}` over all 4
+  pairs — previously signal *generation* only happened when the frontend loaded a page and
+  called `api.generateSignal(...)`; ingestion and scoring ran unattended but nothing new
+  ever got created without a human visiting the site.
+- Verified via manual `workflow_dispatch` (run `#27`) — all 7 steps green: ingest, both
+  generate steps, score. First confirmed-working end-to-end run since auth was added.
+
 ## 2026-08-18
 
 **A week of stale/unresolved pending signals — root cause was FastAPI Cloud dashboard
