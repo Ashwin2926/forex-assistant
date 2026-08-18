@@ -7,31 +7,47 @@ from app.services.indicators import add_all_indicators
 
 def apply_rules(
     latest: pd.Series, prev: pd.Series, config: RuleConfig = RuleConfig()
-) -> tuple[list[SignalReason], int, int, int, dict[str, str]]:
+) -> tuple[list[SignalReason], int, int, int, dict[str, str], dict[str, float]]:
     """
     Core rule logic, isolated from indicator computation and dataframe slicing so
     both the live engine and the backtester evaluate the exact same decision code
     against a row of already-computed indicators. Returns (reasons, bullish_votes,
-    bearish_votes, total_rules, rule_votes) where rule_votes maps each rule that
-    fired to the direction ("BUY"/"SELL") it voted for — used by the backtester to
-    score which specific rules were pulling their weight vs. dead weight.
+    bearish_votes, total_rules, rule_votes, rule_strengths):
+      rule_votes maps each rule that fired to the direction ("BUY"/"SELL") it voted
+      for — used by the backtester to score which specific rules were pulling their
+      weight vs. dead weight.
+      rule_strengths maps each voting rule to a normalized [0, 1] "how strong was
+      this reading" score — e.g. an RSI of 15 is much stronger oversold evidence
+      than an RSI of 29 even though both cast the same vote at the old flat-count
+      confidence. decide() uses this to weight confidence instead of just counting
+      votes, so two signals with the same direction and vote count no longer always
+      report the exact same confidence.
     """
     reasons: list[SignalReason] = []
     rule_votes: dict[str, str] = {}
+    rule_strengths: dict[str, float] = {}
     bullish_votes = 0
     bearish_votes = 0
     total_rules = 0
 
+    # ATR% computed up front — used both as its own filter (rule 4, below) and as the
+    # volatility yardstick trend_ema/macd_cross strength is normalized against, so an EMA
+    # spread or MACD histogram reads as "big" relative to how much this pair/interval is
+    # actually moving right now, not against one fixed number that wouldn't generalize
+    # across pairs with very different typical price scales (EUR/USD ~1.1 vs USD/JPY ~150).
+    atr_pct = (latest["atr"] / latest["close"]) * 100
+
     # Rule 1: Trend - price vs fast/slow EMA. value is the EMA spread normalized by price
     # (%) rather than the raw EMA levels themselves — raw levels aren't comparable across
-    # pairs (EUR/USD ~1.1 vs USD/JPY ~150) or over time as a price drifts, so they're
-    # useless as a feature; the normalized spread is scale-invariant and its sign alone
-    # already encodes uptrend/downtrend/flat.
+    # pairs or over time as a price drifts, so they're useless as a feature; the
+    # normalized spread is scale-invariant and its sign alone already encodes
+    # uptrend/downtrend/flat.
     total_rules += 1
     ema_spread_pct = (latest["ema_fast"] - latest["ema_slow"]) / latest["close"] * 100
     if latest["ema_fast"] > latest["ema_slow"]:
         bullish_votes += 1
         rule_votes["trend_ema"] = "BUY"
+        rule_strengths["trend_ema"] = min(abs(ema_spread_pct) / atr_pct, 1.0) if atr_pct > 0 else 0.0
         reasons.append(SignalReason(
             rule="trend_ema", passed=True, value=ema_spread_pct,
             detail=f"EMA{config.ema_fast} ({latest['ema_fast']:.5f}) above EMA{config.ema_slow} "
@@ -40,6 +56,7 @@ def apply_rules(
     elif latest["ema_fast"] < latest["ema_slow"]:
         bearish_votes += 1
         rule_votes["trend_ema"] = "SELL"
+        rule_strengths["trend_ema"] = min(abs(ema_spread_pct) / atr_pct, 1.0) if atr_pct > 0 else 0.0
         reasons.append(SignalReason(
             rule="trend_ema", passed=True, value=ema_spread_pct,
             detail=f"EMA{config.ema_fast} ({latest['ema_fast']:.5f}) below EMA{config.ema_slow} "
@@ -50,11 +67,16 @@ def apply_rules(
             rule="trend_ema", passed=False, value=ema_spread_pct, detail="EMAs flat, no clear trend"
         ))
 
-    # Rule 2: Momentum - RSI
+    # Rule 2: Momentum - RSI. strength is how far past its threshold the reading is,
+    # scaled against the natural 0-100 RSI bound (no ATR normalization needed here —
+    # RSI is already unitless and self-bounded).
     total_rules += 1
     if latest["rsi"] < config.rsi_oversold:
         bullish_votes += 1
         rule_votes["rsi_oversold"] = "BUY"
+        rule_strengths["rsi_oversold"] = max(0.0, min(
+            (config.rsi_oversold - latest["rsi"]) / config.rsi_oversold, 1.0
+        ))
         reasons.append(SignalReason(
             rule="rsi_oversold", passed=True, value=float(latest["rsi"]),
             detail=f"RSI at {latest['rsi']:.1f} — oversold, potential bounce"
@@ -62,6 +84,9 @@ def apply_rules(
     elif latest["rsi"] > config.rsi_overbought:
         bearish_votes += 1
         rule_votes["rsi_overbought"] = "SELL"
+        rule_strengths["rsi_overbought"] = max(0.0, min(
+            (latest["rsi"] - config.rsi_overbought) / (100 - config.rsi_overbought), 1.0
+        ))
         reasons.append(SignalReason(
             rule="rsi_overbought", passed=True, value=float(latest["rsi"]),
             detail=f"RSI at {latest['rsi']:.1f} — overbought, potential pullback"
@@ -73,22 +98,25 @@ def apply_rules(
         ))
 
     # Rule 3: MACD crossover. value is the histogram (macd - signal) rather than a bare
-    # crossed/didn't-cross boolean — its sign and magnitude carry real information (how
-    # far above/below the signal line, not just whether a cross happened this bar) that
-    # the pass/fail flag alone throws away.
+    # crossed/didn't-cross boolean — its sign and magnitude carry real information that a
+    # pass/fail flag alone throws away. strength normalizes that histogram (converted to
+    # a % of price, same units as ema_spread_pct) against ATR%, same reasoning as trend_ema.
     total_rules += 1
     macd_hist = float(latest["macd"] - latest["macd_signal"])
+    macd_hist_pct = macd_hist / latest["close"] * 100
     macd_cross_up = prev["macd"] <= prev["macd_signal"] and latest["macd"] > latest["macd_signal"]
     macd_cross_down = prev["macd"] >= prev["macd_signal"] and latest["macd"] < latest["macd_signal"]
     if macd_cross_up:
         bullish_votes += 1
         rule_votes["macd_cross"] = "BUY"
+        rule_strengths["macd_cross"] = min(abs(macd_hist_pct) / atr_pct, 1.0) if atr_pct > 0 else 0.0
         reasons.append(SignalReason(
             rule="macd_cross", passed=True, value=macd_hist, detail="MACD crossed above signal line"
         ))
     elif macd_cross_down:
         bearish_votes += 1
         rule_votes["macd_cross"] = "SELL"
+        rule_strengths["macd_cross"] = min(abs(macd_hist_pct) / atr_pct, 1.0) if atr_pct > 0 else 0.0
         reasons.append(SignalReason(
             rule="macd_cross", passed=True, value=macd_hist, detail="MACD crossed below signal line"
         ))
@@ -98,7 +126,6 @@ def apply_rules(
         ))
 
     # Rule 4: Volatility filter - skip signals when ATR indicates dead market
-    atr_pct = (latest["atr"] / latest["close"]) * 100
     volatility_ok = atr_pct > config.volatility_threshold_pct
     reasons.append(SignalReason(
         rule="volatility_filter", passed=volatility_ok, value=float(atr_pct),
@@ -118,25 +145,47 @@ def apply_rules(
                    f"{config.session_start_hour_utc:02d}:00-{config.session_end_hour_utc:02d}:00 UTC window"
         ))
 
-    return reasons, bullish_votes, bearish_votes, total_rules, rule_votes
+    return reasons, bullish_votes, bearish_votes, total_rules, rule_votes, rule_strengths
 
 
-def decide(bullish_votes: int, bearish_votes: int, total_rules: int, gate_ok: bool) -> tuple[str, float]:
+def decide(
+    bullish_votes: int, bearish_votes: int, total_rules: int, gate_ok: bool,
+    rule_votes: dict[str, str], rule_strengths: dict[str, float],
+) -> tuple[str, float]:
     """
     Turn rule votes into a direction + confidence. gate_ok combines every pass/fail
     gating condition (volatility_filter and, for intraday, session_filter) — if any
     gate fails, force HOLD regardless of vote counts. Shared by live engine and backtester.
-    """
-    confidence = round((max(bullish_votes, bearish_votes) / total_rules) * 100, 1)
 
+    Direction is still decided purely by vote count (bullish_votes vs bearish_votes) —
+    unchanged from before, so every backtested hit-rate number in signal_engine.py's
+    PROFILE_DEFAULTS history stays valid; only how *confidence* is computed changed.
+    Previously confidence was max(bullish_votes, bearish_votes) / total_rules, which can
+    only ever take 4 values for total_rules=3 (0%, 33.3%, 66.7%, 100%) — every signal
+    where e.g. 2 of 3 rules agreed reported the identical 66.7% regardless of whether
+    those rules were barely over their threshold or deep into it. Now it's the *sum of
+    rule_strengths* for whichever rules agreed with the winning direction, divided by
+    total_rules — a continuous value in the same [0, 100] range, and equal to the old
+    formula exactly when every agreeing rule's strength is 1.0.
+    """
     if not gate_ok:
         return "HOLD", 0.0
-    elif bullish_votes > bearish_votes:
-        return "BUY", confidence
+
+    if bullish_votes > bearish_votes:
+        direction = "BUY"
     elif bearish_votes > bullish_votes:
-        return "SELL", confidence
+        direction = "SELL"
     else:
+        # Tie (including 0-0, no rule voting either way) -- no winning side to weight
+        # confidence against, so fall back to the plain vote-count formula.
+        confidence = round((max(bullish_votes, bearish_votes) / total_rules) * 100, 1)
         return "HOLD", confidence
+
+    agreeing_strength = sum(
+        rule_strengths.get(rule, 1.0) for rule, voted in rule_votes.items() if voted == direction
+    )
+    confidence = round(min(agreeing_strength / total_rules, 1.0) * 100, 1)
+    return direction, confidence
 
 
 def compute_atr_target_stop(
@@ -213,10 +262,12 @@ def generate_signal(
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    reasons, bullish_votes, bearish_votes, total_rules, _rule_votes = apply_rules(latest, prev, config)
+    reasons, bullish_votes, bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(latest, prev, config)
     volatility_ok = next(r.passed for r in reasons if r.rule == "volatility_filter")
     session_ok = next((r.passed for r in reasons if r.rule == "session_filter"), True)
-    direction, confidence = decide(bullish_votes, bearish_votes, total_rules, volatility_ok and session_ok)
+    direction, confidence = decide(
+        bullish_votes, bearish_votes, total_rules, volatility_ok and session_ok, rule_votes, rule_strengths
+    )
 
     return Signal(
         pair=pair,

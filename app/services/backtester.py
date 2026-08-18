@@ -79,10 +79,12 @@ def run_backtest(
         latest = indicator_df.iloc[i]
         prev = indicator_df.iloc[i - 1]
 
-        reasons, bullish_votes, bearish_votes, total_rules, rule_votes = apply_rules(latest, prev, config)
+        reasons, bullish_votes, bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(latest, prev, config)
         volatility_ok = next(r.passed for r in reasons if r.rule == "volatility_filter")
         session_ok = next((r.passed for r in reasons if r.rule == "session_filter"), True)
-        direction, confidence = decide(bullish_votes, bearish_votes, total_rules, volatility_ok and session_ok)
+        direction, confidence = decide(
+            bullish_votes, bearish_votes, total_rules, volatility_ok and session_ok, rule_votes, rule_strengths
+        )
 
         for r in reasons:
             if r.passed:
