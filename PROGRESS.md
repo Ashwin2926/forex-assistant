@@ -4,6 +4,56 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-18 (cont. 2)
+
+**Auth re-enabled; cron split by interval speed to fit Twelve Data quota; signals now
+carry structured numeric features for a future ML pass.**
+
+- Re-enabled `AuthMiddleware` (`app/main.py`) and the frontend `AuthGuard` redirect,
+  commit `aa5252b` — both had been left open since the debugging session above. Cron
+  unaffected: it authenticates via `X-Service-Token`, checked before the JWT path in
+  `AuthMiddleware`, and `AUTH_SECRET_KEY2` already matched `AUTOMATION_TOKEN`.
+- Found a second, separate env var gap right after re-enabling: `AUTH_SECRET_KEY` (the
+  JWT *signing* key, not `AUTH_SECRET_KEY2`) was missing from FastAPI Cloud entirely —
+  login succeeded (doesn't need it) but every subsequent request 401'd instantly
+  (`verify_token` fails closed when unset), so the frontend looked like it was logging in
+  then immediately logging back out. Set `AUTH_SECRET_KEY` alongside `AUTH_SECRET_KEY2`,
+  fixed.
+- Expanded `keep-fresh.yml` to all 5 intervals (5min/15min/1h/4h/1day) and added signal
+  *generation* to the cron (previously frontend-only — `api.generateSignal`, only fired
+  when someone loaded a page). This uncovered a real quota problem: 5 intervals x 4 pairs
+  x 96 runs/day (the original single `*/15` schedule) = 1,920 Twelve Data calls/day, more
+  than double the free tier's 800/day cap. Fixed by giving each interval its own cron
+  entry at its natural cadence instead of refreshing everything every 15 min — a 4h candle
+  only closes every 4 hours, a 1day candle once a day. `github.event.schedule` gates which
+  ingest/generate steps run on each firing (`workflow_dispatch` still runs everything, for
+  manual testing). Landed on 5min+15min every 20 min (576/day) + 1h hourly (96/day) + 4h
+  every 4h (24/day) + 1day daily (4/day) = ~700/day, using the spare headroom on the two
+  intervals intraday's signal quality depends on most rather than leaving it unused.
+- Added `SignalReason.value: Optional[float]` (commit `367ac99`) — the single most
+  decision-relevant number behind each rule's verdict (RSI reading, EMA spread normalized
+  by price %, MACD histogram, ATR%, session hour), alongside the existing human-readable
+  `detail` string. `detail` was fine for a person reading it but useless as a feature
+  without re-parsing. Optional/defaulted so old stored signals still validate; `backtester.py`
+  needed no changes since it just passes `apply_rules()`'s reasons through unmodified.
+  Frontend: `types.ts` updated for parity, and `page.tsx`'s signal feed now shows each
+  rule's value next to its detail text (commit `0763c30`).
+- **Why this matters going in to tomorrow**: paired with `outcome_pct_move` (already
+  stored per signal), every signal generated from here on is close to a ready-made labeled
+  row — rule-level numeric features in, actual outcome out — without having to
+  reconstruct features from raw candles after the fact once the ML pass starts.
+
+## Next up: ML angle (starting 2026-08-19)
+
+Rule-based engine stays as the trusted baseline (per README's existing backtest
+discipline — train/test split, reject anything that flips sign) — the plan is to treat
+ML as a separate, additive angle, not a replacement, at least until it's proven out with
+the same rigor. Not yet scoped: model type, how much history to backfill/require before
+training is meaningful, whether it predicts direction (classification, matching
+hit/miss) or magnitude (regression, matching outcome_pct_move), and how a model's output
+would sit alongside the existing rule-vote confidence score rather than silently
+replacing it.
+
 ## 2026-08-18 (cont.)
 
 **Found the actual reason `keep-fresh.yml` never worked: invalid YAML, not auth.** After
