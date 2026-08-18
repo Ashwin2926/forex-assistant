@@ -4,6 +4,48 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-18
+
+**A week of stale/unresolved pending signals — root cause was FastAPI Cloud dashboard
+"redeploy" never actually rebuilding from git, not the auth mismatch it looked like at
+first.** `keep-fresh.yml` had been 401ing on every run since 2026-08-11 (see that entry);
+turned out the cron's *schedule trigger itself* had gone dormant for the full week too —
+GitHub Actions API showed zero runs, scheduled or manual, between 2026-08-11 04:58 and
+today. It resumed on its own once new commits landed today.
+
+- Rotated `AUTOMATION_TOKEN` (GitHub secret) / `AUTH_SECRET_KEY2` (FastAPI Cloud env var)
+  to a fresh matching value first — didn't fix it, which was the real clue. Confirmed
+  byte-for-byte the GitHub secret and FastAPI Cloud value matched, and the env var change
+  had triggered a fresh container boot (clean startup log, no crash) — yet requests kept
+  401ing regardless. Deployment IDs kept changing every few minutes on their own (`466f5902`
+  → `858b6f95` → `f00c234f` → `402f9e9d` → `158ac579` → `25711bd4`, all within ~40 min) with
+  **zero build logs on any of them** — every dashboard "redeploy"/restart was just
+  restarting the same already-built image, never pulling latest git. That's why nothing
+  we changed (env vars, two code pushes) ever took effect no matter how long we waited.
+- To isolate the deploy problem from auth itself, temporarily disabled `AuthMiddleware`
+  (`app/main.py`, commit `b6d3498`) and the frontend's login-redirect (`AuthGuard.tsx`,
+  commit `23f0818`). **Both are currently wide open, no auth at all — re-enable before any
+  real or public use.**
+- Actual fix: FastAPI Cloud's dashboard restarts don't rebuild from source; only their CLI
+  does a real rebuild. Ran the CLI deploy (project directory left blank in its setup
+  wizard — no `pyproject.toml` anywhere in this repo; `app/` and `requirements.txt` both
+  live at the repo root, not a subdirectory) — first deploy in over a week to actually pick
+  up new code.
+- Once that landed: `/signals/score` immediately cleared the backlog (2 hit, 1 miss, 0
+  left pending), `/ingest` confirmed working again for all 4 pairs on `15min` and `1h`,
+  and the `keep-fresh.yml` cron (caught red-handed still firing every 15 min with 401s the
+  whole time, in FastAPI Cloud's runtime logs) will succeed going forward.
+- Vercel: frontend builds were landing as `Preview` and not auto-promoting to
+  `Production` (consistent with the "blocked" deploys noted last entry) — had to manually
+  click "Production rebuild" to get `23f0818` live. Worth checking whether
+  auto-promote-to-Production is actually enabled for this project, or every future
+  frontend change will need the same manual step.
+- **Known gap**: `keep-fresh.yml` only calls `/ingest` and `/signals/score` — never
+  `POST /signals/{interval}/{profile}`, which is what actually *generates* a new signal.
+  Generation still only happens when the frontend loads a page and calls
+  `api.generateSignal(...)` client-side. Ingestion/scoring now run fully unattended; new
+  signals still need someone to visit the site unless the cron gets a generation step added.
+
 ## 2026-08-11
 
 **`keep-fresh.yml` cron fixed — was 401ing on every run since auth landed.** The
