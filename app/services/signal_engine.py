@@ -22,13 +22,18 @@ def apply_rules(
     bearish_votes = 0
     total_rules = 0
 
-    # Rule 1: Trend - price vs fast/slow EMA
+    # Rule 1: Trend - price vs fast/slow EMA. value is the EMA spread normalized by price
+    # (%) rather than the raw EMA levels themselves — raw levels aren't comparable across
+    # pairs (EUR/USD ~1.1 vs USD/JPY ~150) or over time as a price drifts, so they're
+    # useless as a feature; the normalized spread is scale-invariant and its sign alone
+    # already encodes uptrend/downtrend/flat.
     total_rules += 1
+    ema_spread_pct = (latest["ema_fast"] - latest["ema_slow"]) / latest["close"] * 100
     if latest["ema_fast"] > latest["ema_slow"]:
         bullish_votes += 1
         rule_votes["trend_ema"] = "BUY"
         reasons.append(SignalReason(
-            rule="trend_ema", passed=True,
+            rule="trend_ema", passed=True, value=ema_spread_pct,
             detail=f"EMA{config.ema_fast} ({latest['ema_fast']:.5f}) above EMA{config.ema_slow} "
                    f"({latest['ema_slow']:.5f}) — uptrend context"
         ))
@@ -36,12 +41,14 @@ def apply_rules(
         bearish_votes += 1
         rule_votes["trend_ema"] = "SELL"
         reasons.append(SignalReason(
-            rule="trend_ema", passed=True,
+            rule="trend_ema", passed=True, value=ema_spread_pct,
             detail=f"EMA{config.ema_fast} ({latest['ema_fast']:.5f}) below EMA{config.ema_slow} "
                    f"({latest['ema_slow']:.5f}) — downtrend context"
         ))
     else:
-        reasons.append(SignalReason(rule="trend_ema", passed=False, detail="EMAs flat, no clear trend"))
+        reasons.append(SignalReason(
+            rule="trend_ema", passed=False, value=ema_spread_pct, detail="EMAs flat, no clear trend"
+        ))
 
     # Rule 2: Momentum - RSI
     total_rules += 1
@@ -49,41 +56,52 @@ def apply_rules(
         bullish_votes += 1
         rule_votes["rsi_oversold"] = "BUY"
         reasons.append(SignalReason(
-            rule="rsi_oversold", passed=True,
+            rule="rsi_oversold", passed=True, value=float(latest["rsi"]),
             detail=f"RSI at {latest['rsi']:.1f} — oversold, potential bounce"
         ))
     elif latest["rsi"] > config.rsi_overbought:
         bearish_votes += 1
         rule_votes["rsi_overbought"] = "SELL"
         reasons.append(SignalReason(
-            rule="rsi_overbought", passed=True,
+            rule="rsi_overbought", passed=True, value=float(latest["rsi"]),
             detail=f"RSI at {latest['rsi']:.1f} — overbought, potential pullback"
         ))
     else:
         reasons.append(SignalReason(
-            rule="rsi_neutral", passed=False, detail=f"RSI at {latest['rsi']:.1f} — no extreme"
+            rule="rsi_neutral", passed=False, value=float(latest["rsi"]),
+            detail=f"RSI at {latest['rsi']:.1f} — no extreme"
         ))
 
-    # Rule 3: MACD crossover
+    # Rule 3: MACD crossover. value is the histogram (macd - signal) rather than a bare
+    # crossed/didn't-cross boolean — its sign and magnitude carry real information (how
+    # far above/below the signal line, not just whether a cross happened this bar) that
+    # the pass/fail flag alone throws away.
     total_rules += 1
+    macd_hist = float(latest["macd"] - latest["macd_signal"])
     macd_cross_up = prev["macd"] <= prev["macd_signal"] and latest["macd"] > latest["macd_signal"]
     macd_cross_down = prev["macd"] >= prev["macd_signal"] and latest["macd"] < latest["macd_signal"]
     if macd_cross_up:
         bullish_votes += 1
         rule_votes["macd_cross"] = "BUY"
-        reasons.append(SignalReason(rule="macd_cross", passed=True, detail="MACD crossed above signal line"))
+        reasons.append(SignalReason(
+            rule="macd_cross", passed=True, value=macd_hist, detail="MACD crossed above signal line"
+        ))
     elif macd_cross_down:
         bearish_votes += 1
         rule_votes["macd_cross"] = "SELL"
-        reasons.append(SignalReason(rule="macd_cross", passed=True, detail="MACD crossed below signal line"))
+        reasons.append(SignalReason(
+            rule="macd_cross", passed=True, value=macd_hist, detail="MACD crossed below signal line"
+        ))
     else:
-        reasons.append(SignalReason(rule="macd_cross", passed=False, detail="No recent MACD crossover"))
+        reasons.append(SignalReason(
+            rule="macd_cross", passed=False, value=macd_hist, detail="No recent MACD crossover"
+        ))
 
     # Rule 4: Volatility filter - skip signals when ATR indicates dead market
     atr_pct = (latest["atr"] / latest["close"]) * 100
     volatility_ok = atr_pct > config.volatility_threshold_pct
     reasons.append(SignalReason(
-        rule="volatility_filter", passed=volatility_ok,
+        rule="volatility_filter", passed=volatility_ok, value=float(atr_pct),
         detail=f"ATR is {atr_pct:.4f}% of price — {'sufficient' if volatility_ok else 'too low, likely illiquid session'}"
     ))
 
@@ -95,7 +113,7 @@ def apply_rules(
         hour = pd.Timestamp(latest["timestamp"]).hour
         session_ok = config.session_start_hour_utc <= hour < config.session_end_hour_utc
         reasons.append(SignalReason(
-            rule="session_filter", passed=session_ok,
+            rule="session_filter", passed=session_ok, value=float(hour),
             detail=f"{hour:02d}:00 UTC — {'within' if session_ok else 'outside'} the "
                    f"{config.session_start_hour_utc:02d}:00-{config.session_end_hour_utc:02d}:00 UTC window"
         ))

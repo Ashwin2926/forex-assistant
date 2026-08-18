@@ -9,6 +9,10 @@ export interface SignalReason {
   rule: string;
   passed: boolean;
   detail: string;
+  // The single most decision-relevant number behind this rule's verdict (RSI reading,
+  // normalized EMA spread %, MACD histogram, ATR%, or session hour) — absent on signals
+  // generated before this field existed.
+  value?: number | null;
 }
 
 export interface Signal {

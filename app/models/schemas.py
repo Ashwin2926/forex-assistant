@@ -56,6 +56,12 @@ class SignalReason(BaseModel):
     rule: str
     passed: bool
     detail: str
+    # The single most decision-relevant number behind this rule's verdict — RSI reading,
+    # normalized EMA spread (%), MACD histogram, ATR%, or session hour, depending on the
+    # rule. `detail` stays human-readable prose; `value` exists so this data doesn't have
+    # to be re-parsed out of that prose later for backtesting analysis or as an ML feature.
+    # Optional/defaulted so older stored signals (no `value`) still validate.
+    value: Optional[float] = None
 
 
 class Signal(BaseModel):
