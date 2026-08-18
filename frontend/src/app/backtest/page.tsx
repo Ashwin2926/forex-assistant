@@ -12,7 +12,34 @@ import {
   YAxis,
 } from "recharts";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, PROFILES, type BacktestRun, type OptimizeRankBy, type OptimizeResult, type Profile } from "@/lib/types";
+import { INTERVALS, PAIRS, PROFILES, type BacktestRun, type OptimizeRankBy, type OptimizeResult, type Profile, type RuleConfig } from "@/lib/types";
+
+// Mirrors PROFILE_DEFAULTS["intraday"] in signal_engine.py. Optimize without an explicit
+// `configs` body falls back to the backend's generic DEFAULT_OPTIMIZE_GRID, which never
+// sets session_filter_enabled -- fine for swing (which has no session filter anyway), but
+// for intraday that grid silently tests an unfiltered strategy that has nothing to do with
+// the live config, and the resulting hit-rate numbers aren't comparable to anything real.
+// Every candidate here keeps the session filter on, varying one or two axes at a time
+// around the actual live baseline (the first entry) instead.
+const INTRADAY_BASELINE: RuleConfig = {
+  ema_fast: 9, ema_slow: 21, rsi_period: 14, rsi_oversold: 30, rsi_overbought: 70,
+  macd_fast: 12, macd_slow: 26, macd_signal: 9, atr_period: 14,
+  volatility_threshold_pct: 0.02, session_filter_enabled: true,
+  session_start_hour_utc: 12, session_end_hour_utc: 16,
+  target_atr_mult: 1.5, stop_atr_mult: 1.0,
+};
+
+const INTRADAY_OPTIMIZE_GRID: RuleConfig[] = [
+  INTRADAY_BASELINE,
+  { ...INTRADAY_BASELINE, ema_fast: 7, ema_slow: 18 },
+  { ...INTRADAY_BASELINE, ema_fast: 12, ema_slow: 26 },
+  { ...INTRADAY_BASELINE, rsi_oversold: 25, rsi_overbought: 75 },
+  { ...INTRADAY_BASELINE, rsi_oversold: 35, rsi_overbought: 65 },
+  { ...INTRADAY_BASELINE, volatility_threshold_pct: 0.01 },
+  { ...INTRADAY_BASELINE, volatility_threshold_pct: 0.03 },
+  { ...INTRADAY_BASELINE, target_atr_mult: 0.5, stop_atr_mult: 1.25 },
+  { ...INTRADAY_BASELINE, ema_fast: 7, ema_slow: 18, rsi_oversold: 25, rsi_overbought: 75 },
+];
 
 export default function BacktestPage() {
   const [runs, setRuns] = useState<BacktestRun[]>([]);
@@ -81,6 +108,9 @@ export default function BacktestPage() {
         train_frac: trainFrac,
         min_directional_signals: minSignals,
         rank_by: rankBy,
+        // Only intraday needs a custom grid -- swing has no session filter, so the
+        // backend's generic default grid is already a fair, real-baseline comparison for it.
+        configs: optProfile === "intraday" ? INTRADAY_OPTIMIZE_GRID : undefined,
       });
       setOptimizeResult(result);
       await loadRuns();
