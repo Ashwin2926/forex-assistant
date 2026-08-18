@@ -11,13 +11,14 @@ name: Keep candle data fresh
 # every 4 hours and a 1day candle once a day, so refreshing them on the same 15-minute
 # cadence as 5min/15min was pure waste: 5 intervals x 4 pairs x 96 runs/day = 1,920
 # Twelve Data calls/day, well over the free tier's 800/day cap. Splitting by how often
-# each interval's underlying candle actually advances brings that down to ~890/day
-# without losing any real freshness. Each entry is minute-offset from the others so
-# they don't collide on the same wall-clock minute; github.event.schedule (only set on
-# schedule-triggered runs, not workflow_dispatch) tells each step which cron fired it.
+# each interval's underlying candle actually advances, plus running the fast tier every
+# 30 min instead of 15, brings this down to ~508/day (5min+15min: 384, 1h: 96, 4h: 24,
+# 1day: 4) with real headroom under the cap. Each entry is minute-offset from the others
+# so they don't collide on the same wall-clock minute; github.event.schedule (only set
+# on schedule-triggered runs, not workflow_dispatch) tells each step which cron fired it.
 on:
   schedule:
-    - cron: "*/15 * * * *"  # 5min + 15min candles
+    - cron: "*/30 * * * *"  # 5min + 15min candles
     - cron: "3 * * * *"     # + 1h candles, hourly
     - cron: "7 */4 * * *"   # + 4h candles, every 4 hours
     - cron: "11 0 * * *"    # + 1day candles, once daily at 00:11 UTC
