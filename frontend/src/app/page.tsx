@@ -304,6 +304,11 @@ export default function SignalFeedPage() {
                           </span>
                           <span>
                             <span className="font-mono text-zinc-500">[{r.rule}]</span> {r.detail}
+                            {r.value != null && (
+                              <span className="ml-1 font-mono text-zinc-400">
+                                ({parseFloat(r.value.toFixed(4))})
+                              </span>
+                            )}
                           </span>
                         </li>
                       ))}
