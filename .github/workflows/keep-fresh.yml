@@ -6,9 +6,21 @@ name: Keep candle data fresh
 # only resumes on the next cold start, so candle data could go stale for days without
 # any error being raised. Driving ingestion from here instead means it runs on a
 # schedule GitHub controls, independent of whether the backend instance is asleep.
+#
+# Four cron entries instead of one "*/15 refresh everything" — a 4h candle only closes
+# every 4 hours and a 1day candle once a day, so refreshing them on the same 15-minute
+# cadence as 5min/15min was pure waste: 5 intervals x 4 pairs x 96 runs/day = 1,920
+# Twelve Data calls/day, well over the free tier's 800/day cap. Splitting by how often
+# each interval's underlying candle actually advances brings that down to ~890/day
+# without losing any real freshness. Each entry is minute-offset from the others so
+# they don't collide on the same wall-clock minute; github.event.schedule (only set on
+# schedule-triggered runs, not workflow_dispatch) tells each step which cron fired it.
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"  # 5min + 15min candles
+    - cron: "3 * * * *"     # + 1h candles, hourly
+    - cron: "7 */4 * * *"   # + 4h candles, every 4 hours
+    - cron: "11 0 * * *"    # + 1day candles, once daily at 00:11 UTC
   workflow_dispatch: {}
 
 jobs:
@@ -24,22 +36,35 @@ jobs:
       # on FastAPI Cloud (named to match what's already there, not related to the JWT
       # signing key AUTH_SECRET_KEY despite the similar name). The secret is named
       # AUTOMATION_TOKEN here on the GitHub side; only the value has to match, not the name.
-      - name: Ingest candles (5min, 15min, 1h, 4h, 1day)
+      - name: Ingest 5min + 15min candles
         run: |
-          for interval in 5min 15min 1h 4h 1day; do
+          for interval in 5min 15min; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5"
           done
+      - name: Ingest 1h candles
+        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
+      - name: Ingest 4h candles
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/4h?output_size=5"
+      - name: Ingest 1day candles
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1day?output_size=5"
       # Generation was previously frontend-only (api.generateSignal, called when someone
       # loads the dashboard) — ingest/score ran unattended but no new signals appeared
-      # unless a human visited the site. These two steps make generation unattended too.
+      # unless a human visited the site. These steps make generation unattended too, on
+      # the same per-interval cadence as that interval's own ingest step above.
       # Interval-to-profile pairing: intraday (EMA9/21, session-filtered) for the two
       # fastest intervals, swing (EMA50/200, no session filter) for the three slower ones —
       # matches the existing 15min/intraday and 1h/swing convention the frontend and README
       # already use; the long EMAs/no session-filter combo would be meaningless on 5min
       # candles and vice versa for intraday's short EMAs on daily candles. create_signal is
       # itself de-duped (see app/main.py) against the last live signal for the same
-      # pair/interval/profile, so re-running this every 15 minutes won't insert duplicates
-      # when the underlying candle hasn't advanced.
+      # pair/interval/profile, so re-running this won't insert duplicates when the
+      # underlying candle hasn't advanced.
       - name: Generate intraday signals (5min, 15min)
         run: |
           for interval in 5min 15min; do
@@ -48,13 +73,26 @@ jobs:
                 "$API_BASE/signals/$interval/intraday?pair=${pair/\//%2F}"
             done
           done
-      - name: Generate swing signals (1h, 4h, 1day)
+      - name: Generate swing signals (1h)
+        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
-          for interval in 1h 4h 1day; do
-            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-                "$API_BASE/signals/$interval/swing?pair=${pair/\//%2F}"
-            done
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/signals/1h/swing?pair=${pair/\//%2F}"
+          done
+      - name: Generate swing signals (4h)
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/signals/4h/swing?pair=${pair/\//%2F}"
+          done
+      - name: Generate swing signals (1day)
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/signals/1day/swing?pair=${pair/\//%2F}"
           done
       - name: Score pending live signals
         run: |
