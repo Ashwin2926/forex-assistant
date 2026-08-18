@@ -45,10 +45,10 @@ DEFAULT_OPTIMIZE_GRID = [
     RuleConfig(rsi_oversold=25, rsi_overbought=75, target_atr_mult=0.5, stop_atr_mult=1.25),
 ]
 
-# AuthMiddleware added first so CORSMiddleware ends up outermost (Starlette makes the
-# *last*-added middleware the outermost one) — otherwise a 401 from AuthMiddleware would
-# skip CORS entirely and the browser would report a CORS error instead of surfacing 401.
-app.add_middleware(AuthMiddleware)
+# Temporarily disabled while debugging why AUTH_SECRET_KEY2/login auth wasn't
+# authenticating on FastAPI Cloud even with a freshly-redeployed matching value.
+# Every route is open until this is put back — re-enable before any real use.
+# app.add_middleware(AuthMiddleware)
 
 # Local Next.js dev server needs to call this API directly from the browser.
 app.add_middleware(
