@@ -25,8 +25,30 @@ jobs:
       # signing key AUTH_SECRET_KEY despite the similar name). The secret is named
       # AUTOMATION_TOKEN here on the GitHub side; only the value has to match, not the name.
       - name: Ingest 15min candles
-        run: curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/15min?output_size=5"
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/15min?output_size=5"
       - name: Ingest 1h candles
-        run: curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
+      # Generation was previously frontend-only (api.generateSignal, called when someone
+      # loads the dashboard) — ingest/score ran unattended but no new signals appeared
+      # unless a human visited the site. These two steps make generation unattended too,
+      # matching the interval/profile pairing the frontend and README already use
+      # (intraday on 15min, swing on 1h). create_signal is itself de-duped (see app/main.py)
+      # against the last live signal for the same pair/interval/profile, so re-running this
+      # every 15 minutes won't insert duplicates when the underlying candle hasn't advanced.
+      - name: Generate intraday signals (15min)
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/signals/15min/intraday?pair=${pair/\//%2F}"
+          done
+      - name: Generate swing signals (1h)
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/signals/1h/swing?pair=${pair/\//%2F}"
+          done
       - name: Score pending live signals
-        run: curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/signals/score"
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/signals/score"
