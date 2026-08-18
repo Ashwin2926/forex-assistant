@@ -1,6 +1,6 @@
 import pandas as pd
 from app.core.database import candles_collection, signals_collection
-from app.services.signal_engine import label_outcome
+from app.services.signal_engine import label_outcome, spread_cost_pct
 
 DEFAULT_MAX_LOOKFORWARD = 20
 
@@ -56,6 +56,7 @@ async def score_pending_signals(max_lookforward: int = DEFAULT_MAX_LOOKFORWARD) 
         pct_move = ((outcome_price - doc["price_at_signal"]) / doc["price_at_signal"]) * 100
         if doc["direction"] == "SELL":
             pct_move = -pct_move
+        pct_move -= spread_cost_pct(doc["pair"], doc["price_at_signal"])  # every real trade pays this, win or lose
 
         await signals_collection.update_one(
             {"_id": doc["_id"]},

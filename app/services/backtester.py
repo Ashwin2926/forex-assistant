@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 from app.models.schemas import Signal, BacktestRun, RuleStat, RuleConfig
 from app.services.indicators import add_all_indicators
-from app.services.signal_engine import apply_rules, decide, compute_atr_target_stop, label_outcome
+from app.services.signal_engine import apply_rules, decide, compute_atr_target_stop, label_outcome, spread_cost_pct
 
 
 def run_backtest(
@@ -113,6 +113,7 @@ def run_backtest(
         pct_move = ((outcome_price - entry_price) / entry_price) * 100
         if direction == "SELL":
             pct_move = -pct_move  # normalize: positive = favorable move regardless of direction
+        pct_move -= spread_cost_pct(pair, entry_price)  # every real trade pays this, win or lose
 
         if status == "hit":
             hits += 1

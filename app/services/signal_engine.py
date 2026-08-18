@@ -204,6 +204,38 @@ def compute_atr_target_stop(
     raise ValueError(f"No target/stop for direction={direction!r}; only BUY/SELL have one.")
 
 
+# Rough typical retail spread per pair, in raw price units rather than pips -- JPY pairs
+# quote 2 decimals (1 pip = 0.01) vs 4 for the other majors (1 pip = 0.0001), so price
+# units sidestep that difference entirely. These are ballpark figures for a typical
+# retail account, NOT sourced from Deriv or any specific broker's actual live spread
+# (paper_trading.py already notes it doesn't model Deriv's real spread/commission either,
+# for the same reason: nobody's confirmed the real number yet). Until that's confirmed,
+# every expectancy number computed with this should be read as an upper bound on the real
+# edge, not a validated one -- real spreads also widen outside major sessions and around
+# news, which a single fixed number per pair can't capture.
+TYPICAL_SPREAD_PRICE: dict[str, float] = {
+    "EUR/USD": 0.00010,  # ~1.0 pip
+    "GBP/USD": 0.00015,  # ~1.5 pips
+    "USD/JPY": 0.010,    # ~1.0 pip -- JPY pip size is 0.01, not 0.0001
+    "AUD/USD": 0.00015,  # ~1.5 pips
+}
+DEFAULT_SPREAD_PRICE = 0.00015  # fallback for any pair not listed above
+
+
+def spread_cost_pct(pair: str, entry_price: float) -> float:
+    """
+    Round-trip spread cost as a % of entry price, in the same units as pct_move. Every
+    real trade pays this on entry and exit regardless of whether it wins or loses -- the
+    backtester and live outcome scoring both previously computed pct_move (and therefore
+    expectancy_pct) as if trades executed at the exact recorded close price with zero cost.
+    Subtracting this here means expectancy now reflects a realistic cost instead of a
+    frictionless simulation; it does NOT change hit/miss/expired classification, since
+    that's still purely about whether target_price/stop_price was touched.
+    """
+    spread = TYPICAL_SPREAD_PRICE.get(pair, DEFAULT_SPREAD_PRICE)
+    return (spread / entry_price) * 100
+
+
 def label_outcome(
     future_candles: pd.DataFrame, direction: str, target_price: float, stop_price: float, max_lookforward: int,
 ) -> tuple[str, Optional[float], Optional[datetime], Optional[int]]:
