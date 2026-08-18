@@ -24,30 +24,37 @@ jobs:
       # on FastAPI Cloud (named to match what's already there, not related to the JWT
       # signing key AUTH_SECRET_KEY despite the similar name). The secret is named
       # AUTOMATION_TOKEN here on the GitHub side; only the value has to match, not the name.
-      - name: Ingest 15min candles
+      - name: Ingest candles (5min, 15min, 1h, 4h, 1day)
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/15min?output_size=5"
-      - name: Ingest 1h candles
-        run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
+          for interval in 5min 15min 1h 4h 1day; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5"
+          done
       # Generation was previously frontend-only (api.generateSignal, called when someone
       # loads the dashboard) — ingest/score ran unattended but no new signals appeared
-      # unless a human visited the site. These two steps make generation unattended too,
-      # matching the interval/profile pairing the frontend and README already use
-      # (intraday on 15min, swing on 1h). create_signal is itself de-duped (see app/main.py)
-      # against the last live signal for the same pair/interval/profile, so re-running this
-      # every 15 minutes won't insert duplicates when the underlying candle hasn't advanced.
-      - name: Generate intraday signals (15min)
+      # unless a human visited the site. These two steps make generation unattended too.
+      # Interval-to-profile pairing: intraday (EMA9/21, session-filtered) for the two
+      # fastest intervals, swing (EMA50/200, no session filter) for the three slower ones —
+      # matches the existing 15min/intraday and 1h/swing convention the frontend and README
+      # already use; the long EMAs/no session-filter combo would be meaningless on 5min
+      # candles and vice versa for intraday's short EMAs on daily candles. create_signal is
+      # itself de-duped (see app/main.py) against the last live signal for the same
+      # pair/interval/profile, so re-running this every 15 minutes won't insert duplicates
+      # when the underlying candle hasn't advanced.
+      - name: Generate intraday signals (5min, 15min)
         run: |
-          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/15min/intraday?pair=${pair/\//%2F}"
+          for interval in 5min 15min; do
+            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/signals/$interval/intraday?pair=${pair/\//%2F}"
+            done
           done
-      - name: Generate swing signals (1h)
+      - name: Generate swing signals (1h, 4h, 1day)
         run: |
-          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/1h/swing?pair=${pair/\//%2F}"
+          for interval in 1h 4h 1day; do
+            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/signals/$interval/swing?pair=${pair/\//%2F}"
+            done
           done
       - name: Score pending live signals
         run: |
