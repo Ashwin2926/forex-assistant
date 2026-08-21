@@ -195,11 +195,11 @@ async def signal_accuracy(pair: str | None = None, profile: str | None = None, l
     you whether live performance is actually tracking what was backtested; it often won't
     match at first, and that gap is itself useful signal, not a bug to explain away.
 
-    sample_size is capped at `limit` (a rolling window, so hit-rate stays responsive to
-    recent performance instead of getting diluted as history grows forever) and will
-    plateau at that number once enough signals have resolved — total_resolved is the real,
-    uncapped count via count_documents on the same filter, so "is sample_size stuck" has an
-    actual answer instead of looking like a stalled number.
+    sample_size/hits/misses/expired are capped at `limit` (a rolling window, so hit-rate
+    stays responsive to recent performance instead of getting diluted as history grows
+    forever) and will plateau once enough signals have resolved — the total_* fields are
+    the real, uncapped counts (count_documents per status on the same filter) so "is
+    sample_size stuck" has an actual answer instead of looking like a stalled number.
     """
     query: dict = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
     if pair:
@@ -208,22 +208,30 @@ async def signal_accuracy(pair: str | None = None, profile: str | None = None, l
         query["profile"] = profile
     cursor = signals_collection.find(query).sort("timestamp", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
-    total_resolved = await signals_collection.count_documents(query)
 
     hits = sum(1 for d in docs if d["status"] == "hit")
     misses = sum(1 for d in docs if d["status"] == "miss")
     expired = sum(1 for d in docs if d["status"] == "expired")
     total = len(docs)
 
+    total_hits = await signals_collection.count_documents({**query, "status": "hit"})
+    total_misses = await signals_collection.count_documents({**query, "status": "miss"})
+    total_expired = await signals_collection.count_documents({**query, "status": "expired"})
+    total_resolved = total_hits + total_misses + total_expired
+
     return {
         "pair": pair,
         "profile": profile,
         "sample_size": total,
-        "total_resolved": total_resolved,
         "hits": hits,
         "misses": misses,
         "expired": expired,
         "hit_rate_pct": round(hits / total * 100, 1) if total else None,
+        "total_resolved": total_resolved,
+        "total_hits": total_hits,
+        "total_misses": total_misses,
+        "total_expired": total_expired,
+        "total_hit_rate_pct": round(total_hits / total_resolved * 100, 1) if total_resolved else None,
     }
 
 

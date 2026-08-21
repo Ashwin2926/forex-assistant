@@ -225,11 +225,23 @@ export default function SignalFeedPage() {
               once enough candles have arrived).
             </p>
           ) : (
-            <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <AccuracyStat label="Hit rate" value={accuracy.hit_rate_pct != null ? `${accuracy.hit_rate_pct}%` : "—"} />
-              <AccuracyStat label="Sample size (last 100)" value={String(accuracy.sample_size)} />
-              <AccuracyStat label="Total resolved" value={String(accuracy.total_resolved)} />
-              <AccuracyStat label="Hit / Miss / Expired" value={`${accuracy.hits} / ${accuracy.misses} / ${accuracy.expired}`} />
+            <div className="mt-3 flex flex-col gap-4">
+              <div>
+                <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500">Rolling (last 100)</p>
+                <div className="mt-1 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                  <AccuracyStat label="Hit rate" value={accuracy.hit_rate_pct != null ? `${accuracy.hit_rate_pct}%` : "—"} />
+                  <AccuracyStat label="Sample size" value={String(accuracy.sample_size)} />
+                  <AccuracyStat label="Hit / Miss / Expired" value={`${accuracy.hits} / ${accuracy.misses} / ${accuracy.expired}`} />
+                </div>
+              </div>
+              <div>
+                <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500">All-time</p>
+                <div className="mt-1 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                  <AccuracyStat label="Hit rate" value={accuracy.total_hit_rate_pct != null ? `${accuracy.total_hit_rate_pct}%` : "—"} />
+                  <AccuracyStat label="Total resolved" value={String(accuracy.total_resolved)} />
+                  <AccuracyStat label="Hit / Miss / Expired" value={`${accuracy.total_hits} / ${accuracy.total_misses} / ${accuracy.total_expired}`} />
+                </div>
+              </div>
             </div>
           )
         )}

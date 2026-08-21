@@ -191,12 +191,18 @@ export interface PaperTradeResult {
 export interface SignalAccuracy {
   pair: string | null;
   profile: Profile | null;
-  sample_size: number; // rolling window, capped at the request's `limit` (default 100) -- plateaus there, not a running total
-  total_resolved: number; // real uncapped count of every resolved live signal matching the same filter
+  // Rolling window, capped at the request's `limit` (default 100) -- plateaus there, not a running total.
+  sample_size: number;
   hits: number;
   misses: number;
   expired: number;
   hit_rate_pct: number | null;
+  // Real uncapped counts/rate across every resolved live signal matching the same filter.
+  total_resolved: number;
+  total_hits: number;
+  total_misses: number;
+  total_expired: number;
+  total_hit_rate_pct: number | null;
 }
 
 export interface CandlePoint {
