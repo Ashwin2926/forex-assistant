@@ -36,6 +36,40 @@ export interface Signal {
   candles_to_outcome?: number | null;
 }
 
+export interface StrategyCall {
+  strategy: string; // "trend" | "bollinger" | "support_resistance" | "candlestick" | "stoch_adx"
+  direction: Direction;
+  entry_price: number;
+  target_price: number | null;
+  stop_price: number | null;
+  reasons: SignalReason[];
+}
+
+export interface ConsensusSignal {
+  _id?: string;
+  pair: string;
+  interval: string;
+  timestamp: string;
+  direction: "BUY" | "SELL";
+  entry_price: number;
+  target_price: number;
+  stop_price: number;
+  agreeing_count: number;
+  strategy_calls: StrategyCall[];
+  status: SignalStatus;
+  outcome_price?: number | null;
+  outcome_timestamp?: string | null;
+  outcome_pct_move?: number | null;
+  candles_to_outcome?: number | null;
+  source: SignalSource;
+  run_id?: string | null;
+}
+
+export interface ConsensusCheckResult {
+  consensus: ConsensusSignal | null;
+  strategy_calls: StrategyCall[];
+}
+
 export interface RuleConfig {
   ema_fast: number;
   ema_slow: number;
@@ -67,7 +101,7 @@ export interface BacktestRun {
   run_id: string;
   pair: string;
   interval: string;
-  profile: Profile;
+  profile: Profile | "consensus"; // "consensus" from POST /consensus/backtest/{interval}, reusing this model
   created_at: string;
   rule_config: RuleConfig;
   target_atr_mult: number;
@@ -104,6 +138,11 @@ export interface OptimizeResult {
   train: BacktestRun;
   test: BacktestRun;
   candidates_evaluated: OptimizeCandidate[];
+}
+
+export interface ConsensusBacktestResult {
+  train: BacktestRun;
+  test: BacktestRun;
 }
 
 export type PaperTradeStatus = "open" | "won" | "lost" | "error";

@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RuleConfig, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RuleConfig, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -143,6 +143,37 @@ export const api = {
     if (params.limit) qs.set("limit", String(params.limit));
     const query = qs.toString();
     return request<Signal[]>(`/backtest/runs/${runId}/signals${query ? `?${query}` : ""}`);
+  },
+
+  generateConsensus(pair: string, interval: string) {
+    // pair goes in the query string, not the path — a literal '/' in a path segment
+    // breaks Starlette's routing even when percent-encoded.
+    return request<ConsensusCheckResult>(
+      `/consensus/${interval}?pair=${encodeURIComponent(pair)}`,
+      { method: "POST" },
+    );
+  },
+
+  listConsensusSignals(params: { pair?: string; limit?: number } = {}) {
+    const qs = new URLSearchParams();
+    if (params.pair) qs.set("pair", params.pair);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const query = qs.toString();
+    return request<ConsensusSignal[]>(`/consensus${query ? `?${query}` : ""}`);
+  },
+
+  runConsensusBacktest(
+    pair: string,
+    interval: string,
+    opts: { train_frac?: number; max_lookforward?: number } = {},
+  ) {
+    const qs = new URLSearchParams({ pair });
+    if (opts.train_frac !== undefined) qs.set("train_frac", String(opts.train_frac));
+    if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
+    return request<ConsensusBacktestResult>(
+      `/consensus/backtest/${interval}?${qs.toString()}`,
+      { method: "POST" },
+    );
   },
 
   getPaperTradeAccount() {

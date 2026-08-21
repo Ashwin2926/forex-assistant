@@ -305,10 +305,10 @@ async def create_consensus_signal(interval: str, pair: str):
         and last["target_price"] == consensus.target_price
     ):
         last["_id"] = str(last["_id"])
-        return last
+        return {"consensus": last, "strategy_calls": [c.model_dump() for c in calls]}
 
     await consensus_signals_collection.insert_one(consensus.model_dump())
-    return consensus
+    return {"consensus": consensus, "strategy_calls": [c.model_dump() for c in calls]}
 
 
 @app.get("/consensus")
