@@ -191,7 +191,8 @@ export interface PaperTradeResult {
 export interface SignalAccuracy {
   pair: string | null;
   profile: Profile | null;
-  sample_size: number;
+  sample_size: number; // rolling window, capped at the request's `limit` (default 100) -- plateaus there, not a running total
+  total_resolved: number; // real uncapped count of every resolved live signal matching the same filter
   hits: number;
   misses: number;
   expired: number;

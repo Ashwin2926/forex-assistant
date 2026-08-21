@@ -227,7 +227,8 @@ export default function SignalFeedPage() {
           ) : (
             <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
               <AccuracyStat label="Hit rate" value={accuracy.hit_rate_pct != null ? `${accuracy.hit_rate_pct}%` : "—"} />
-              <AccuracyStat label="Sample size" value={String(accuracy.sample_size)} />
+              <AccuracyStat label="Sample size (last 100)" value={String(accuracy.sample_size)} />
+              <AccuracyStat label="Total resolved" value={String(accuracy.total_resolved)} />
               <AccuracyStat label="Hit / Miss / Expired" value={`${accuracy.hits} / ${accuracy.misses} / ${accuracy.expired}`} />
             </div>
           )
