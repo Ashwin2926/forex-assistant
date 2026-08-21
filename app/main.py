@@ -254,6 +254,23 @@ async def get_candles(interval: str, pair: str, profile: str = "swing", limit: i
     ]
 
 
+@app.post("/consensus/score")
+async def score_consensus_signals(max_lookforward: int = 20):
+    """
+    Closes the loop for live consensus signals the same way /signals/score does for regular
+    ones -- resolves pending consensus signals to hit/miss/expired against candles that have
+    arrived since they fired. Separate endpoint (not folded into /signals/score) because
+    consensus signals live in their own collection with a different shape.
+
+    Must stay declared before /consensus/{interval} below -- Starlette matches routes in
+    declaration order, and {interval} is a single dynamic path segment that would otherwise
+    swallow a request to the literal path "/consensus/score" (interval="score") before it
+    ever reached this one. (No such collision for /consensus/backtest/{interval}, which has
+    two segments after /consensus/ and so never matches the single-segment {interval} pattern.)
+    """
+    return await score_pending_consensus_signals(max_lookforward=max_lookforward)
+
+
 @app.post("/consensus/{interval}")
 async def create_consensus_signal(interval: str, pair: str):
     """
@@ -319,17 +336,6 @@ async def list_consensus_signals(pair: str | None = None, limit: int = 50):
     for d in docs:
         d["_id"] = str(d["_id"])
     return docs
-
-
-@app.post("/consensus/score")
-async def score_consensus_signals(max_lookforward: int = 20):
-    """
-    Closes the loop for live consensus signals the same way /signals/score does for regular
-    ones -- resolves pending consensus signals to hit/miss/expired against candles that have
-    arrived since they fired. Separate endpoint (not folded into /signals/score) because
-    consensus signals live in their own collection with a different shape.
-    """
-    return await score_pending_consensus_signals(max_lookforward=max_lookforward)
 
 
 @app.post("/consensus/backtest/{interval}")
