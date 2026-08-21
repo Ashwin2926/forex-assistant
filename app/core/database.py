@@ -12,6 +12,7 @@ signals_collection = db["signals"]                    # live buy/sell/hold signa
 backtest_signals_collection = db["backtest_signals"]  # per-signal backtest replay results
 backtest_runs_collection = db["backtest_runs"]        # one summary doc per backtest run
 paper_trades_collection = db["paper_trades"]          # Deriv Multipliers demo-account executions
+consensus_signals_collection = db["consensus_signals"]  # 4-of-5 multi-strategy agreement signals
 
 
 async def init_indexes():
@@ -26,3 +27,5 @@ async def init_indexes():
     await backtest_runs_collection.create_index([("pair", 1), ("interval", 1), ("profile", 1), ("created_at", -1)])
     await paper_trades_collection.create_index([("status", 1)])
     await paper_trades_collection.create_index([("opened_at", -1)])
+    await consensus_signals_collection.create_index([("pair", 1), ("timestamp", -1)])
+    await consensus_signals_collection.create_index([("status", 1)])

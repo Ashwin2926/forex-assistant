@@ -88,6 +88,49 @@ class Signal(BaseModel):
     candles_to_outcome: Optional[int] = None
 
 
+class StrategyCall(BaseModel):
+    """
+    One strategy's independent verdict at a single bar -- the unit the consensus engine votes
+    over (see app/services/consensus.py). Every strategy in app/services/strategies.py returns
+    one of these with the same shape (including `reasons`, reusing SignalReason so every
+    strategy stays explainable and ML-feature-ready the same way the trend strategy already
+    is, not just a bare direction).
+    """
+    strategy: str  # "trend" | "bollinger" | "support_resistance" | "candlestick" | "stoch_adx"
+    direction: Literal["BUY", "SELL", "HOLD"]
+    entry_price: float
+    target_price: Optional[float] = None  # None when direction == HOLD
+    stop_price: Optional[float] = None
+    reasons: list[SignalReason]
+
+
+class ConsensusSignal(BaseModel):
+    """
+    Fires only when >= MIN_AGREEING strategies (see consensus.py) agree on direction AND their
+    entry/exit prices land within PROXIMITY_ATR_MULT of each other -- a separate, additive
+    layer on top of the single-strategy Signal model above, not a replacement. entry_price/
+    target_price/stop_price are the mean of the agreeing strategies' own numbers.
+    """
+    pair: str
+    interval: str
+    timestamp: datetime
+    direction: Literal["BUY", "SELL"]  # HOLD never produces a consensus signal
+    entry_price: float
+    target_price: float
+    stop_price: float
+    agreeing_count: int
+    strategy_calls: list[StrategyCall]  # all 5, so disagreement is visible too, not just the winners
+
+    status: Literal["pending", "hit", "miss", "expired"] = "pending"
+    outcome_price: Optional[float] = None
+    outcome_timestamp: Optional[datetime] = None
+    outcome_pct_move: Optional[float] = None
+    candles_to_outcome: Optional[int] = None
+
+    source: Literal["live", "backtest"] = "live"
+    run_id: Optional[str] = None
+
+
 class RuleStat(BaseModel):
     """How often a rule fired, and how often signals it agreed with turned out to hit."""
     rule: str

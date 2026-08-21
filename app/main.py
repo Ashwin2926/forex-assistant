@@ -12,12 +12,15 @@ from app.core.database import (
     backtest_signals_collection,
     backtest_runs_collection,
     paper_trades_collection,
+    consensus_signals_collection,
 )
 from app.models.schemas import LoginRequest, RuleConfig
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for
-from app.services.backtester import run_backtest
+from app.services.backtester import run_backtest, run_consensus_backtest
+from app.services.strategies import STRATEGIES
+from app.services.consensus import check_consensus
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import score_pending_signals
@@ -249,6 +252,131 @@ async def get_candles(interval: str, pair: str, profile: str = "swing", limit: i
         }
         for _, row in indicator_df.iterrows()
     ]
+
+
+@app.post("/consensus/{interval}")
+async def create_consensus_signal(interval: str, pair: str):
+    """
+    Runs all 5 independent strategies (app/services/strategies.py) against stored candles and
+    checks for consensus (app/services/consensus.py) — >= 4 of 5 agreeing on direction and
+    within PROXIMITY_ATR_MULT of each other's entry/exit. Always returns all 5 strategy_calls
+    alongside the verdict, so "no consensus right now" is visibly the 5 calls disagreeing,
+    not an opaque empty response.
+
+    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
+    """
+    # Consensus has no PROFILE_DEFAULTS entry of its own; swing's config (no session filter)
+    # is the more neutral pick of the two since consensus isn't scoped to a session window.
+    config = default_config_for("swing", pair)
+    cursor = candles_collection.find(
+        {"pair": pair, "interval": interval}
+    ).sort("timestamp", -1).limit(500)
+    docs = await cursor.to_list(length=500)
+    docs.reverse()
+
+    min_needed = 30  # covers every strategy's own warmup (see run_consensus_backtest)
+    if len(docs) < min_needed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for consensus. "
+                    f"Run /ingest/{interval} first."
+        )
+
+    df = pd.DataFrame(docs)
+    indicator_df = add_all_indicators(df, config)
+    calls = [fn(indicator_df, config) for fn in STRATEGIES]
+    latest = indicator_df.iloc[-1]
+    consensus = check_consensus(calls, pair, interval, latest["timestamp"], float(latest["atr"]))
+
+    if consensus is None:
+        return {"consensus": None, "strategy_calls": [c.model_dump() for c in calls]}
+
+    # De-dupe against the last stored consensus signal for this pair/interval, same idea as
+    # create_signal's dedup — avoid inserting an identical duplicate when the underlying
+    # candle hasn't advanced since the last check.
+    last = await consensus_signals_collection.find_one(
+        {"pair": pair, "interval": interval, "source": "live"},
+        sort=[("timestamp", -1)],
+    )
+    if (
+        last is not None
+        and last["direction"] == consensus.direction
+        and last["entry_price"] == consensus.entry_price
+        and last["target_price"] == consensus.target_price
+    ):
+        last["_id"] = str(last["_id"])
+        return last
+
+    await consensus_signals_collection.insert_one(consensus.model_dump())
+    return consensus
+
+
+@app.get("/consensus")
+async def list_consensus_signals(pair: str | None = None, limit: int = 50):
+    query = {"pair": pair} if pair else {}
+    cursor = consensus_signals_collection.find(query).sort("timestamp", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+
+@app.post("/consensus/backtest/{interval}")
+async def backtest_consensus(interval: str, pair: str, train_frac: float = 0.7, max_lookforward: int = 20):
+    """
+    Train/test validated backtest of the consensus mechanism itself — same discipline as
+    /backtest/optimize: run on the first train_frac of history, then re-score on the untouched
+    remaining tail. There's no grid to search here, but the split still catches a mechanism
+    that only looks good on one slice of history by chance rather than a real, repeatable edge.
+    """
+    if not 0 < train_frac < 1:
+        raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
+
+    config = default_config_for("swing", pair)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
+    docs = await cursor.to_list(length=None)
+    if not docs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.",
+        )
+
+    df = pd.DataFrame(docs)
+    split_idx = int(len(df) * train_frac)
+
+    if split_idx < 31:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Train slice ({split_idx} candles) is too short for consensus's warmup needs (30+). "
+                    f"Ingest more history or lower train_frac.",
+        )
+    if len(df) - split_idx - max_lookforward < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Test slice is too short ({len(df) - split_idx} candles) for max_lookforward={max_lookforward}. "
+                    f"Ingest more history or raise train_frac.",
+        )
+
+    train_df = df.iloc[:split_idx]
+    try:
+        train_run, _train_signals = run_consensus_backtest(
+            train_df, pair, interval, config, max_lookforward=max_lookforward,
+        )
+        test_run, _test_signals = run_consensus_backtest(
+            df, pair, interval, config, max_lookforward=max_lookforward, eval_start_index=split_idx,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Individual consensus signals aren't persisted to backtest_signals_collection -- that
+    # collection stores Signal-shaped docs (reasons/profile/confidence) for the existing
+    # /backtest/runs/{run_id}/signals endpoint, and ConsensusSignal's shape (strategy_calls,
+    # no profile/confidence) doesn't match. The two BacktestRun summaries below (tagged
+    # profile="consensus") are what the frontend train/test view actually needs.
+    await backtest_runs_collection.insert_one(train_run.model_dump())
+    await backtest_runs_collection.insert_one(test_run.model_dump())
+
+    return {"train": train_run, "test": test_run}
 
 
 @app.post("/backtest/{interval}/{profile}")
