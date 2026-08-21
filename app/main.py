@@ -23,7 +23,7 @@ from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
-from app.services.outcome_scoring import score_pending_signals
+from app.services.outcome_scoring import score_pending_signals, score_pending_consensus_signals
 
 settings = get_settings()
 app = FastAPI(title="Forex Trading Assistant")
@@ -319,6 +319,17 @@ async def list_consensus_signals(pair: str | None = None, limit: int = 50):
     for d in docs:
         d["_id"] = str(d["_id"])
     return docs
+
+
+@app.post("/consensus/score")
+async def score_consensus_signals(max_lookforward: int = 20):
+    """
+    Closes the loop for live consensus signals the same way /signals/score does for regular
+    ones -- resolves pending consensus signals to hit/miss/expired against candles that have
+    arrived since they fired. Separate endpoint (not folded into /signals/score) because
+    consensus signals live in their own collection with a different shape.
+    """
+    return await score_pending_consensus_signals(max_lookforward=max_lookforward)
 
 
 @app.post("/consensus/backtest/{interval}")

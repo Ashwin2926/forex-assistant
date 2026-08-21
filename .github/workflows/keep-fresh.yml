@@ -97,6 +97,43 @@ jobs:
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/signals/1day/swing?pair=${pair/\//%2F}"
           done
+      # Consensus (app/services/consensus.py) is a separate, additive signal source on top
+      # of intraday/swing -- checked on the same per-interval cadence as the generate steps
+      # above, reusing the candles that step already ingested (zero extra Twelve Data calls).
+      # Only fires a stored signal on genuine 4-of-5 agreement, so most of these calls are
+      # expected to return "no consensus" -- that's normal, not a sign anything's broken.
+      - name: Check consensus (5min, 15min)
+        run: |
+          for interval in 5min 15min; do
+            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/consensus/$interval?pair=${pair/\//%2F}"
+            done
+          done
+      - name: Check consensus (1h)
+        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/consensus/1h?pair=${pair/\//%2F}"
+          done
+      - name: Check consensus (4h)
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/consensus/4h?pair=${pair/\//%2F}"
+          done
+      - name: Check consensus (1day)
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/consensus/1day?pair=${pair/\//%2F}"
+          done
       - name: Score pending live signals
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/signals/score"
+      - name: Score pending consensus signals
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/consensus/score"
