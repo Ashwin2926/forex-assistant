@@ -36,6 +36,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               <Link href="/" className="hover:text-zinc-900 dark:hover:text-zinc-100">
                 Signal Feed
               </Link>
+              <Link href="/trading-signals" className="hover:text-zinc-900 dark:hover:text-zinc-100">
+                Trading Signals
+              </Link>
               <Link href="/chart" className="hover:text-zinc-900 dark:hover:text-zinc-100">
                 Chart
               </Link>

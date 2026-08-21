@@ -4,16 +4,21 @@ import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { INTERVALS, PAIRS, type BacktestRun, type ConsensusBacktestResult, type ConsensusSignal, type StrategyCall } from "@/lib/types";
 
+interface GridCell {
+  pair: string;
+  interval: string;
+  consensus: ConsensusSignal | null;
+  strategyCalls: StrategyCall[];
+  error?: string;
+}
+
 export default function ConsensusPage() {
+  const [grid, setGrid] = useState<GridCell[]>([]);
+  const [gridLoading, setGridLoading] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null); // "pair-interval" key of the row showing its 5 strategy calls
+
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
-
-  const [checking, setChecking] = useState(false);
-  const [checkError, setCheckError] = useState<string | null>(null);
-  const [strategyCalls, setStrategyCalls] = useState<StrategyCall[] | null>(null);
-  const [consensus, setConsensus] = useState<ConsensusSignal | null>(null);
-  const [checked, setChecked] = useState(false);
-
   const [trainFrac, setTrainFrac] = useState(0.7);
   const [backtesting, setBacktesting] = useState(false);
   const [backtestError, setBacktestError] = useState<string | null>(null);
@@ -33,25 +38,37 @@ export default function ConsensusPage() {
     }
   }
 
-  useEffect(() => {
-    loadRecent();
-  }, []);
-
-  async function handleCheck() {
-    setChecking(true);
-    setCheckError(null);
-    try {
-      const result = await api.generateConsensus(pair, interval);
-      setConsensus(result.consensus);
-      setStrategyCalls(result.strategy_calls);
-      setChecked(true);
-      await loadRecent();
-    } catch (e) {
-      setCheckError(e instanceof ApiError ? e.message : "Consensus check failed.");
-    } finally {
-      setChecking(false);
-    }
+  async function checkAll() {
+    setGridLoading(true);
+    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
+    const results = await Promise.all(
+      combos.map(async ({ pair: p, interval: i }): Promise<GridCell> => {
+        try {
+          const result = await api.generateConsensus(p, i);
+          return { pair: p, interval: i, consensus: result.consensus, strategyCalls: result.strategy_calls };
+        } catch (e) {
+          return { pair: p, interval: i, consensus: null, strategyCalls: [], error: e instanceof ApiError ? e.message : "Failed" };
+        }
+      }),
+    );
+    // Firing consensus rows first (the actually useful ones), then everything else in a
+    // stable pair/interval order.
+    results.sort((a, b) => {
+      const aFired = a.consensus ? 1 : 0;
+      const bFired = b.consensus ? 1 : 0;
+      if (aFired !== bFired) return bFired - aFired;
+      return 0;
+    });
+    setGrid(results);
+    setGridLoading(false);
+    await loadRecent();
   }
+
+  useEffect(() => {
+    checkAll();
+    loadRecent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleBacktest() {
     setBacktesting(true);
@@ -66,6 +83,8 @@ export default function ConsensusPage() {
     }
   }
 
+  const firedCount = grid.filter((c) => c.consensus).length;
+
   return (
     <div className="flex flex-col gap-8">
       <section>
@@ -74,80 +93,91 @@ export default function ConsensusPage() {
           Five independent strategies (trend, Bollinger mean-reversion, support/resistance,
           candlestick patterns, stochastic+ADX) each analyze the same candles. A consensus
           only fires when at least 4 of 5 agree on direction <em>and</em> their entry/exit
-          prices land within half an ATR of each other — agreeing on direction alone isn&apos;t
-          enough to call it the same trade. This is additive to the existing intraday/swing
-          engine, not a replacement for it, and hasn&apos;t been validated the way that engine
-          has — run the backtest below before trusting anything it says.
+          prices land within half an ATR of each other. Additive to the existing intraday/swing
+          engine, not a replacement — run the backtest below before trusting anything it says.
         </p>
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Check consensus now</h2>
-        <div className="mt-3 flex flex-wrap items-end gap-3">
-          <Field label="Pair">
-            <select value={pair} onChange={(e) => setPair(e.target.value)} className="select">
-              {PAIRS.map((p) => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </Field>
-          <Field label="Interval">
-            <select value={interval} onChange={(e) => setInterval_(e.target.value)} className="select">
-              {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
-            </select>
-          </Field>
-          <button onClick={handleCheck} disabled={checking} className="btn-primary">
-            {checking ? "Checking…" : "Check consensus"}
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+            All pairs &times; all intervals {grid.length > 0 && `(${firedCount} consensus firing)`}
+          </h2>
+          <button onClick={checkAll} disabled={gridLoading} className="btn-primary">
+            {gridLoading ? "Checking 20 combinations…" : "Refresh all"}
           </button>
         </div>
-        {checkError && (
-          <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-            {checkError}
-          </p>
-        )}
 
-        {checked && (
-          <div className="mt-4 flex flex-col gap-4">
-            {consensus ? (
-              <div className={`rounded-lg border p-4 ${consensus.direction === "BUY" ? "border-emerald-200 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950" : "border-rose-200 bg-rose-50 dark:border-rose-900 dark:bg-rose-950"}`}>
-                <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
-                  {consensus.agreeing_count}/5 strategies agree
-                </p>
-                <p className="mt-1 text-lg font-semibold">
-                  {consensus.direction} at {consensus.entry_price.toFixed(5)}, exit at {consensus.target_price.toFixed(5)}
-                </p>
-                <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                  Stop {consensus.stop_price.toFixed(5)}
-                </p>
-              </div>
-            ) : (
-              <p className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-                No consensus right now — see how each strategy called it below.
-              </p>
-            )}
-
-            <div className="overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
-                  <tr>
-                    <th className="px-3 py-1.5">Strategy</th>
-                    <th className="px-3 py-1.5">Direction</th>
-                    <th className="px-3 py-1.5">Entry</th>
-                    <th className="px-3 py-1.5">Exit</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {strategyCalls?.map((c) => (
-                    <tr key={c.strategy} className="border-t border-zinc-100 dark:border-zinc-800">
-                      <td className="px-3 py-1.5 font-mono">{c.strategy}</td>
-                      <td className={`px-3 py-1.5 font-medium ${c.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : c.direction === "SELL" ? "text-rose-600 dark:text-rose-400" : "text-zinc-400"}`}>
-                        {c.direction}
-                      </td>
-                      <td className="px-3 py-1.5">{c.entry_price.toFixed(5)}</td>
-                      <td className="px-3 py-1.5">{c.target_price != null ? c.target_price.toFixed(5) : "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+        {grid.length > 0 && (
+          <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                <tr>
+                  <th className="px-3 py-1.5">Pair</th>
+                  <th className="px-3 py-1.5">Interval</th>
+                  <th className="px-3 py-1.5">Result</th>
+                  <th className="px-3 py-1.5">Entry</th>
+                  <th className="px-3 py-1.5">Exit</th>
+                  <th className="px-3 py-1.5">Stop</th>
+                  <th className="px-3 py-1.5"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {grid.map((cell) => {
+                  const key = `${cell.pair}-${cell.interval}`;
+                  return (
+                    <>
+                      <tr
+                        key={key}
+                        className={`border-t border-zinc-100 dark:border-zinc-800 ${cell.consensus ? (cell.consensus.direction === "BUY" ? "bg-emerald-50 dark:bg-emerald-950" : "bg-rose-50 dark:bg-rose-950") : ""}`}
+                      >
+                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
+                        <td className="px-3 py-1.5">
+                          {cell.error ? (
+                            <span className="text-zinc-400">{cell.error}</span>
+                          ) : cell.consensus ? (
+                            <span className={`font-semibold ${cell.consensus.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {cell.consensus.direction} · {cell.consensus.agreeing_count}/5 agree
+                            </span>
+                          ) : (
+                            <span className="text-zinc-400">No consensus</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5">{cell.consensus ? cell.consensus.entry_price.toFixed(5) : "—"}</td>
+                        <td className="px-3 py-1.5">{cell.consensus ? cell.consensus.target_price.toFixed(5) : "—"}</td>
+                        <td className="px-3 py-1.5">{cell.consensus ? cell.consensus.stop_price.toFixed(5) : "—"}</td>
+                        <td className="px-3 py-1.5">
+                          <button
+                            onClick={() => setExpanded(expanded === key ? null : key)}
+                            className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
+                          >
+                            {expanded === key ? "Hide" : "Show"} 5 calls
+                          </button>
+                        </td>
+                      </tr>
+                      {expanded === key && (
+                        <tr key={`${key}-detail`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
+                          <td colSpan={7} className="px-3 py-2">
+                            <div className="flex flex-wrap gap-x-6 gap-y-1">
+                              {cell.strategyCalls.map((c) => (
+                                <span key={c.strategy} className="font-mono">
+                                  {c.strategy}:{" "}
+                                  <span className={c.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : c.direction === "SELL" ? "text-rose-600 dark:text-rose-400" : "text-zinc-400"}>
+                                    {c.direction}
+                                  </span>
+                                  {c.target_price != null && ` @ ${c.entry_price.toFixed(5)} → ${c.target_price.toFixed(5)}`}
+                                </span>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </section>
@@ -198,7 +228,7 @@ export default function ConsensusPage() {
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Recent consensus signals</h2>
         {recentLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
         {!recentLoading && recent.length === 0 && (
-          <p className="mt-4 text-sm text-zinc-500">No consensus signals yet — check one above.</p>
+          <p className="mt-4 text-sm text-zinc-500">No consensus signals yet.</p>
         )}
         {recent.length > 0 && (
           <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
