@@ -3,25 +3,30 @@ from typing import Optional
 from app.models.schemas import ConsensusSignal, StrategyCall
 from app.services.strategies import STRATEGIES
 
-# Per-strategy vote weight -- NOT tuned from real data yet, deliberately all equal for now.
-# A raw headcount ("at most 1 dissenter") can't adapt to a strategy that's *consistently*
-# on the other side of the market from the rest: the first consensus backtest round showed
-# Bollinger agreeing with the eventual consensus direction on 0 of the signals that fired,
-# across all 4 pairs, both train and test -- a plausible, explainable pattern (mean-reversion
-# is philosophically opposed to the other four, which lean trend/momentum), but with an
-# 8-13 signal sample per pair it isn't proof, just a real observation worth acting on later.
-# Weighting lets that get reflected by editing one number here once there's enough consensus-
-# backtest history to justify it, instead of hand-coding which strategies "count less" into
-# check_consensus itself. Derived from function name (call_X -> "X") so it can't drift out of
-# sync with STRATEGIES/StrategyCall.strategy.
+# Per-strategy vote weight -- equal by default, NOT tuned from real data (that would be
+# overfitting an 8-13 signal backtest sample). Weighting exists so a strategy that's shown it
+# doesn't belong in the majority can be dialed down later by editing one number here, instead
+# of hand-coding exceptions into check_consensus itself. Derived from function name
+# (call_X -> "X") so it can't drift out of sync with STRATEGIES/StrategyCall.strategy.
 STRATEGY_WEIGHTS: dict[str, float] = {fn.__name__.removeprefix("call_"): 1.0 for fn in STRATEGIES}
 
-# Fraction of total vote weight that must agree on one direction. With today's all-equal
-# weights this reproduces the original "at most 1 of N dissents" bar (0.8 * 6 = 4.8, so 5 of
-# 6 equal votes is required, same stringency as the previous 4-of-5 design) -- but once a
-# weight is lowered for a strategy that's shown it doesn't belong in the majority, that
-# strategy alone can no longer single-handedly block every consensus the way a raw headcount
-# would let it.
+# volume_momentum is the one exception to "equal by default, unweighted until proven
+# otherwise" -- confirmed (not just suspected) that Twelve Data structurally can't supply
+# forex volume (their own docs: "available not for all instrument types" -- spot FX has no
+# centralized tape to report it from, so no plan tier fixes this), so every call it makes is
+# HOLD, permanently. Weighting it 0 means it can't dilute the other strategies' threshold by
+# sitting in the denominator doing nothing -- the remaining 5 land back at exactly the
+# original 4-of-5 bar (0.8 * 5.0 = 4.0) instead of an unreachable 5-of-6. If a real volume
+# source (OANDA/MT5 tick volume, see PROGRESS.md) ever replaces Twelve Data for ingestion,
+# raise this back to 1.0 -- the strategy itself doesn't need to change, only this number.
+STRATEGY_WEIGHTS["volume_momentum"] = 0.0
+
+# Fraction of total vote weight that must agree on one direction. With volume_momentum at 0
+# and the other 5 equal at 1.0, total_weight is effectively 5.0, so this reproduces the
+# original "at most 1 of 5 dissents" bar exactly (0.8 * 5.0 = 4.0) -- but once a weight is
+# lowered for a strategy that's shown it doesn't belong in the majority (rather than zeroed
+# out for missing data), that strategy alone can no longer single-handedly block every
+# consensus the way a raw headcount would let it.
 REQUIRED_WEIGHT_FRACTION = 0.8
 
 # How close (in ATR multiples) agreeing strategies' entry/exit prices must be to count as
