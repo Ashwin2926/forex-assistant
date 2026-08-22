@@ -137,3 +137,11 @@ jobs:
       - name: Score pending consensus signals
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/consensus/score"
+      # Retrains the supervised hit/miss classifier (app/services/ml_model.py) on every
+      # resolved live signal -- right after scoring above, so it sees whatever just got
+      # resolved this cycle. Unconditional/every firing like scoring, not gated by interval:
+      # retraining costs no Twelve Data quota and is cheap (single-digit ms on ~238 rows), so
+      # there's no reason to run it less often than the data it depends on actually changes.
+      - name: Retrain ML model
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train"

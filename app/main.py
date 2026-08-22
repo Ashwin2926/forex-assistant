@@ -13,6 +13,7 @@ from app.core.database import (
     backtest_runs_collection,
     paper_trades_collection,
     consensus_signals_collection,
+    ml_runs_collection,
 )
 from app.models.schemas import LoginRequest, RuleConfig
 from app.services.data_fetcher import fetch_and_store
@@ -21,6 +22,8 @@ from app.services.signal_engine import generate_signal, compute_atr_target_stop,
 from app.services.backtester import run_backtest, run_consensus_backtest
 from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus
+from app.services.ml_features import extract_features
+from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import score_pending_signals, score_pending_consensus_signals
@@ -693,6 +696,86 @@ async def get_backtest_run_signals(run_id: str, status: str | None = None, limit
     for d in docs:
         d["_id"] = str(d["_id"])
     return docs
+
+
+@app.post("/ml/train")
+async def train_ml_model(train_frac: float = 0.7):
+    """
+    Trains the supervised hit/miss classifier (app/services/ml_model.py, LogisticRegression --
+    NOT reinforcement learning) on every resolved live signal across all pairs/profiles. One
+    shared model, not per-pair -- splitting the current ~238 resolved signals further would
+    leave too few examples per model to mean anything. Chronological train/test split, not
+    random (see train_hit_classifier's own docstring) -- the same lookahead-bias discipline
+    already applied to run_backtest's eval_start_index.
+    """
+    if not 0 < train_frac < 1:
+        raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
+
+    query = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    signals = await signals_collection.find(query).to_list(length=None)
+
+    try:
+        result = train_hit_classifier(signals, train_frac=train_frac)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    await ml_runs_collection.insert_one(result.model_dump())
+    return result
+
+
+@app.get("/ml/runs")
+async def list_ml_runs(limit: int = 20):
+    cursor = ml_runs_collection.find().sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+
+@app.post("/ml/predict/{interval}/{profile}")
+async def predict_signal(interval: str, profile: str, pair: str):
+    """
+    Generates a fresh signal the same way create_signal does (reuses generate_signal), but
+    does NOT insert it into signals_collection or touch that endpoint's dedup/history in any
+    way -- purely advisory. Attaches ml_hit_probability from a model trained fresh on every
+    currently resolved signal; null (not a fabricated number) when there isn't enough
+    resolved data yet -- see ml_model.MIN_TRAIN_SIGNALS/MIN_TEST_SIGNALS.
+
+    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
+    """
+    config = default_config_for(profile, pair)
+    cursor = candles_collection.find(
+        {"pair": pair, "interval": interval}
+    ).sort("timestamp", -1).limit(500)
+    docs = await cursor.to_list(length=500)
+    docs.reverse()
+
+    min_needed = config.ema_slow
+    if len(docs) < min_needed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for "
+                    f"{profile}. Run /ingest/{interval} first."
+        )
+
+    df = pd.DataFrame(docs)
+    signal = generate_signal(df, pair, interval, profile, config)
+
+    if signal.direction in ("BUY", "SELL"):
+        atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+        signal.target_price, signal.stop_price = compute_atr_target_stop(
+            signal.price_at_signal, atr_val, signal.direction,
+            config.target_atr_mult, config.stop_atr_mult,
+        )
+
+    resolved_query = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    resolved_signals = await signals_collection.find(resolved_query).to_list(length=None)
+    features = extract_features(signal.model_dump())
+    ml_hit_probability = predict_hit_probability(resolved_signals, features)
+
+    response = signal.model_dump()
+    response["ml_hit_probability"] = ml_hit_probability
+    return response
 
 
 @app.get("/paper-trade/account")

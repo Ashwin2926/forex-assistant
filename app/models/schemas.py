@@ -183,6 +183,26 @@ class BacktestRun(BaseModel):
     rule_stats: list[RuleStat] = []
 
 
+class MLTrainResult(BaseModel):
+    """
+    Result of training the supervised hit/miss classifier (app/services/ml_model.py) on the
+    current set of resolved live signals -- a sibling to BacktestRun, not a reuse of it: the
+    metrics are genuinely different (accuracy/precision/recall against a chronological
+    train/test split, not hit_rate/expectancy against a rule-config). feature_coefficients is
+    what a LogisticRegression actually leaned on, for the same interpretability every other
+    part of this project already treats as non-negotiable (SignalReason.detail, rule_stats).
+    """
+    run_id: str
+    created_at: datetime
+    train_samples: int
+    test_samples: int
+    train_accuracy: float
+    test_accuracy: float
+    test_precision: Optional[float] = None
+    test_recall: Optional[float] = None
+    feature_coefficients: dict[str, float] = {}
+
+
 class PaperTrade(BaseModel):
     """
     A live signal executed as a Deriv Multipliers contract on a virtual (demo) account.
