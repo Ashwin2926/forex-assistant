@@ -15,7 +15,7 @@ interface GridCell {
 export default function ConsensusPage() {
   const [grid, setGrid] = useState<GridCell[]>([]);
   const [gridLoading, setGridLoading] = useState(false);
-  const [expanded, setExpanded] = useState<string | null>(null); // "pair-interval" key of the row showing its 5 strategy calls
+  const [expanded, setExpanded] = useState<string | null>(null); // "pair-interval" key of the row showing its strategy calls
 
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
@@ -92,7 +92,7 @@ export default function ConsensusPage() {
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
           Five independent strategies (trend, Bollinger mean-reversion, support/resistance,
           candlestick patterns, stochastic+ADX) each analyze the same candles. A consensus
-          only fires when at least 4 of 5 agree on direction <em>and</em> their entry/exit
+          only fires when a weighted majority agree on direction <em>and</em> their entry/exit
           prices land within half an ATR of each other. Additive to the existing intraday/swing
           engine, not a replacement — run the backtest below before trusting anything it says.
         </p>
@@ -138,7 +138,7 @@ export default function ConsensusPage() {
                             <span className="text-zinc-400">{cell.error}</span>
                           ) : cell.consensus ? (
                             <span className={`font-semibold ${cell.consensus.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                              {cell.consensus.direction} · {cell.consensus.agreeing_count}/5 agree
+                              {cell.consensus.direction} · {cell.consensus.agreeing_count}/{cell.strategyCalls.length} agree
                             </span>
                           ) : (
                             <span className="text-zinc-400">No consensus</span>
@@ -152,7 +152,7 @@ export default function ConsensusPage() {
                             onClick={() => setExpanded(expanded === key ? null : key)}
                             className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
                           >
-                            {expanded === key ? "Hide" : "Show"} 5 calls
+                            {expanded === key ? "Hide" : "Show"} calls
                           </button>
                         </td>
                       </tr>
@@ -253,7 +253,7 @@ export default function ConsensusPage() {
                     </td>
                     <td className="px-4 py-2">{c.entry_price.toFixed(5)}</td>
                     <td className="px-4 py-2">{c.target_price.toFixed(5)}</td>
-                    <td className="px-4 py-2">{c.agreeing_count}/5</td>
+                    <td className="px-4 py-2">{c.agreeing_count}/{c.strategy_calls.length}</td>
                     <td className="px-4 py-2">{c.status}</td>
                     <td className="px-4 py-2 text-xs text-zinc-500">{new Date(c.timestamp).toLocaleString()}</td>
                   </tr>

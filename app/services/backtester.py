@@ -210,23 +210,23 @@ def run_consensus_backtest(
     eval_start_index: int | None = None,
 ) -> tuple[BacktestRun, list[ConsensusSignal]]:
     """
-    Same walk-forward replay shape as run_backtest, but at each bar runs all 5 STRATEGIES and
-    only scores a bar where check_consensus actually fires (>= MIN_AGREEING strategies agree
-    on direction and price). Reuses label_outcome/spread_cost_pct so a consensus signal is
-    judged by the exact same real-cost standard as everything else in this project --
-    expected to fire rarely, since none of the five strategies individually has shown a
-    reliable edge in prior backtests, so a majority landing on the same trade at the same time
-    should be uncommon by construction, not routine.
+    Same walk-forward replay shape as run_backtest, but at each bar runs every STRATEGIES
+    entry and only scores a bar where check_consensus actually fires (weighted majority, see
+    consensus.STRATEGY_WEIGHTS/REQUIRED_WEIGHT_FRACTION). Reuses label_outcome/spread_cost_pct
+    so a consensus signal is judged by the exact same real-cost standard as everything else --
+    expected to fire rarely, since none of the strategies individually has shown a reliable
+    edge in prior backtests, so a majority landing on the same trade at the same time should
+    be uncommon by construction, not routine.
 
-    rule_stats is repurposed here: "rule" is each of the 5 strategy names, "fired_count"
-    counts how often that strategy gave any directional call at all (consensus or not),
+    rule_stats is repurposed here: "rule" is each strategy's name, "fired_count" counts how
+    often that strategy gave any directional call at all (consensus or not),
     "agreed"/"hits_when_agreed" count how often that strategy's direction matched the
     eventual consensus direction on a bar where consensus fired, and how often those
     agreements hit -- shows which strategies actually pull their weight in a consensus vs
     which rarely participate.
 
     avg_confidence_hit/avg_confidence_miss are repurposed to hold the mean agreeing_count
-    (4 or 5) rather than a 0-100 confidence score, since consensus signals have no analogous
+    rather than a 0-100 confidence score, since consensus signals have no analogous
     confidence number of their own.
     """
     df = df.reset_index(drop=True)

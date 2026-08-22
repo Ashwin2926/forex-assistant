@@ -290,11 +290,12 @@ async def score_consensus_signals(max_lookforward: int = 20):
 @app.post("/consensus/{interval}")
 async def create_consensus_signal(interval: str, pair: str):
     """
-    Runs all 5 independent strategies (app/services/strategies.py) against stored candles and
-    checks for consensus (app/services/consensus.py) — >= 4 of 5 agreeing on direction and
-    within PROXIMITY_ATR_MULT of each other's entry/exit. Always returns all 5 strategy_calls
-    alongside the verdict, so "no consensus right now" is visibly the 5 calls disagreeing,
-    not an opaque empty response.
+    Runs every independent strategy (app/services/strategies.py) against stored candles and
+    checks for consensus (app/services/consensus.py) — a weighted majority (see
+    consensus.STRATEGY_WEIGHTS/REQUIRED_WEIGHT_FRACTION) agreeing on direction, and within
+    PROXIMITY_ATR_MULT of each other's entry/exit. Always returns every strategy_call
+    alongside the verdict, so "no consensus right now" is visibly the calls disagreeing, not
+    an opaque empty response.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """

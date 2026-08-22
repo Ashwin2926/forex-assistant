@@ -106,10 +106,11 @@ class StrategyCall(BaseModel):
 
 class ConsensusSignal(BaseModel):
     """
-    Fires only when >= MIN_AGREEING strategies (see consensus.py) agree on direction AND their
-    entry/exit prices land within PROXIMITY_ATR_MULT of each other -- a separate, additive
-    layer on top of the single-strategy Signal model above, not a replacement. entry_price/
-    target_price/stop_price are the mean of the agreeing strategies' own numbers.
+    Fires only when a weighted majority of strategies (see consensus.py's STRATEGY_WEIGHTS/
+    REQUIRED_WEIGHT_FRACTION) agree on direction AND their entry/exit prices land within
+    PROXIMITY_ATR_MULT of each other -- a separate, additive layer on top of the
+    single-strategy Signal model above, not a replacement. entry_price/target_price/
+    stop_price are the mean of the agreeing strategies' own numbers.
     """
     pair: str
     interval: str

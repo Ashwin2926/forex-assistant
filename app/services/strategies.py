@@ -14,6 +14,12 @@ BEARISH_PATTERNS = {"bearish_engulfing", "shooting_star"}
 # rather than trading it at reduced confidence.
 ADX_TREND_THRESHOLD = 20.0
 
+# call_volume_momentum: how large a 5-bar move needs to be (relative to ATR) to count as
+# "momentum" at all, and how far above its own 20-bar average volume has to be to "confirm"
+# that move rather than trust price alone. Both starting guesses, not backtested.
+MOMENTUM_ROC_ATR_MULT = 1.0
+VOLUME_CONFIRMATION_MULT = 1.5
+
 
 def call_trend(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
     """Wraps the existing, already-backtested EMA/RSI/MACD engine unmodified -- this strategy
@@ -262,6 +268,65 @@ def call_stoch_adx(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> Strat
     )
 
 
+def call_volume_momentum(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+    """
+    Momentum trading: a fast multi-bar price move (rate_of_change, not a single noisy candle),
+    confirmed by above-average volume rather than trusted on price alone -- the piece
+    call_stoch_adx's ADX-based trend-strength approximation doesn't cover, since ADX has
+    nothing to do with volume.
+
+    Forex caveat worth being upfront about: most forex data providers, Twelve Data included,
+    report *tick* volume -- how many price updates occurred, not literal traded volume, since
+    spot forex is decentralized with no single exchange tape the way a listed stock has. It's
+    a real, commonly-used proxy for market activity, just not the same thing a stock trader
+    would mean by "volume." Falls back to HOLD when volume data isn't available at all,
+    rather than guessing.
+    """
+    latest = df.iloc[-1]
+    entry_price = float(latest["close"])
+    atr_val = float(latest["atr"])
+
+    volume_available = pd.notna(latest.get("volume")) and latest.get("volume", 0) > 0 and pd.notna(latest.get("volume_sma")) and latest["volume_sma"] > 0
+    if not volume_available:
+        return StrategyCall(
+            strategy="volume_momentum", direction="HOLD",
+            entry_price=entry_price, target_price=None, stop_price=None,
+            reasons=[SignalReason(rule="volume_confirmation", passed=False, detail="No reliable volume data for this candle")],
+        )
+
+    volume_ratio = float(latest["volume"] / latest["volume_sma"])
+    volume_confirmed = volume_ratio >= VOLUME_CONFIRMATION_MULT
+    reasons = [SignalReason(
+        rule="volume_confirmation", passed=volume_confirmed, value=volume_ratio,
+        detail=f"Volume is {volume_ratio:.2f}x the 20-bar average — "
+               f"{'confirmed' if volume_confirmed else 'not elevated enough'}"
+    )]
+
+    roc = float(latest["roc"]) if pd.notna(latest["roc"]) else 0.0
+    roc_price_move = abs(roc) / 100 * entry_price
+    momentum_strong = atr_val > 0 and (roc_price_move / atr_val) >= MOMENTUM_ROC_ATR_MULT
+    reasons.append(SignalReason(
+        rule="momentum_strength", passed=momentum_strong, value=roc,
+        detail=f"5-bar rate of change is {roc:.3f}% — "
+               f"{'strong' if momentum_strong else 'not strong enough'} relative to ATR"
+    ))
+
+    direction = "HOLD"
+    target_price = stop_price = None
+    if volume_confirmed and momentum_strong:
+        direction = "BUY" if roc > 0 else "SELL"
+        target_price, stop_price = compute_atr_target_stop(
+            entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
+        )
+
+    return StrategyCall(
+        strategy="volume_momentum", direction=direction,
+        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
+        reasons=reasons,
+    )
+
+
 STRATEGIES: list[Callable[..., StrategyCall]] = [
     call_trend, call_bollinger, call_support_resistance, call_candlestick, call_stoch_adx,
+    call_volume_momentum,
 ]

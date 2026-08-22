@@ -75,6 +75,19 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return dx.rolling(window=period).mean()
 
 
+def volume_sma(series: pd.Series, period: int = 20) -> pd.Series:
+    """Simple moving average of volume -- the "normal" level a candle's own volume gets
+    compared against to decide whether a move was actually well-participated or not."""
+    return series.rolling(window=period).mean()
+
+
+def rate_of_change(series: pd.Series, period: int = 5) -> pd.Series:
+    """% change over `period` bars -- a short-lookback momentum reading, deliberately not
+    single-bar like most of this module's other rules, so it catches a sustained fast move
+    rather than one noisy candle."""
+    return (series - series.shift(period)) / series.shift(period) * 100
+
+
 def add_all_indicators(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> pd.DataFrame:
     """
     Expects df sorted ascending by timestamp with columns: open, high, low, close, volume.
@@ -99,4 +112,6 @@ def add_all_indicators(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> p
     df["stoch_k"] = stoch_k
     df["stoch_d"] = stoch_d
     df["adx"] = adx(df)
+    df["volume_sma"] = volume_sma(df["volume"].fillna(0))
+    df["roc"] = rate_of_change(df["close"])
     return df

@@ -79,7 +79,7 @@ export default function TradingSignalsPage() {
       <section>
         <h1 className="text-xl font-semibold tracking-tight">Trading signals</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Only signals where at least 4 of 5 independent strategies agree — every row here is
+          Only signals where a weighted majority of independent strategies agree — every row here is
           a fired consensus signal (see the Consensus page for the full picture, including
           where nothing agreed). This is a practical stand-in while the ML angle is still
           being built, not a claim that any of this is a validated edge yet — check the
@@ -155,7 +155,7 @@ export default function TradingSignalsPage() {
                     <td className="px-4 py-2 font-mono">{signal.entry_price.toFixed(5)}</td>
                     <td className="px-4 py-2 font-mono">{signal.target_price.toFixed(5)}</td>
                     <td className="px-4 py-2 font-mono">{signal.stop_price.toFixed(5)}</td>
-                    <td className="px-4 py-2">{signal.agreeing_count}/5</td>
+                    <td className="px-4 py-2">{signal.agreeing_count}/{signal.strategy_calls.length}</td>
                     <td className="px-4 py-2 font-mono">{lots.toFixed(2)}</td>
                     <td className="px-4 py-2 text-xs">
                       <span className="text-rose-600 dark:text-rose-400">-${riskUsd.toFixed(0)}</span>
