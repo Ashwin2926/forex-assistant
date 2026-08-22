@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RuleConfig, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RuleConfig, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -172,6 +172,24 @@ export const api = {
     if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
     return request<ConsensusBacktestResult>(
       `/consensus/backtest/${interval}?${qs.toString()}`,
+      { method: "POST" },
+    );
+  },
+
+  trainMLModel(trainFrac?: number) {
+    const qs = trainFrac !== undefined ? `?train_frac=${trainFrac}` : "";
+    return request<MLTrainResult>(`/ml/train${qs}`, { method: "POST" });
+  },
+
+  listMLRuns(limit = 20) {
+    return request<MLTrainResult[]>(`/ml/runs?limit=${limit}`);
+  },
+
+  predictML(pair: string, interval: string, profile: string) {
+    // pair goes in the query string, not the path — a literal '/' in a path segment
+    // breaks Starlette's routing even when percent-encoded.
+    return request<MLPrediction>(
+      `/ml/predict/${interval}/${profile}?pair=${encodeURIComponent(pair)}`,
       { method: "POST" },
     );
   },

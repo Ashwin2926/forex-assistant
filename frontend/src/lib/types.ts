@@ -123,6 +123,23 @@ export interface BacktestRun {
   rule_stats: RuleStat[];
 }
 
+export interface MLTrainResult {
+  _id?: string;
+  run_id: string;
+  created_at: string;
+  train_samples: number;
+  test_samples: number;
+  train_accuracy: number;
+  test_accuracy: number;
+  test_precision: number | null;
+  test_recall: number | null;
+  feature_coefficients: Record<string, number>;
+}
+
+// Signal's normal fields plus the ML classifier's advisory hit probability -- returned by
+// POST /ml/predict/{interval}/{profile}, which does NOT insert into the signals collection.
+export type MLPrediction = Signal & { ml_hit_probability: number | null };
+
 export type OptimizeRankBy = "expectancy" | "hit_rate";
 
 export interface OptimizeCandidate {

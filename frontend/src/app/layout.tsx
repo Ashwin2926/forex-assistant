@@ -51,6 +51,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               <Link href="/paper-trade" className="hover:text-zinc-900 dark:hover:text-zinc-100">
                 Paper Trading
               </Link>
+              <Link href="/ml" className="hover:text-zinc-900 dark:hover:text-zinc-100">
+                ML
+              </Link>
             </nav>
             <AuthNav />
           </div>
