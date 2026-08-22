@@ -61,6 +61,15 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">
           <AuthGuard>{children}</AuthGuard>
         </main>
+        <footer className="border-t border-zinc-200 px-6 py-3 text-xs text-zinc-400 dark:border-zinc-800 dark:text-zinc-600">
+          <div className="mx-auto max-w-5xl">
+            {/* NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA is auto-injected by Vercel at build time
+                (requires "Automatically expose System Environment Variables" in project
+                settings) -- lets a deploy be confirmed as picking up the latest push
+                without needing a throwaway commit each time. */}
+            Build {process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? "dev"}
+          </div>
+        </footer>
       </body>
     </html>
   );
