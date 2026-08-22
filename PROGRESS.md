@@ -4,6 +4,46 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-22
+
+**ML v1: supervised hit/miss classifier, not reinforcement learning — deliberately
+corrected scope after being asked to "confirm we are using reinforced training."** RL
+needs an environment/reward-shaping scheme and far more data than the ~238 resolved
+signals on hand; a binary classifier on rule-level features is the standard, appropriate
+first step at this sample size, and is exactly what `SignalReason.value` +
+`outcome_pct_move`/`status` (added the day before) were already shaped for.
+
+- `app/services/ml_features.py`: `extract_features()` maps each signal's `reasons[].rule`
+  to a canonical feature via `FEATURE_RULE_MAP` (`ema_spread_pct`, `rsi`, `macd_hist`,
+  `atr_pct`, `session_hour`, plus `confidence`/`profile_intraday`/`direction_buy`) —
+  the single place encoding lives, so training and prediction can't drift apart.
+- `app/services/ml_model.py`: `train_hit_classifier()` fits `scikit-learn`
+  `LogisticRegression` (chosen over a tree ensemble/anything deep-learning-shaped —
+  far more resistant to overfitting ~166 train rows across 8 features, and its
+  coefficients are directly interpretable, matching this project's existing
+  "explainable" ethos). Chronological, not random, train/test split — same
+  lookahead-bias discipline as the backtester's `eval_start_index`. No model
+  persistence in v1: retraining fresh on every call is single-digit milliseconds at
+  this row count, so versioning/staleness handling is deferred until it's actually slow.
+- New `ml_runs_collection` + `POST /ml/train`, `GET /ml/runs`,
+  `POST /ml/predict/{interval}/{profile}` (reuses `generate_signal`, does not insert
+  into `signals_collection` — purely advisory, zero effect on the existing signal feed).
+- **User explicitly required this run automatically, not just on-demand**: added a
+  "Retrain ML model" step to `keep-fresh.yml`, right after "Score pending live signals"
+  so each cycle trains on whatever just resolved. Unconditional every firing, like
+  scoring — retraining costs no Twelve Data quota.
+- New frontend `app/ml/page.tsx`: train button showing train/test accuracy +
+  precision/recall side by side plus feature coefficients (which features the model
+  actually leaned on); a pair/interval/profile predict form showing the generated
+  signal's entry/target/stop alongside `ml_hit_probability`; a training-run history
+  table backed by `GET /ml/runs`. Nav link added to `layout.tsx`.
+- Backend pushed as `3c68dd2`, frontend as `f66aec2`. **Not yet deployed/verified** —
+  needs a FastAPI Cloud CLI deploy (dashboard restart doesn't rebuild from git) and a
+  Vercel deploy, then `POST /ml/train` + `POST /ml/predict/...` curl checks and a
+  `workflow_dispatch` to confirm the new cron step goes green.
+- **Explicitly out of scope for v1**: consensus-signal ML (0 live consensus samples so
+  far), model persistence, anything RL.
+
 ## 2026-08-21
 
 **Built a multi-strategy consensus system, on top of (not replacing) the intraday/swing
