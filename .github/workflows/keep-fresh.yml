@@ -168,34 +168,41 @@ jobs:
                 "$API_BASE/rl/train/$interval?pair=${pair/\//%2F}"
             done
           done
+      # -f is deliberately dropped (replaced with a plain -s + `|| true` per call) on these
+      # four steps only: unlike ingest/score, a 400 "no trained policy yet" here is an
+      # expected, self-resolving state -- e.g. right after this cron first started running
+      # against a pair/interval that hasn't hit its once-daily training slot yet, or after a
+      # completely new pair/interval is added before its first training run. That isn't a
+      # real failure worth turning the whole job red for; it just means "check again after
+      # today's training step has run."
       - name: Generate RL signals (5min, 15min)
         run: |
           for interval in 5min 15min; do
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-                "$API_BASE/rl/signal/$interval?pair=${pair/\//%2F}"
+              curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/rl/signal/$interval?pair=${pair/\//%2F}" -o /dev/null || true
             done
           done
       - name: Generate RL signals (1h)
         if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}"
+            curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Generate RL signals (4h)
         if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}"
+            curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Generate RL signals (1day)
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/rl/signal/1day?pair=${pair/\//%2F}"
+            curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/rl/signal/1day?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Score pending RL signals
         run: |

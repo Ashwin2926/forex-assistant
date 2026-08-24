@@ -20,6 +20,21 @@ function calculateLotSize(pair: string, entryPrice: number, stopPrice: number, r
   return units / 100_000;
 }
 
+interface TrainAllCell {
+  pair: string;
+  interval: string;
+  evaluation: BacktestRun | null;
+  error?: string;
+}
+
+interface GenerateAllCell {
+  pair: string;
+  interval: string;
+  signal: RLSignal | null;
+  qValues: Record<string, number> | null;
+  error?: string;
+}
+
 export default function RLPage() {
   const [accountBalance, setAccountBalance] = useState(10000);
   const [riskPercent, setRiskPercent] = useState(1);
@@ -43,6 +58,14 @@ export default function RLPage() {
 
   const [recentSignals, setRecentSignals] = useState<RLSignal[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
+
+  const [trainAllResults, setTrainAllResults] = useState<TrainAllCell[]>([]);
+  const [trainAllProgress, setTrainAllProgress] = useState(0);
+  const [trainAllRunning, setTrainAllRunning] = useState(false);
+
+  const [generateAllResults, setGenerateAllResults] = useState<GenerateAllCell[]>([]);
+  const [generateAllProgress, setGenerateAllProgress] = useState(0);
+  const [generateAllRunning, setGenerateAllRunning] = useState(false);
 
   async function loadPolicies() {
     setPoliciesLoading(true);
@@ -98,6 +121,52 @@ export default function RLPage() {
     } finally {
       setGenerating(false);
     }
+  }
+
+  async function handleTrainAll() {
+    setTrainAllRunning(true);
+    setTrainAllResults([]);
+    setTrainAllProgress(0);
+    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
+    const results: TrainAllCell[] = [];
+    // Sequential, not Promise.all -- same reasoning as the consensus/ML "run all" grids:
+    // each call is a real training run (many episodes over that interval's full candle
+    // history), and 20 of those hitting the same backend instance at once would be far
+    // heavier than 20 concurrent live checks. Each cell catches its own error and the loop
+    // keeps going, so one pair/interval timing out (5min/15min are the likeliest candidates
+    // -- see PROGRESS.md) doesn't block the other 19.
+    for (const { pair: p, interval: i } of combos) {
+      try {
+        const result = await api.trainRLPolicy(p, i, { episodes, train_frac: trainFrac });
+        results.push({ pair: p, interval: i, evaluation: result.evaluation });
+      } catch (e) {
+        results.push({ pair: p, interval: i, evaluation: null, error: e instanceof ApiError ? e.message : "Failed" });
+      }
+      setTrainAllProgress(results.length);
+      setTrainAllResults([...results]);
+    }
+    setTrainAllRunning(false);
+    await loadPolicies();
+  }
+
+  async function handleGenerateAll() {
+    setGenerateAllRunning(true);
+    setGenerateAllResults([]);
+    setGenerateAllProgress(0);
+    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
+    const results: GenerateAllCell[] = [];
+    for (const { pair: p, interval: i } of combos) {
+      try {
+        const result = await api.generateRLSignal(p, i);
+        results.push({ pair: p, interval: i, signal: result.signal, qValues: result.q_values });
+      } catch (e) {
+        results.push({ pair: p, interval: i, signal: null, qValues: null, error: e instanceof ApiError ? e.message : "Failed" });
+      }
+      setGenerateAllProgress(results.length);
+      setGenerateAllResults([...results]);
+    }
+    setGenerateAllRunning(false);
+    await loadRecentSignals();
   }
 
   return (
@@ -188,6 +257,58 @@ export default function RLPage() {
             </div>
           </div>
         )}
+
+        <div className="mt-6 border-t border-zinc-100 pt-4 dark:border-zinc-800">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Or train all 4 pairs &times; 5 intervals at once (using the episodes/train
+              fraction above) — same thing the cron does once daily, run on demand.
+            </p>
+            <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">
+              {trainAllRunning ? `Training ${trainAllProgress}/20…` : "Train all"}
+            </button>
+          </div>
+          {trainAllResults.length > 0 && (
+            <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                  <tr>
+                    <th className="px-3 py-1.5">Pair</th>
+                    <th className="px-3 py-1.5">Interval</th>
+                    <th className="px-3 py-1.5">Test hit rate</th>
+                    <th className="px-3 py-1.5">Test expectancy</th>
+                    <th className="px-3 py-1.5">Trades</th>
+                    <th className="px-3 py-1.5">Holds</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trainAllResults.map((cell) => {
+                    const key = `${cell.pair}-${cell.interval}`;
+                    const run = cell.evaluation;
+                    return (
+                      <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
+                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
+                        {cell.error ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={4}>{cell.error}</td>
+                        ) : (
+                          <>
+                            <td className="px-3 py-1.5">{run?.hit_rate_pct != null ? `${run.hit_rate_pct}%` : "—"}</td>
+                            <td className={`px-3 py-1.5 ${run?.expectancy_pct != null && run.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {run?.expectancy_pct != null ? `${run.expectancy_pct >= 0 ? "+" : ""}${run.expectancy_pct}%` : "—"}
+                            </td>
+                            <td className="px-3 py-1.5">{run?.directional_signals ?? "—"}</td>
+                            <td className="px-3 py-1.5">{run?.hold_signals ?? "—"}</td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
@@ -239,6 +360,65 @@ export default function RLPage() {
             <QValueRow qValues={generated.q_values} />
           </div>
         )}
+
+        <div className="mt-6 border-t border-zinc-100 pt-4 dark:border-zinc-800">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Or generate for all 4 pairs &times; 5 intervals at once.
+            </p>
+            <button onClick={handleGenerateAll} disabled={generateAllRunning} className="btn-primary shrink-0">
+              {generateAllRunning ? `Generating ${generateAllProgress}/20…` : "Generate all"}
+            </button>
+          </div>
+          {generateAllResults.length > 0 && (
+            <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                  <tr>
+                    <th className="px-3 py-1.5">Pair</th>
+                    <th className="px-3 py-1.5">Interval</th>
+                    <th className="px-3 py-1.5">Direction</th>
+                    <th className="px-3 py-1.5">Entry</th>
+                    <th className="px-3 py-1.5">Exit</th>
+                    <th className="px-3 py-1.5">Lot size</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {generateAllResults.map((cell) => {
+                    const key = `${cell.pair}-${cell.interval}`;
+                    const s = cell.signal;
+                    const riskAmountUsd = accountBalance * (riskPercent / 100);
+                    return (
+                      <tr
+                        key={key}
+                        className={`border-t border-zinc-100 dark:border-zinc-800 ${s ? (s.direction === "BUY" ? "bg-emerald-50 dark:bg-emerald-950" : "bg-rose-50 dark:bg-rose-950") : ""}`}
+                      >
+                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
+                        {cell.error ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={4}>{cell.error}</td>
+                        ) : !s ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={4}>HOLD</td>
+                        ) : (
+                          <>
+                            <td className={`px-3 py-1.5 font-semibold ${s.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {s.direction}
+                            </td>
+                            <td className="px-3 py-1.5">{s.entry_price.toFixed(5)}</td>
+                            <td className="px-3 py-1.5">{s.target_price.toFixed(5)}</td>
+                            <td className="px-3 py-1.5 font-mono">
+                              {calculateLotSize(s.pair, s.entry_price, s.stop_price, riskAmountUsd).toFixed(2)}
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </section>
 
       <section>
