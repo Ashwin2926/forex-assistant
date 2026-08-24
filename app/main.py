@@ -768,10 +768,19 @@ async def predict_signal(interval: str, profile: str, pair: str):
             config.target_atr_mult, config.stop_atr_mult,
         )
 
-    resolved_query = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
-    resolved_signals = await signals_collection.find(resolved_query).to_list(length=None)
-    features = extract_features(signal.model_dump())
-    ml_hit_probability = predict_hit_probability(resolved_signals, features)
+    # "hit" only means anything for an actual trade -- HOLD signals never get target/stop,
+    # never get scored (see score_pending_signals' direction filter), and so never appear in
+    # the training set at all. Asking the model to score one isn't "not enough data," it's a
+    # different question with no meaning: there's no trade to hit or miss. Skip it rather than
+    # returning a number that looks like a real answer but isn't (the model's direction_buy
+    # feature is 0 for both a real SELL and a HOLD -- without this guard it would silently
+    # score a HOLD as if it were a SELL that never happened).
+    ml_hit_probability = None
+    if signal.direction in ("BUY", "SELL"):
+        resolved_query = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+        resolved_signals = await signals_collection.find(resolved_query).to_list(length=None)
+        features = extract_features(signal.model_dump())
+        ml_hit_probability = predict_hit_probability(resolved_signals, features)
 
     response = signal.model_dump()
     response["ml_hit_probability"] = ml_hit_probability
