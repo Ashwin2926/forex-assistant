@@ -112,6 +112,40 @@ export default function MLPage() {
                 ))}
               </div>
             </div>
+            <div>
+              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Calibration (test set only)</p>
+              <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
+                Does a signal the model scores higher actually hit more often? This is the
+                real answer to whether ml_hit_probability is worth filtering on — an
+                overall accuracy number alone can't tell you that.
+              </p>
+              {trainResult.test_calibration.length === 0 ? (
+                <p className="mt-2 text-xs text-zinc-400">Not enough test samples to break down by bucket.</p>
+              ) : (
+                <div className="mt-2 overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                      <tr>
+                        <th className="px-3 py-1.5">Predicted probability</th>
+                        <th className="px-3 py-1.5">Test signals</th>
+                        <th className="px-3 py-1.5">Actual hit rate</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {trainResult.test_calibration.map((b) => (
+                        <tr key={b.range_label} className="border-t border-zinc-100 dark:border-zinc-800">
+                          <td className="px-3 py-1.5 font-mono">{b.range_label}</td>
+                          <td className="px-3 py-1.5">{b.count}</td>
+                          <td className={`px-3 py-1.5 font-semibold ${b.actual_hit_rate_pct > 50 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                            {b.actual_hit_rate_pct}%
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </section>

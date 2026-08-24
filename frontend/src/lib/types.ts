@@ -123,6 +123,12 @@ export interface BacktestRun {
   rule_stats: RuleStat[];
 }
 
+export interface MLCalibrationBucket {
+  range_label: string;
+  count: number;
+  actual_hit_rate_pct: number;
+}
+
 export interface MLTrainResult {
   _id?: string;
   run_id: string;
@@ -134,6 +140,7 @@ export interface MLTrainResult {
   test_precision: number | null;
   test_recall: number | null;
   feature_coefficients: Record<string, number>;
+  test_calibration: MLCalibrationBucket[];
 }
 
 // Signal's normal fields plus the ML classifier's advisory hit probability -- returned by

@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, precision_score, recall_score
-from app.models.schemas import MLTrainResult
+from app.models.schemas import MLCalibrationBucket, MLTrainResult
 from app.services.ml_features import extract_features, FEATURE_NAMES
 
 # Below this many resolved signals on either side of the split, training isn't meaningful --
@@ -11,6 +11,12 @@ from app.services.ml_features import extract_features, FEATURE_NAMES
 # forward-looking prediction should be trusted against.
 MIN_TRAIN_SIGNALS = 10
 MIN_TEST_SIGNALS = 5
+
+# Fixed-width probability ranges for the calibration breakdown, not quantiles -- quantiles
+# would always show ~20% of signals in the "top bucket" by construction even if the model
+# has zero skill; fixed ranges let a bucket come back empty or tiny, which is itself the
+# honest answer when the model isn't confidently separating anything.
+CALIBRATION_BUCKETS = [(0.0, 0.4), (0.4, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 1.01)]
 
 
 def _to_xy(signals: list[dict]) -> tuple[list[list[float]], list[int]]:
@@ -20,6 +26,21 @@ def _to_xy(signals: list[dict]) -> tuple[list[list[float]], list[int]]:
     # touch the target specifically."
     y = [1 if s["status"] == "hit" else 0 for s in signals]
     return X, y
+
+
+def _calibration_buckets(probs: list[float], y_test: list[int]) -> list[MLCalibrationBucket]:
+    buckets = []
+    for low, high in CALIBRATION_BUCKETS:
+        bucket_outcomes = [y for p, y in zip(probs, y_test) if low <= p < high]
+        if not bucket_outcomes:
+            continue  # an empty range is itself informative -- shown as absent, not a fabricated 0%
+        label = f"{int(low * 100)}-{min(int(high * 100), 100)}%"
+        buckets.append(MLCalibrationBucket(
+            range_label=label,
+            count=len(bucket_outcomes),
+            actual_hit_rate_pct=round(100 * sum(bucket_outcomes) / len(bucket_outcomes), 1),
+        ))
+    return buckets
 
 
 def train_hit_classifier(signals: list[dict], train_frac: float = 0.7) -> MLTrainResult:
@@ -58,6 +79,7 @@ def train_hit_classifier(signals: list[dict], train_frac: float = 0.7) -> MLTrai
     # error to hide.
     test_precision = precision_score(y_test, test_predictions, zero_division=0)
     test_recall = recall_score(y_test, test_predictions, zero_division=0)
+    test_probs = model.predict_proba(X_test)[:, 1].tolist()
 
     feature_coefficients = {
         name: round(float(coef), 5) for name, coef in zip(FEATURE_NAMES, model.coef_[0].tolist())
@@ -73,6 +95,7 @@ def train_hit_classifier(signals: list[dict], train_frac: float = 0.7) -> MLTrai
         test_precision=round(float(test_precision), 4),
         test_recall=round(float(test_recall), 4),
         feature_coefficients=feature_coefficients,
+        test_calibration=_calibration_buckets(test_probs, y_test),
     )
 
 

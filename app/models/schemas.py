@@ -183,6 +183,18 @@ class BacktestRun(BaseModel):
     rule_stats: list[RuleStat] = []
 
 
+class MLCalibrationBucket(BaseModel):
+    """
+    One predicted-probability range's actual outcome rate on the held-out test slice --
+    answers "does a signal the model scores 60-70% actually land above the ~50% baseline,"
+    which accuracy/precision/recall alone don't (a model can be 55% accurate overall while
+    still being a genuinely useful filter at its high-confidence end, or vice versa).
+    """
+    range_label: str  # e.g. "60-70%"
+    count: int
+    actual_hit_rate_pct: float
+
+
 class MLTrainResult(BaseModel):
     """
     Result of training the supervised hit/miss classifier (app/services/ml_model.py) on the
@@ -201,6 +213,7 @@ class MLTrainResult(BaseModel):
     test_precision: Optional[float] = None
     test_recall: Optional[float] = None
     feature_coefficients: dict[str, float] = {}
+    test_calibration: list[MLCalibrationBucket] = []
 
 
 class PaperTrade(BaseModel):
