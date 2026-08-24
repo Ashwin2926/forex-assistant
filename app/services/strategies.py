@@ -20,6 +20,17 @@ ADX_TREND_THRESHOLD = 20.0
 MOMENTUM_ROC_ATR_MULT = 1.0
 VOLUME_CONFIRMATION_MULT = 1.5
 
+# call_smart_money: how much larger a rejection wick must be than the candle's own body to
+# count as an aggressive "liquidity sweep" rather than an ordinary bounce. Starting guess,
+# matches detect_candlestick_pattern's hammer/shooting-star wick-to-body convention, not
+# independently backtested.
+SMC_WICK_BODY_MULT = 2.0
+
+# How far beyond the sweep wick's own extreme the stop sits, as an ATR multiple -- a real
+# SMC stop goes just past the sweep itself (if price returns there, the liquidity-grab
+# thesis was wrong), not a flat multiple from entry the way most other strategies here do.
+SMC_STOP_BUFFER_ATR_MULT = 0.25
+
 
 def call_trend(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
     """Wraps the existing, already-backtested EMA/RSI/MACD engine unmodified -- this strategy
@@ -326,7 +337,82 @@ def call_volume_momentum(df: pd.DataFrame, config: RuleConfig = RuleConfig()) ->
     )
 
 
+def call_smart_money(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+    """
+    A mechanized, deliberately narrow approximation of one piece of ICT/"Smart Money
+    Concepts": a liquidity sweep -- price wicks through a recent swing level (where
+    stop-losses are assumed to cluster) with a wick disproportionately larger than its own
+    body, then closes back on the original side. This differs from
+    call_support_resistance's bounce case specifically by requiring that wick dominance
+    (support_resistance fires on any close-back-inside touch, regardless of wick size) --
+    the actual visual signature SMC traders look for ("stop hunt"), not just "price touched
+    a level."
+
+    Target is the opposite recent swing level (the next liquidity pool), not a generic ATR
+    multiple -- same precedent as call_bollinger using its middle band, since that's what
+    this strategy's actual thesis predicts price will travel to. Stop sits just beyond the
+    sweep wick's own extreme (plus a small ATR buffer), not a flat multiple from entry --
+    that's where a real SMC stop goes, since a return past the sweep means the liquidity-grab
+    read was wrong.
+
+    Full SMC also covers market structure (BOS/CHoCH), order blocks, and fair value gaps --
+    none of that is modeled here. This mechanizes the liquidity-sweep trigger only.
+    """
+    latest = df.iloc[-1]
+    entry_price = float(latest["close"])
+    atr_val = float(latest["atr"])
+    resistance_levels, support_levels = find_swing_levels(df.iloc[:-1])
+    nearest_resistance = resistance_levels[0] if resistance_levels else None
+    nearest_support = support_levels[0] if support_levels else None
+
+    body = abs(latest["close"] - latest["open"])
+    upper_wick = latest["high"] - max(latest["close"], latest["open"])
+    lower_wick = min(latest["close"], latest["open"]) - latest["low"]
+
+    res_str = f"{nearest_resistance:.5f}" if nearest_resistance is not None else "n/a"
+    sup_str = f"{nearest_support:.5f}" if nearest_support is not None else "n/a"
+    reasons = [SignalReason(
+        rule="smc_levels", passed=nearest_resistance is not None and nearest_support is not None,
+        detail=f"Liquidity reference levels -- recent high {res_str}, recent low {sup_str}"
+    )]
+
+    direction = "HOLD"
+    target_price = stop_price = None
+
+    # Both a sweep AND a target need to exist -- a sweep with nowhere (no opposite level) to
+    # send the reversal toward isn't a tradeable setup here.
+    swept_high = nearest_resistance is not None and nearest_support is not None and latest["high"] > nearest_resistance and latest["close"] < nearest_resistance
+    swept_low = nearest_support is not None and nearest_resistance is not None and latest["low"] < nearest_support and latest["close"] > nearest_support
+
+    if swept_high and body > 0 and upper_wick >= body * SMC_WICK_BODY_MULT:
+        direction = "SELL"
+        target_price = nearest_support
+        stop_price = float(latest["high"]) + SMC_STOP_BUFFER_ATR_MULT * atr_val
+        reasons.append(SignalReason(
+            rule="liquidity_sweep", passed=True, value=float(upper_wick / body),
+            detail=f"Wicked above {res_str} (high {latest['high']:.5f}) then rejected, closing at "
+                   f"{latest['close']:.5f} -- wick {upper_wick / body:.1f}x the candle's body"
+        ))
+    elif swept_low and body > 0 and lower_wick >= body * SMC_WICK_BODY_MULT:
+        direction = "BUY"
+        target_price = nearest_resistance
+        stop_price = float(latest["low"]) - SMC_STOP_BUFFER_ATR_MULT * atr_val
+        reasons.append(SignalReason(
+            rule="liquidity_sweep", passed=True, value=float(lower_wick / body),
+            detail=f"Wicked below {sup_str} (low {latest['low']:.5f}) then rejected, closing at "
+                   f"{latest['close']:.5f} -- wick {lower_wick / body:.1f}x the candle's body"
+        ))
+    else:
+        reasons.append(SignalReason(rule="liquidity_sweep", passed=False, detail="No wick-dominant rejection at a recent swing level"))
+
+    return StrategyCall(
+        strategy="smart_money", direction=direction,
+        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
+        reasons=reasons,
+    )
+
+
 STRATEGIES: list[Callable[..., StrategyCall]] = [
     call_trend, call_bollinger, call_support_resistance, call_candlestick, call_stoch_adx,
-    call_volume_momentum,
+    call_volume_momentum, call_smart_money,
 ]

@@ -100,7 +100,8 @@ jobs:
       # Consensus (app/services/consensus.py) is a separate, additive signal source on top
       # of intraday/swing -- checked on the same per-interval cadence as the generate steps
       # above, reusing the candles that step already ingested (zero extra Twelve Data calls).
-      # Only fires a stored signal on genuine 3-of-5 weighted agreement, so most of these calls are
+      # Only fires a stored signal on genuine weighted-majority agreement (see consensus.py's
+      # REQUIRED_WEIGHT_FRACTION), so most of these calls are
       # expected to return "no consensus" -- that's normal, not a sign anything's broken.
       - name: Check consensus (5min, 15min)
         run: |

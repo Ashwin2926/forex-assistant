@@ -96,7 +96,7 @@ class StrategyCall(BaseModel):
     strategy stays explainable and ML-feature-ready the same way the trend strategy already
     is, not just a bare direction).
     """
-    strategy: str  # "trend" | "bollinger" | "support_resistance" | "candlestick" | "stoch_adx"
+    strategy: str  # "trend" | "bollinger" | "support_resistance" | "candlestick" | "stoch_adx" | "volume_momentum" | "smart_money"
     direction: Literal["BUY", "SELL", "HOLD"]
     entry_price: float
     target_price: Optional[float] = None  # None when direction == HOLD

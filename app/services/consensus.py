@@ -15,21 +15,25 @@ STRATEGY_WEIGHTS: dict[str, float] = {fn.__name__.removeprefix("call_"): 1.0 for
 # forex volume (their own docs: "available not for all instrument types" -- spot FX has no
 # centralized tape to report it from, so no plan tier fixes this), so every call it makes is
 # HOLD, permanently. Weighting it 0 means it can't dilute the other strategies' threshold by
-# sitting in the denominator doing nothing -- the remaining 5 land at whatever bar
-# REQUIRED_WEIGHT_FRACTION below sets (as if there were only 5 strategies) instead of an
-# unreachable 6-strategy bar. If a real volume source (OANDA/MT5 tick volume, see
-# PROGRESS.md) ever replaces Twelve Data for ingestion, raise this back to 1.0 -- the
-# strategy itself doesn't need to change, only this number.
+# sitting in the denominator doing nothing -- the remaining active strategies land at
+# whatever bar REQUIRED_WEIGHT_FRACTION below sets as if it didn't exist at all, instead of
+# an unreachable bar. If a real volume source (OANDA/MT5 tick volume, see PROGRESS.md) ever
+# replaces Twelve Data for ingestion, raise this back to 1.0 -- the strategy itself doesn't
+# need to change, only this number.
 STRATEGY_WEIGHTS["volume_momentum"] = 0.0
 
 # Fraction of total vote weight that must agree on one direction. With volume_momentum at 0
-# and the other 5 equal at 1.0, total_weight is effectively 5.0, so 0.6 means a real majority
-# (3-of-5) rather than the original near-unanimous 4-of-5 (0.8). Lowered from 0.8 on
-# 2026-08-24: requiring 4 of 5 philosophically different techniques (trend-following vs.
-# Bollinger mean-reversion in particular -- the 2026-08-21 backtest found Bollinger never
-# once agreed with the pack) made consensus fire so rarely it was closer to "wait for a
-# near-miracle" than "wait for a real majority." Re-backtest across all pairs/intervals
-# after any further change here -- more signals at a lower bar trades agreement-strength for
+# and the other 6 (as of smart_money, added 2026-08-24) equal at 1.0, total_weight is
+# effectively 6.0, so 0.6 needs 4 of 6 to agree (0.6 * 6.0 = 3.6, rounds up). This is a
+# proportional bar, not a fixed headcount -- adding a real, functioning strategy is expected
+# to shift the raw number needed, unlike volume_momentum's permanent-HOLD case which would
+# have silently tightened the bar for a voice that can never actually vote. Originally set to
+# 0.6 (3-of-5) on 2026-08-24 after 0.8 (4-of-5, before smart_money existed) made consensus
+# fire so rarely across 5 philosophically different techniques it was closer to "wait for a
+# near-miracle" than "wait for a real majority" (the 2026-08-21 backtest found Bollinger
+# never once agreed with the pack, for context on how divergent these techniques can be).
+# Re-backtest across all pairs/intervals after any further change here, including strategy
+# count changes -- more signals at a lower effective bar trades agreement-strength for
 # frequency, so this needs the same train/test validation as everything else, not just a
 # vibe check.
 REQUIRED_WEIGHT_FRACTION = 0.6

@@ -101,7 +101,7 @@ export default function ConsensusPage() {
     const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
     const results: BacktestGridCell[] = [];
     // Sequential, not Promise.all like the live grid above -- each call replays every
-    // candle bar-by-bar across up to 6 strategies, far heavier than a single-candle live
+    // candle bar-by-bar across every strategy, far heavier than a single-candle live
     // check, and this hits the same backend instance 20x in a row.
     for (const { pair: p, interval: i } of combos) {
       try {
@@ -128,11 +128,13 @@ export default function ConsensusPage() {
       <section>
         <h1 className="text-xl font-semibold tracking-tight">Multi-strategy consensus</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Five independent strategies (trend, Bollinger mean-reversion, support/resistance,
-          candlestick patterns, stochastic+ADX) each analyze the same candles. A consensus
-          only fires when a weighted majority agree on direction <em>and</em> their entry/exit
-          prices land within half an ATR of each other. Additive to the existing intraday/swing
-          engine, not a replacement — run the backtest below before trusting anything it says.
+          Seven independent strategies (trend, Bollinger mean-reversion, support/resistance,
+          candlestick patterns, stochastic+ADX, volume-confirmed momentum, and a liquidity-sweep
+          approximation of Smart Money Concepts) each analyze the same candles independently —
+          no shared state between them. A consensus only fires when a weighted majority agree on
+          direction <em>and</em> their entry/exit prices land within half an ATR of each other.
+          Additive to the existing intraday/swing engine, not a replacement — run the backtest
+          below before trusting anything it says.
         </p>
       </section>
 
