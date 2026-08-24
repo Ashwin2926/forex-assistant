@@ -12,6 +12,13 @@ interface GridCell {
   error?: string;
 }
 
+interface BacktestGridCell {
+  pair: string;
+  interval: string;
+  result: ConsensusBacktestResult | null;
+  error?: string;
+}
+
 export default function ConsensusPage() {
   const [grid, setGrid] = useState<GridCell[]>([]);
   const [gridLoading, setGridLoading] = useState(false);
@@ -23,6 +30,10 @@ export default function ConsensusPage() {
   const [backtesting, setBacktesting] = useState(false);
   const [backtestError, setBacktestError] = useState<string | null>(null);
   const [backtestResult, setBacktestResult] = useState<ConsensusBacktestResult | null>(null);
+
+  const [backtestGrid, setBacktestGrid] = useState<BacktestGridCell[]>([]);
+  const [backtestGridProgress, setBacktestGridProgress] = useState(0);
+  const [backtestGridRunning, setBacktestGridRunning] = useState(false);
 
   const [recent, setRecent] = useState<ConsensusSignal[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
@@ -83,7 +94,34 @@ export default function ConsensusPage() {
     }
   }
 
+  async function runAllBacktests() {
+    setBacktestGridRunning(true);
+    setBacktestGrid([]);
+    setBacktestGridProgress(0);
+    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
+    const results: BacktestGridCell[] = [];
+    // Sequential, not Promise.all like the live grid above -- each call replays every
+    // candle bar-by-bar across up to 6 strategies, far heavier than a single-candle live
+    // check, and this hits the same backend instance 20x in a row.
+    for (const { pair: p, interval: i } of combos) {
+      try {
+        const result = await api.runConsensusBacktest(p, i, { train_frac: trainFrac });
+        results.push({ pair: p, interval: i, result });
+      } catch (e) {
+        results.push({ pair: p, interval: i, result: null, error: e instanceof ApiError ? e.message : "Failed" });
+      }
+      setBacktestGridProgress(results.length);
+      setBacktestGrid([...results]);
+    }
+    setBacktestGridRunning(false);
+  }
+
   const firedCount = grid.filter((c) => c.consensus).length;
+  const sortedBacktestGrid = [...backtestGrid].sort((a, b) => {
+    const aSignals = a.result?.test.directional_signals ?? -1;
+    const bSignals = b.result?.test.directional_signals ?? -1;
+    return bSignals - aSignals;
+  });
 
   return (
     <div className="flex flex-col gap-8">
@@ -222,6 +260,71 @@ export default function ConsensusPage() {
             <TrainTestCard label="Test (out-of-sample)" run={backtestResult.test} accent="emerald" />
           </div>
         )}
+
+        <div className="mt-6 border-t border-zinc-100 pt-4 dark:border-zinc-800">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Or run the same train/test backtest across all 4 pairs &times; 5 intervals at
+              once, using the train fraction above.
+            </p>
+            <button onClick={runAllBacktests} disabled={backtestGridRunning} className="btn-primary shrink-0">
+              {backtestGridRunning ? `Running ${backtestGridProgress}/20…` : "Run all backtests"}
+            </button>
+          </div>
+
+          {backtestGrid.length > 0 && (
+            <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                  <tr>
+                    <th className="px-3 py-1.5">Pair</th>
+                    <th className="px-3 py-1.5">Interval</th>
+                    <th className="px-3 py-1.5">Train hit rate</th>
+                    <th className="px-3 py-1.5">Train expectancy</th>
+                    <th className="px-3 py-1.5">Test hit rate</th>
+                    <th className="px-3 py-1.5">Test expectancy</th>
+                    <th className="px-3 py-1.5">Test signals</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedBacktestGrid.map((cell) => {
+                    const key = `${cell.pair}-${cell.interval}`;
+                    const test = cell.result?.test;
+                    const train = cell.result?.train;
+                    const sameSign = test && train && test.expectancy_pct != null && train.expectancy_pct != null
+                      && Math.sign(test.expectancy_pct) === Math.sign(train.expectancy_pct) && test.expectancy_pct > 0;
+                    return (
+                      <tr key={key} className={`border-t border-zinc-100 dark:border-zinc-800 ${sameSign ? "bg-emerald-50 dark:bg-emerald-950" : ""}`}>
+                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
+                        {cell.error ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>{cell.error}</td>
+                        ) : (
+                          <>
+                            <td className="px-3 py-1.5">{train?.hit_rate_pct != null ? `${train.hit_rate_pct}%` : "—"}</td>
+                            <td className={`px-3 py-1.5 ${train?.expectancy_pct != null && train.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {train?.expectancy_pct != null ? `${train.expectancy_pct >= 0 ? "+" : ""}${train.expectancy_pct}%` : "—"}
+                            </td>
+                            <td className="px-3 py-1.5">{test?.hit_rate_pct != null ? `${test.hit_rate_pct}%` : "—"}</td>
+                            <td className={`px-3 py-1.5 ${test?.expectancy_pct != null && test.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {test?.expectancy_pct != null ? `${test.expectancy_pct >= 0 ? "+" : ""}${test.expectancy_pct}%` : "—"}
+                            </td>
+                            <td className="px-3 py-1.5">{test?.directional_signals ?? "—"}</td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <p className="px-3 py-2 text-xs text-zinc-400 dark:text-zinc-600">
+                Highlighted rows: test expectancy is positive and the same sign as train —
+                the closest this view gets to "worth trusting," and even then only with a
+                large enough test-signal count to mean anything.
+              </p>
+            </div>
+          )}
+        </div>
       </section>
 
       <section>
