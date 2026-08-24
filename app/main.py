@@ -1,6 +1,7 @@
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from datetime import datetime
 import pandas as pd
 
 from app.core.config import get_settings
@@ -20,7 +21,7 @@ from app.core.database import (
 from app.models.schemas import LoginRequest, RuleConfig, RLPolicy, RLSignal, Signal
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
-from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for
+from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, spread_cost_pct
 from app.services.backtester import run_backtest, run_consensus_backtest
 from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus
@@ -857,15 +858,49 @@ async def list_rl_policies(pair: str | None = None, interval: str | None = None,
     return docs
 
 
+async def _expire_stale_rl_signal(pending: dict, current_price: float) -> None:
+    """
+    Marks a pending RL signal expired because the policy's live view has moved on (a newer
+    decision at the same pair/interval disagrees with it), rather than leaving it to resolve
+    naturally against label_outcome's max_lookforward window (up to ~20 hours at 1h). This
+    project treats "pending" as "still the agent's current live view" for RL signals
+    specifically, since they're meant to be traded manually and soon -- a stale one hanging
+    around for most of a day isn't a real trade opportunity anymore. The record is UPDATED,
+    never deleted -- same "keep history, don't erase it" convention as every other status
+    transition in this project (hit/miss/expired all go through update_one, not delete_one).
+    """
+    pct_move = ((current_price - pending["entry_price"]) / pending["entry_price"]) * 100
+    if pending["direction"] == "SELL":
+        pct_move = -pct_move
+    pct_move -= spread_cost_pct(pending["pair"], pending["entry_price"])
+    await rl_signals_collection.update_one(
+        {"_id": pending["_id"]},
+        {"$set": {
+            "status": "expired",
+            "outcome_price": round(current_price, 5),
+            "outcome_timestamp": datetime.utcnow(),
+            "outcome_pct_move": round(pct_move, 5),
+            "candles_to_outcome": None,  # superseded, not resolved by walking forward N candles
+        }},
+    )
+
+
 @app.post("/rl/signal/{interval}")
 async def create_rl_signal(interval: str, pair: str):
     """
     Loads the most recently trained RLPolicy for this pair/interval, computes the current
     state from live strategy calls on the latest candles (compute_strategy_vote_states, same
     encoding used during training), and picks the greedy action. Only BUY/SELL get stored --
-    HOLD never produces an RLSignal, same as ConsensusSignal. De-dupes against the last
-    stored RLSignal the same way create_consensus_signal already does, so re-running this
-    before the underlying candle has advanced doesn't insert a duplicate.
+    HOLD never produces an RLSignal, same as ConsensusSignal.
+
+    If a different decision now disagrees with whatever RL signal is still "pending" for this
+    pair/interval (new direction, new action is HOLD, or price has moved enough that the
+    entry itself changed), that old pending signal is marked "expired" immediately (see
+    _expire_stale_rl_signal) instead of being left to resolve on its own hours later --
+    "pending" should mean "still the agent's current live view," not "might still resolve
+    eventually." An exact repeat of the still-pending signal is left alone and returned as-is
+    (same de-dupe idea create_consensus_signal already uses), so re-running this before the
+    underlying candle has advanced doesn't spuriously expire-then-recreate it.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
@@ -894,12 +929,19 @@ async def create_rl_signal(interval: str, pair: str):
 
     state, df = _rl_state_from_candles(docs, config)
     action, q_values = choose_action(policy, state)
+    current_price = float(df.iloc[-1]["close"])
+
+    pending = await rl_signals_collection.find_one(
+        {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
+    )
 
     if action == "HOLD":
+        if pending is not None:
+            await _expire_stale_rl_signal(pending, current_price)
         return {"signal": None, "q_values": q_values}
 
     latest = df.iloc[-1]
-    entry_price = float(latest["close"])
+    entry_price = current_price
     atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
     target_price, stop_price = compute_atr_target_stop(
         entry_price, atr_val, action, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT,
@@ -911,18 +953,20 @@ async def create_rl_signal(interval: str, pair: str):
         q_values=q_values, policy_id=policy.policy_id,
     )
 
-    # De-dupe against the last stored RL signal, same idea as create_consensus_signal.
-    last = await rl_signals_collection.find_one(
-        {"pair": pair, "interval": interval, "source": "live"}, sort=[("timestamp", -1)],
-    )
     if (
-        last is not None
-        and last["direction"] == rl_signal.direction
-        and last["entry_price"] == rl_signal.entry_price
-        and last["target_price"] == rl_signal.target_price
+        pending is not None
+        and pending["direction"] == rl_signal.direction
+        and pending["entry_price"] == rl_signal.entry_price
+        and pending["target_price"] == rl_signal.target_price
     ):
-        last["_id"] = str(last["_id"])
-        return {"signal": last, "q_values": q_values}
+        # Exact repeat of the still-live signal -- nothing has changed, return it as-is.
+        pending["_id"] = str(pending["_id"])
+        return {"signal": pending, "q_values": q_values}
+
+    if pending is not None:
+        # The agent's view has moved on (different direction or entry) -- the old signal is
+        # no longer what the agent would trade right now.
+        await _expire_stale_rl_signal(pending, current_price)
 
     await rl_signals_collection.insert_one(rl_signal.model_dump())
     return {"signal": rl_signal, "q_values": q_values}

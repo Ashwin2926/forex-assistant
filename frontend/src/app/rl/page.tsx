@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { PAIRS, type BacktestRun, type PaperTrade, type RLPolicy, type RLSignal } from "@/lib/types";
+import { StatusBadge } from "@/components/Badges";
 
 const RL_INTERVAL = "1h"; // v1 is scoped to 1h only -- see PROGRESS.md
 
@@ -330,7 +331,7 @@ export default function RLPage() {
                         {" / "}
                         <span className="text-emerald-600 dark:text-emerald-400">+${rewardUsd.toFixed(0)}</span>
                       </td>
-                      <td className="px-4 py-2">{s.status}</td>
+                      <td className="px-4 py-2"><StatusBadge status={s.status} /></td>
                       <td className="px-4 py-2 text-xs text-zinc-500">{new Date(s.timestamp).toLocaleString()}</td>
                     </tr>
                   );
