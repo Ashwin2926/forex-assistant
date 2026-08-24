@@ -247,13 +247,25 @@ export default function RLPage() {
           </p>
         )}
         {trainResult && (
-          <div className="mt-4">
-            <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Test-slice evaluation (a real backtest run, greedy/no exploration) — directly
-              comparable to any other approach&apos;s expectancy on the same pair/interval.
-            </p>
-            <div className="mt-2 max-w-xs">
-              <TrainTestCard run={trainResult.evaluation} />
+          <div className="mt-4 flex flex-col gap-4">
+            <div>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                Test-slice evaluation (a real backtest run, greedy/no exploration) — directly
+                comparable to any other approach&apos;s expectancy on the same pair/interval.
+              </p>
+              <div className="mt-2 max-w-xs">
+                <TrainTestCard run={trainResult.evaluation} />
+              </div>
+            </div>
+            <div>
+              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">What it learned to value</p>
+              <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
+                Reward/punishment isn&apos;t logged trade-by-trade — it&apos;s baked directly
+                into these weights during training. For each action, a positive weight on a
+                strategy&apos;s vote means agreeing with that strategy got reinforced
+                (led to reward); negative means it got punished (led to loss).
+              </p>
+              <WeightsTable policy={trainResult.policy} />
             </div>
           </div>
         )}
@@ -505,6 +517,39 @@ export default function RLPage() {
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+const ACTION_DISPLAY_ORDER = ["BUY", "SELL", "HOLD"];
+
+function WeightsTable({ policy }: { policy: RLPolicy }) {
+  const actions = ACTION_DISPLAY_ORDER.filter((a) => a in policy.weights);
+  return (
+    <div className="mt-2 overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
+      <table className="w-full text-left text-xs">
+        <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+          <tr>
+            <th className="px-3 py-1.5">Feature</th>
+            {actions.map((a) => <th key={a} className="px-3 py-1.5">{a}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {policy.feature_names.map((feature, i) => (
+            <tr key={feature} className="border-t border-zinc-100 dark:border-zinc-800">
+              <td className="px-3 py-1.5 font-mono">{feature}</td>
+              {actions.map((a) => {
+                const value = policy.weights[a][i];
+                return (
+                  <td key={a} className={`px-3 py-1.5 font-mono ${value >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                    {value >= 0 ? "+" : ""}{value.toFixed(4)}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
