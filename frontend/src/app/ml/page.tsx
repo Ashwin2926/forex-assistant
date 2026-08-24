@@ -4,6 +4,21 @@ import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { INTERVALS, PAIRS, PROFILES, type MLPrediction, type MLTrainResult, type Profile } from "@/lib/types";
 
+// Same interval -> profile pairing the cron uses (keep-fresh.yml): 5min/15min are
+// intraday (short EMAs, session-filtered), 1h/4h/1day are swing (long EMAs, no session
+// filter) -- the other combinations exist in the API but aren't what's actually live.
+const INTERVAL_PROFILE: Record<string, Profile> = {
+  "5min": "intraday", "15min": "intraday", "1h": "swing", "4h": "swing", "1day": "swing",
+};
+
+interface PredictGridCell {
+  pair: string;
+  interval: string;
+  profile: Profile;
+  prediction: MLPrediction | null;
+  error?: string;
+}
+
 export default function MLPage() {
   const [training, setTraining] = useState(false);
   const [trainError, setTrainError] = useState<string | null>(null);
@@ -18,6 +33,10 @@ export default function MLPage() {
   const [predicting, setPredicting] = useState(false);
   const [predictError, setPredictError] = useState<string | null>(null);
   const [prediction, setPrediction] = useState<MLPrediction | null>(null);
+
+  const [predictGrid, setPredictGrid] = useState<PredictGridCell[]>([]);
+  const [predictGridProgress, setPredictGridProgress] = useState(0);
+  const [predictGridRunning, setPredictGridRunning] = useState(false);
 
   async function loadRuns() {
     setRunsLoading(true);
@@ -60,6 +79,37 @@ export default function MLPage() {
       setPredicting(false);
     }
   }
+
+  async function handlePredictAll() {
+    setPredictGridRunning(true);
+    setPredictGrid([]);
+    setPredictGridProgress(0);
+    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i, profile: INTERVAL_PROFILE[i] })));
+    const results: PredictGridCell[] = [];
+    // Sequential, not Promise.all -- predictML retrains the classifier from scratch on
+    // every call (see predict_hit_probability in ml_model.py), so 20 in parallel would be
+    // 20 concurrent training runs hitting the same backend instance at once.
+    for (const { pair: p, interval: i, profile: pr } of combos) {
+      try {
+        const result = await api.predictML(p, i, pr);
+        results.push({ pair: p, interval: i, profile: pr, prediction: result });
+      } catch (e) {
+        results.push({ pair: p, interval: i, profile: pr, prediction: null, error: e instanceof ApiError ? e.message : "Failed" });
+      }
+      setPredictGridProgress(results.length);
+      setPredictGrid([...results]);
+    }
+    setPredictGridRunning(false);
+  }
+
+  const sortedPredictGrid = [...predictGrid].sort((a, b) => {
+    const aDirectional = a.prediction && a.prediction.direction !== "HOLD" ? 1 : 0;
+    const bDirectional = b.prediction && b.prediction.direction !== "HOLD" ? 1 : 0;
+    if (aDirectional !== bDirectional) return bDirectional - aDirectional;
+    const aProb = a.prediction?.ml_hit_probability ?? -1;
+    const bProb = b.prediction?.ml_hit_probability ?? -1;
+    return bProb - aProb;
+  });
 
   return (
     <div className="flex flex-col gap-8">
@@ -202,6 +252,67 @@ export default function MLPage() {
             </p>
           </div>
         )}
+
+        <div className="mt-6 border-t border-zinc-100 pt-4 dark:border-zinc-800">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Or predict all 4 pairs &times; 5 intervals at once (using each interval&apos;s
+              live profile — 5min/15min intraday, 1h/4h/1day swing, same as the cron).
+            </p>
+            <button onClick={handlePredictAll} disabled={predictGridRunning} className="btn-primary shrink-0">
+              {predictGridRunning ? `Predicting ${predictGridProgress}/20…` : "Predict all"}
+            </button>
+          </div>
+
+          {predictGrid.length > 0 && (
+            <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                  <tr>
+                    <th className="px-3 py-1.5">Pair</th>
+                    <th className="px-3 py-1.5">Interval</th>
+                    <th className="px-3 py-1.5">Direction</th>
+                    <th className="px-3 py-1.5">Entry</th>
+                    <th className="px-3 py-1.5">Exit</th>
+                    <th className="px-3 py-1.5">Stop</th>
+                    <th className="px-3 py-1.5">ML hit prob.</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedPredictGrid.map((cell) => {
+                    const key = `${cell.pair}-${cell.interval}`;
+                    const p = cell.prediction;
+                    const directional = p && p.direction !== "HOLD";
+                    return (
+                      <tr
+                        key={key}
+                        className={`border-t border-zinc-100 dark:border-zinc-800 ${directional ? (p!.direction === "BUY" ? "bg-emerald-50 dark:bg-emerald-950" : "bg-rose-50 dark:bg-rose-950") : ""}`}
+                      >
+                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval} · {cell.profile}</td>
+                        {cell.error ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>{cell.error}</td>
+                        ) : (
+                          <>
+                            <td className={`px-3 py-1.5 font-semibold ${p!.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : p!.direction === "SELL" ? "text-rose-600 dark:text-rose-400" : "text-zinc-400"}`}>
+                              {p!.direction}
+                            </td>
+                            <td className="px-3 py-1.5">{directional ? p!.price_at_signal.toFixed(5) : "—"}</td>
+                            <td className="px-3 py-1.5">{p!.target_price != null ? p!.target_price.toFixed(5) : "—"}</td>
+                            <td className="px-3 py-1.5">{p!.stop_price != null ? p!.stop_price.toFixed(5) : "—"}</td>
+                            <td className="px-3 py-1.5">
+                              {p!.ml_hit_probability != null ? `${(p!.ml_hit_probability * 100).toFixed(1)}%` : "—"}
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </section>
 
       <section>
