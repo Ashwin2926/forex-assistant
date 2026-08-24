@@ -24,6 +24,7 @@ interface TrainAllCell {
   pair: string;
   interval: string;
   evaluation: BacktestRun | null;
+  policy: RLPolicy | null;
   error?: string;
 }
 
@@ -62,6 +63,7 @@ export default function RLPage() {
   const [trainAllResults, setTrainAllResults] = useState<TrainAllCell[]>([]);
   const [trainAllProgress, setTrainAllProgress] = useState(0);
   const [trainAllRunning, setTrainAllRunning] = useState(false);
+  const [expandedWeights, setExpandedWeights] = useState<string | null>(null);
 
   const [generateAllResults, setGenerateAllResults] = useState<GenerateAllCell[]>([]);
   const [generateAllProgress, setGenerateAllProgress] = useState(0);
@@ -138,9 +140,9 @@ export default function RLPage() {
     for (const { pair: p, interval: i } of combos) {
       try {
         const result = await api.trainRLPolicy(p, i, { episodes, train_frac: trainFrac });
-        results.push({ pair: p, interval: i, evaluation: result.evaluation });
+        results.push({ pair: p, interval: i, evaluation: result.evaluation, policy: result.policy });
       } catch (e) {
-        results.push({ pair: p, interval: i, evaluation: null, error: e instanceof ApiError ? e.message : "Failed" });
+        results.push({ pair: p, interval: i, evaluation: null, policy: null, error: e instanceof ApiError ? e.message : "Failed" });
       }
       setTrainAllProgress(results.length);
       setTrainAllResults([...results]);
@@ -291,29 +293,48 @@ export default function RLPage() {
                     <th className="px-3 py-1.5">Test expectancy</th>
                     <th className="px-3 py-1.5">Trades</th>
                     <th className="px-3 py-1.5">Holds</th>
+                    <th className="px-3 py-1.5"></th>
                   </tr>
                 </thead>
                 <tbody>
                   {trainAllResults.map((cell) => {
                     const key = `${cell.pair}-${cell.interval}`;
                     const run = cell.evaluation;
+                    const isExpanded = expandedWeights === key;
                     return (
-                      <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
-                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
-                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
-                        {cell.error ? (
-                          <td className="px-3 py-1.5 text-zinc-400" colSpan={4}>{cell.error}</td>
-                        ) : (
-                          <>
-                            <td className="px-3 py-1.5">{run?.hit_rate_pct != null ? `${run.hit_rate_pct}%` : "—"}</td>
-                            <td className={`px-3 py-1.5 ${run?.expectancy_pct != null && run.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                              {run?.expectancy_pct != null ? `${run.expectancy_pct >= 0 ? "+" : ""}${run.expectancy_pct}%` : "—"}
+                      <>
+                        <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
+                          <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                          <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
+                          {cell.error ? (
+                            <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>{cell.error}</td>
+                          ) : (
+                            <>
+                              <td className="px-3 py-1.5">{run?.hit_rate_pct != null ? `${run.hit_rate_pct}%` : "—"}</td>
+                              <td className={`px-3 py-1.5 ${run?.expectancy_pct != null && run.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                                {run?.expectancy_pct != null ? `${run.expectancy_pct >= 0 ? "+" : ""}${run.expectancy_pct}%` : "—"}
+                              </td>
+                              <td className="px-3 py-1.5">{run?.directional_signals ?? "—"}</td>
+                              <td className="px-3 py-1.5">{run?.hold_signals ?? "—"}</td>
+                              <td className="px-3 py-1.5">
+                                <button
+                                  onClick={() => setExpandedWeights(isExpanded ? null : key)}
+                                  className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
+                                >
+                                  {isExpanded ? "Hide" : "Show"} weights
+                                </button>
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                        {isExpanded && cell.policy && (
+                          <tr key={`${key}-weights`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
+                            <td colSpan={7} className="px-3 py-2">
+                              <WeightsTable policy={cell.policy} />
                             </td>
-                            <td className="px-3 py-1.5">{run?.directional_signals ?? "—"}</td>
-                            <td className="px-3 py-1.5">{run?.hold_signals ?? "—"}</td>
-                          </>
+                          </tr>
                         )}
-                      </tr>
+                      </>
                     );
                   })}
                 </tbody>
