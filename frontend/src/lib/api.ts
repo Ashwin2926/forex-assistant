@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RuleConfig, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLPolicy, RLSignal, RuleConfig, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -190,6 +190,64 @@ export const api = {
     // breaks Starlette's routing even when percent-encoded.
     return request<MLPrediction>(
       `/ml/predict/${interval}/${profile}?pair=${encodeURIComponent(pair)}`,
+      { method: "POST" },
+    );
+  },
+
+  trainRLPolicy(
+    pair: string,
+    interval: string,
+    opts: { episodes?: number; train_frac?: number; max_lookforward?: number } = {},
+  ) {
+    const qs = new URLSearchParams({ pair });
+    if (opts.episodes !== undefined) qs.set("episodes", String(opts.episodes));
+    if (opts.train_frac !== undefined) qs.set("train_frac", String(opts.train_frac));
+    if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
+    return request<{ policy: RLPolicy; evaluation: BacktestRun }>(
+      `/rl/train/${interval}?${qs.toString()}`,
+      { method: "POST" },
+    );
+  },
+
+  listRLPolicies(params: { pair?: string; interval?: string; limit?: number } = {}) {
+    const qs = new URLSearchParams();
+    if (params.pair) qs.set("pair", params.pair);
+    if (params.interval) qs.set("interval", params.interval);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const query = qs.toString();
+    return request<RLPolicy[]>(`/rl/policies${query ? `?${query}` : ""}`);
+  },
+
+  generateRLSignal(pair: string, interval: string) {
+    // pair goes in the query string, not the path — a literal '/' in a path segment
+    // breaks Starlette's routing even when percent-encoded.
+    return request<{ signal: RLSignal | null; q_values: Record<string, number> }>(
+      `/rl/signal/${interval}?pair=${encodeURIComponent(pair)}`,
+      { method: "POST" },
+    );
+  },
+
+  listRLSignals(params: { pair?: string; limit?: number } = {}) {
+    const qs = new URLSearchParams();
+    if (params.pair) qs.set("pair", params.pair);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const query = qs.toString();
+    return request<RLSignal[]>(`/rl/signals${query ? `?${query}` : ""}`);
+  },
+
+  scoreRLSignals(maxLookforward?: number) {
+    const qs = maxLookforward !== undefined ? `?max_lookforward=${maxLookforward}` : "";
+    return request<{ hit: number; miss: number; expired: number; still_pending: number; skipped_no_data: number }>(
+      `/rl/score${qs}`, { method: "POST" },
+    );
+  },
+
+  paperTradeRL(pair: string, interval: string, opts: { stake?: number; multiplier?: number } = {}) {
+    const qs = new URLSearchParams({ pair });
+    if (opts.stake !== undefined) qs.set("stake", String(opts.stake));
+    if (opts.multiplier !== undefined) qs.set("multiplier", String(opts.multiplier));
+    return request<{ signal: RLSignal | null; paper_trade: PaperTrade | null; note?: string }>(
+      `/rl/paper-trade/${interval}?${qs.toString()}`,
       { method: "POST" },
     );
   },

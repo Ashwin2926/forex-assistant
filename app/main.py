@@ -14,8 +14,10 @@ from app.core.database import (
     paper_trades_collection,
     consensus_signals_collection,
     ml_runs_collection,
+    rl_policies_collection,
+    rl_signals_collection,
 )
-from app.models.schemas import LoginRequest, RuleConfig
+from app.models.schemas import LoginRequest, RuleConfig, RLPolicy, RLSignal, Signal
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for
@@ -24,9 +26,13 @@ from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus
 from app.services.ml_features import extract_features
 from app.services.ml_model import train_hit_classifier, predict_hit_probability
+from app.services.rl_engine import (
+    train_rl_policy, choose_action, compute_strategy_vote_states,
+    RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT, MIN_WARMUP_BARS,
+)
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
-from app.services.outcome_scoring import score_pending_signals, score_pending_consensus_signals
+from app.services.outcome_scoring import score_pending_signals, score_pending_consensus_signals, score_pending_rl_signals
 
 settings = get_settings()
 app = FastAPI(title="Forex Trading Assistant")
@@ -785,6 +791,207 @@ async def predict_signal(interval: str, profile: str, pair: str):
     response = signal.model_dump()
     response["ml_hit_probability"] = ml_hit_probability
     return response
+
+
+def _rl_state_from_candles(docs: list[dict], config: RuleConfig) -> tuple[list[float], pd.DataFrame]:
+    """Shared by /rl/train and /rl/signal -- builds the indicator dataframe and the current
+    (latest-bar) state vector the same way compute_strategy_vote_states does internally,
+    without recomputing every prior bar's state just to read the last one."""
+    df = pd.DataFrame(docs)
+    indicator_df = add_all_indicators(df, config)
+    states = compute_strategy_vote_states(indicator_df, config)
+    return states[-1], df
+
+
+@app.post("/rl/train/{interval}")
+async def train_rl(
+    interval: str, pair: str, episodes: int = 100, train_frac: float = 0.7, max_lookforward: int = 20,
+):
+    """
+    Trains a linear Q-policy (app/services/rl_engine.py) for this pair/interval via
+    epsilon-greedy Q-learning over historical candle replay -- an adaptive alternative to
+    consensus's fixed weighted-vote threshold, learning how to weight the same 7 strategies
+    instead of using a hand-picked REQUIRED_WEIGHT_FRACTION. One independent policy per pair,
+    not shared across pairs. Persists both the learned RLPolicy and its test-slice evaluation
+    (a real BacktestRun, profile="rl") so it's directly comparable to every other approach via
+    GET /backtest/runs?pair=X&profile=rl.
+
+    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
+    """
+    if not 0 < train_frac < 1:
+        raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
+
+    config = default_config_for("swing", pair)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
+    docs = await cursor.to_list(length=None)
+    if not docs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.",
+        )
+
+    df = pd.DataFrame(docs)
+    try:
+        policy, eval_run = train_rl_policy(
+            df, pair, interval, config, episodes=episodes, train_frac=train_frac, max_lookforward=max_lookforward,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    await backtest_runs_collection.insert_one(eval_run.model_dump())
+    await rl_policies_collection.insert_one(policy.model_dump())
+    return {"policy": policy, "evaluation": eval_run}
+
+
+@app.get("/rl/policies")
+async def list_rl_policies(pair: str | None = None, interval: str | None = None, limit: int = 20):
+    query = {}
+    if pair:
+        query["pair"] = pair
+    if interval:
+        query["interval"] = interval
+    cursor = rl_policies_collection.find(query).sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+
+@app.post("/rl/signal/{interval}")
+async def create_rl_signal(interval: str, pair: str):
+    """
+    Loads the most recently trained RLPolicy for this pair/interval, computes the current
+    state from live strategy calls on the latest candles (compute_strategy_vote_states, same
+    encoding used during training), and picks the greedy action. Only BUY/SELL get stored --
+    HOLD never produces an RLSignal, same as ConsensusSignal. De-dupes against the last
+    stored RLSignal the same way create_consensus_signal already does, so re-running this
+    before the underlying candle has advanced doesn't insert a duplicate.
+
+    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
+    """
+    policy_doc = await rl_policies_collection.find_one(
+        {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
+    )
+    if policy_doc is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No trained RL policy yet for {pair}/{interval}. Call POST /rl/train/{interval}?pair={pair} first.",
+        )
+    policy = RLPolicy(**{k: v for k, v in policy_doc.items() if k != "_id"})
+
+    config = default_config_for("swing", pair)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
+    docs = await cursor.to_list(length=500)
+    docs.reverse()
+
+    min_needed = max(config.ema_slow, MIN_WARMUP_BARS)
+    if len(docs) < min_needed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for RL. "
+                    f"Run /ingest/{interval} first."
+        )
+
+    state, df = _rl_state_from_candles(docs, config)
+    action, q_values = choose_action(policy, state)
+
+    if action == "HOLD":
+        return {"signal": None, "q_values": q_values}
+
+    latest = df.iloc[-1]
+    entry_price = float(latest["close"])
+    atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+    target_price, stop_price = compute_atr_target_stop(
+        entry_price, atr_val, action, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT,
+    )
+
+    rl_signal = RLSignal(
+        pair=pair, interval=interval, timestamp=latest["timestamp"], direction=action,
+        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
+        q_values=q_values, policy_id=policy.policy_id,
+    )
+
+    # De-dupe against the last stored RL signal, same idea as create_consensus_signal.
+    last = await rl_signals_collection.find_one(
+        {"pair": pair, "interval": interval, "source": "live"}, sort=[("timestamp", -1)],
+    )
+    if (
+        last is not None
+        and last["direction"] == rl_signal.direction
+        and last["entry_price"] == rl_signal.entry_price
+        and last["target_price"] == rl_signal.target_price
+    ):
+        last["_id"] = str(last["_id"])
+        return {"signal": last, "q_values": q_values}
+
+    await rl_signals_collection.insert_one(rl_signal.model_dump())
+    return {"signal": rl_signal, "q_values": q_values}
+
+
+@app.get("/rl/signals")
+async def list_rl_signals(pair: str | None = None, limit: int = 50):
+    query = {"pair": pair} if pair else {}
+    cursor = rl_signals_collection.find(query).sort("timestamp", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+
+@app.post("/rl/score")
+async def score_rl_signals(max_lookforward: int = 20):
+    """
+    Closes the loop for live RL signals the same way /signals/score and /consensus/score do
+    for their own collections -- the live, forward-going half of "backtest its signals and
+    learn" (the historical-replay half is POST /rl/train itself).
+    """
+    return await score_pending_rl_signals(max_lookforward=max_lookforward)
+
+
+@app.post("/rl/paper-trade/{interval}")
+async def paper_trade_rl(interval: str, pair: str, stake: float = 10.0, multiplier: int = 100):
+    """
+    Manual/on-demand only -- NOT wired into the cron. Generates an RL signal the same way
+    POST /rl/signal/{interval} does (and stores it the same way) and, if directional,
+    executes it on the Deriv DEMO account via the existing execute_paper_trade, unchanged --
+    same "a human stays in the loop for anything execution-adjacent" pattern the existing
+    manual Paper Trading page already follows.
+
+    Known dependency: this depends on the same Deriv API auth that's currently broken (see
+    PROGRESS.md) -- expect this to surface that specific, already-known error until it's
+    fixed as a separate task, not something new.
+
+    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
+    """
+    result = await create_rl_signal(interval, pair)
+    rl_signal = result["signal"]
+    if rl_signal is None:
+        return {"signal": None, "paper_trade": None, "note": "RL policy chose HOLD — nothing executed."}
+
+    # rl_signal may be a stored dict (deduped path) or a fresh RLSignal -- normalize to a
+    # dict either way before reading fields.
+    signal_data = rl_signal if isinstance(rl_signal, dict) else rl_signal.model_dump()
+
+    # execute_paper_trade takes a Signal, not an RLSignal -- profile is only ever passed
+    # through into the stored PaperTrade record, never branched on, so "swing" here is a
+    # compatibility value (v1 is scoped to the 1h interval, matching swing's own convention)
+    # rather than a real semantic claim about this signal's origin.
+    throwaway_signal = Signal(
+        pair=pair, profile="swing", interval=interval, timestamp=signal_data["timestamp"],
+        direction=signal_data["direction"], confidence=0.0, reasons=[],
+        price_at_signal=signal_data["entry_price"],
+        target_price=signal_data["target_price"], stop_price=signal_data["stop_price"],
+    )
+
+    try:
+        trade = await execute_paper_trade(throwaway_signal, stake=stake, multiplier=multiplier)
+    except DerivAuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    await paper_trades_collection.insert_one(trade.model_dump())
+    return {"signal": rl_signal, "paper_trade": trade}
 
 
 @app.get("/paper-trade/account")

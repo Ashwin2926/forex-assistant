@@ -54,6 +54,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               <Link href="/ml" className="hover:text-zinc-900 dark:hover:text-zinc-100">
                 ML
               </Link>
+              <Link href="/rl" className="hover:text-zinc-900 dark:hover:text-zinc-100">
+                RL Agent
+              </Link>
             </nav>
             <AuthNav />
           </div>

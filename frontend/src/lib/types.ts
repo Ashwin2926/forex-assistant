@@ -143,6 +143,38 @@ export interface MLTrainResult {
   test_calibration: MLCalibrationBucket[];
 }
 
+export interface RLPolicy {
+  _id?: string;
+  policy_id: string;
+  pair: string;
+  interval: string;
+  created_at: string;
+  episodes: number;
+  train_frac: number;
+  weights: Record<string, number[]>;
+  feature_names: string[];
+  eval_run_id: string;
+}
+
+export interface RLSignal {
+  _id?: string;
+  pair: string;
+  interval: string;
+  timestamp: string;
+  direction: "BUY" | "SELL";
+  entry_price: number;
+  target_price: number;
+  stop_price: number;
+  q_values: Record<string, number>;
+  policy_id: string;
+  status: SignalStatus;
+  outcome_price?: number | null;
+  outcome_timestamp?: string | null;
+  outcome_pct_move?: number | null;
+  candles_to_outcome?: number | null;
+  source: SignalSource;
+}
+
 // Signal's normal fields plus the ML classifier's advisory hit probability -- returned by
 // POST /ml/predict/{interval}/{profile}, which does NOT insert into the signals collection.
 export type MLPrediction = Signal & { ml_hit_probability: number | null };
