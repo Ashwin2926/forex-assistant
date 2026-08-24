@@ -147,21 +147,34 @@ jobs:
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train"
       # RL agent (app/services/rl_engine.py) -- a learned, adaptive alternative to consensus's
-      # fixed weighted-vote threshold over the same 7 strategies. Generate + score run hourly
-      # (same cadence as the existing 1h consensus/signal steps) since that's cheap (a handful
-      # of strategy evaluations on the latest candles). Training is the heavy part -- many
-      # epsilon-greedy episodes over the full candle history -- so it's gated to once daily,
-      # unlike ML's near-instant retrain above; there's no reason to burn that compute every
-      # 20 minutes when the 1h candle it trains on only closes once an hour anyway. Scoped to
-      # 1h only for v1 (see PROGRESS.md). Paper-trade execution is deliberately NOT wired here
-      # -- stays a manual, on-demand trigger from the frontend, same as the existing Paper
-      # Trading page.
-      - name: Train RL policy (1h)
+      # fixed weighted-vote threshold over the same 7 strategies. Now covers all 5 intervals
+      # (widened from 1h-only, see PROGRESS.md), one independent policy per pair PER interval.
+      # Training (many epsilon-greedy episodes over each interval's full candle history) is
+      # the heavy part -- gated to once daily across every pair/interval regardless of that
+      # interval's own candle cadence, unlike ML's near-instant retrain above; there's no
+      # reason to train more than once a day even for 5min/15min, since a policy doesn't need
+      # to be as fresh as the candles it reads. Generate + score follow each interval's own
+      # natural cadence (same split already used for ingest/generate/consensus above) since
+      # that part is cheap -- a handful of strategy evaluations on the latest candle, not a
+      # training run. Paper-trade execution was removed entirely (Deriv isn't available in
+      # every region) -- RL signals are sized (lot size) and traded manually instead, see the
+      # RL page.
+      - name: Train RL policy (all intervals)
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
-          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/rl/train/1h?pair=${pair/\//%2F}"
+          for interval in 5min 15min 1h 4h 1day; do
+            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/rl/train/$interval?pair=${pair/\//%2F}"
+            done
+          done
+      - name: Generate RL signals (5min, 15min)
+        run: |
+          for interval in 5min 15min; do
+            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/rl/signal/$interval?pair=${pair/\//%2F}"
+            done
           done
       - name: Generate RL signals (1h)
         if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
@@ -169,6 +182,20 @@ jobs:
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}"
+          done
+      - name: Generate RL signals (4h)
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}"
+          done
+      - name: Generate RL signals (1day)
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        run: |
+          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
+            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/rl/signal/1day?pair=${pair/\//%2F}"
           done
       - name: Score pending RL signals
         run: |

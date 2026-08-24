@@ -18,7 +18,7 @@ from app.core.database import (
     rl_policies_collection,
     rl_signals_collection,
 )
-from app.models.schemas import LoginRequest, RuleConfig, RLPolicy, RLSignal, Signal
+from app.models.schemas import LoginRequest, RuleConfig, RLPolicy, RLSignal
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, spread_cost_pct
@@ -990,52 +990,6 @@ async def score_rl_signals(max_lookforward: int = 20):
     learn" (the historical-replay half is POST /rl/train itself).
     """
     return await score_pending_rl_signals(max_lookforward=max_lookforward)
-
-
-@app.post("/rl/paper-trade/{interval}")
-async def paper_trade_rl(interval: str, pair: str, stake: float = 10.0, multiplier: int = 100):
-    """
-    Manual/on-demand only -- NOT wired into the cron. Generates an RL signal the same way
-    POST /rl/signal/{interval} does (and stores it the same way) and, if directional,
-    executes it on the Deriv DEMO account via the existing execute_paper_trade, unchanged --
-    same "a human stays in the loop for anything execution-adjacent" pattern the existing
-    manual Paper Trading page already follows.
-
-    Known dependency: this depends on the same Deriv API auth that's currently broken (see
-    PROGRESS.md) -- expect this to surface that specific, already-known error until it's
-    fixed as a separate task, not something new.
-
-    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
-    """
-    result = await create_rl_signal(interval, pair)
-    rl_signal = result["signal"]
-    if rl_signal is None:
-        return {"signal": None, "paper_trade": None, "note": "RL policy chose HOLD — nothing executed."}
-
-    # rl_signal may be a stored dict (deduped path) or a fresh RLSignal -- normalize to a
-    # dict either way before reading fields.
-    signal_data = rl_signal if isinstance(rl_signal, dict) else rl_signal.model_dump()
-
-    # execute_paper_trade takes a Signal, not an RLSignal -- profile is only ever passed
-    # through into the stored PaperTrade record, never branched on, so "swing" here is a
-    # compatibility value (v1 is scoped to the 1h interval, matching swing's own convention)
-    # rather than a real semantic claim about this signal's origin.
-    throwaway_signal = Signal(
-        pair=pair, profile="swing", interval=interval, timestamp=signal_data["timestamp"],
-        direction=signal_data["direction"], confidence=0.0, reasons=[],
-        price_at_signal=signal_data["entry_price"],
-        target_price=signal_data["target_price"], stop_price=signal_data["stop_price"],
-    )
-
-    try:
-        trade = await execute_paper_trade(throwaway_signal, stake=stake, multiplier=multiplier)
-    except DerivAuthError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    await paper_trades_collection.insert_one(trade.model_dump())
-    return {"signal": rl_signal, "paper_trade": trade}
 
 
 @app.get("/paper-trade/account")

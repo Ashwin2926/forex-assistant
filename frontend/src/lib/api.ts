@@ -242,16 +242,6 @@ export const api = {
     );
   },
 
-  paperTradeRL(pair: string, interval: string, opts: { stake?: number; multiplier?: number } = {}) {
-    const qs = new URLSearchParams({ pair });
-    if (opts.stake !== undefined) qs.set("stake", String(opts.stake));
-    if (opts.multiplier !== undefined) qs.set("multiplier", String(opts.multiplier));
-    return request<{ signal: RLSignal | null; paper_trade: PaperTrade | null; note?: string }>(
-      `/rl/paper-trade/${interval}?${qs.toString()}`,
-      { method: "POST" },
-    );
-  },
-
   getPaperTradeAccount() {
     return request<PaperTradeAccount>("/paper-trade/account");
   },

@@ -2,16 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { PAIRS, type BacktestRun, type PaperTrade, type RLPolicy, type RLSignal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLPolicy, type RLSignal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
-const RL_INTERVAL = "1h"; // v1 is scoped to 1h only -- see PROGRESS.md
-
 // Same formula as trading-signals/page.tsx, duplicated rather than shared -- this project
-// keeps sizing logic local to whichever page displays it, not in lib/. Relevant here
-// specifically because RL signals are meant to be executed manually on whatever broker you
-// actually have (see PROGRESS.md -- no Deriv access in this region), so a lot size needs to
-// travel with the signal regardless of the paper-trade endpoint.
+// keeps sizing logic local to whichever page displays it, not in lib/. RL signals are meant
+// to be executed manually on whatever broker you actually have (Deriv isn't available in
+// every region), so a lot size needs to travel with the signal on its own.
 function usdPerUnit(pair: string, entryPrice: number): number {
   return pair === "USD/JPY" ? 1 / entryPrice : 1;
 }
@@ -28,6 +25,7 @@ export default function RLPage() {
   const [riskPercent, setRiskPercent] = useState(1);
 
   const [pair, setPair] = useState<string>(PAIRS[0]);
+  const [interval, setInterval_] = useState<string>("1h");
   const [episodes, setEpisodes] = useState(100);
   const [trainFrac, setTrainFrac] = useState(0.7);
   const [training, setTraining] = useState(false);
@@ -38,17 +36,13 @@ export default function RLPage() {
   const [policiesLoading, setPoliciesLoading] = useState(true);
 
   const [signalPair, setSignalPair] = useState<string>(PAIRS[0]);
+  const [signalInterval, setSignalInterval] = useState<string>("1h");
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [generated, setGenerated] = useState<{ signal: RLSignal | null; q_values: Record<string, number> } | null>(null);
 
   const [recentSignals, setRecentSignals] = useState<RLSignal[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
-
-  const [tradePair, setTradePair] = useState<string>(PAIRS[0]);
-  const [trading, setTrading] = useState(false);
-  const [tradeError, setTradeError] = useState<string | null>(null);
-  const [tradeResult, setTradeResult] = useState<{ signal: RLSignal | null; paper_trade: PaperTrade | null; note?: string } | null>(null);
 
   async function loadPolicies() {
     setPoliciesLoading(true);
@@ -81,7 +75,7 @@ export default function RLPage() {
     setTraining(true);
     setTrainError(null);
     try {
-      const result = await api.trainRLPolicy(pair, RL_INTERVAL, { episodes, train_frac: trainFrac });
+      const result = await api.trainRLPolicy(pair, interval, { episodes, train_frac: trainFrac });
       setTrainResult(result);
       await loadPolicies();
     } catch (e) {
@@ -96,7 +90,7 @@ export default function RLPage() {
     setGenerateError(null);
     setGenerated(null);
     try {
-      const result = await api.generateRLSignal(signalPair, RL_INTERVAL);
+      const result = await api.generateRLSignal(signalPair, signalInterval);
       setGenerated(result);
       await loadRecentSignals();
     } catch (e) {
@@ -106,30 +100,19 @@ export default function RLPage() {
     }
   }
 
-  async function handlePaperTrade() {
-    setTrading(true);
-    setTradeError(null);
-    setTradeResult(null);
-    try {
-      setTradeResult(await api.paperTradeRL(tradePair, RL_INTERVAL));
-    } catch (e) {
-      setTradeError(e instanceof ApiError ? e.message : "Paper trade failed.");
-    } finally {
-      setTrading(false);
-    }
-  }
-
   return (
     <div className="flex flex-col gap-8">
       <section>
         <h1 className="text-xl font-semibold tracking-tight">RL agent (v1)</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
           A linear Q-learning agent that learns how to weight the same 7 strategies consensus
-          uses, instead of a fixed vote threshold — one independent policy per pair, trained
-          on historical candle replay (not live signal outcomes). Every trade it takes uses a
-          fixed 1.5:1 target:stop ATR ratio, so it can never risk more than it stands to gain.
-          Scoped to the 1h interval only for now. Additive and separate from the regular
-          signal feed, consensus, and the ML classifier — doesn&apos;t touch any of them.
+          uses, instead of a fixed vote threshold — one independent policy per pair <em>and</em>{" "}
+          interval, trained on historical candle replay (not live signal outcomes). Every trade
+          it takes uses a fixed 1.5:1 target:stop ATR ratio, so it can never risk more than it
+          stands to gain. Additive and separate from the regular signal feed, consensus, and
+          the ML classifier — doesn&apos;t touch any of them. No broker execution here —
+          Deriv isn&apos;t available in every region, so signals are meant to be sized (below)
+          and traded manually on whatever broker you actually have.
         </p>
       </section>
 
@@ -138,9 +121,7 @@ export default function RLPage() {
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Applied to every signal below — lot size = (account balance &times; risk %) &divide;
           (stop distance in price &times; USD value per unit), same formula and same 4-pair
-          quote-currency assumptions as the Trading Signals page. For executing on whatever
-          broker you actually have access to, not the (currently unusable) Deriv paper-trade
-          button.
+          quote-currency assumptions as the Trading Signals page.
         </p>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Account balance (USD)">
@@ -166,6 +147,11 @@ export default function RLPage() {
           <Field label="Pair">
             <select value={pair} onChange={(e) => setPair(e.target.value)} className="select">
               {PAIRS.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </Field>
+          <Field label="Interval">
+            <select value={interval} onChange={(e) => setInterval_(e.target.value)} className="select">
+              {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
             </select>
           </Field>
           <Field label="Episodes">
@@ -207,13 +193,18 @@ export default function RLPage() {
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Generate a signal</h2>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Loads the latest trained policy and picks its greedy action on the current candle.
-          Only BUY/SELL get stored — a HOLD just shows the q_values below.
+          Loads the latest trained policy for this pair/interval and picks its greedy action on
+          the current candle. Only BUY/SELL get stored — a HOLD just shows the q_values below.
         </p>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Pair">
             <select value={signalPair} onChange={(e) => setSignalPair(e.target.value)} className="select">
               {PAIRS.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </Field>
+          <Field label="Interval">
+            <select value={signalInterval} onChange={(e) => setSignalInterval(e.target.value)} className="select">
+              {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
             </select>
           </Field>
           <button onClick={handleGenerate} disabled={generating} className="btn-primary">
@@ -246,45 +237,6 @@ export default function RLPage() {
               <p className="text-lg font-semibold text-zinc-400">HOLD</p>
             )}
             <QValueRow qValues={generated.q_values} />
-          </div>
-        )}
-      </section>
-
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Paper trade (Deriv demo account)</h2>
-        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Manual only — not run by the cron. Generates a signal the same way as above and, if
-          directional, executes it on the Deriv <strong>demo</strong> account.
-          <strong> Not usable if Deriv isn&apos;t available in your region</strong> — in that
-          case, manually execute the signals from the table below on whatever broker you
-          actually have (use the lot size shown there). This button will also fail on the
-          existing Deriv API auth issue, separately from the region question.
-        </p>
-        <div className="mt-3 flex flex-wrap items-end gap-3">
-          <Field label="Pair">
-            <select value={tradePair} onChange={(e) => setTradePair(e.target.value)} className="select">
-              {PAIRS.map((p) => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </Field>
-          <button onClick={handlePaperTrade} disabled={trading} className="btn-secondary">
-            {trading ? "Placing…" : "Paper trade"}
-          </button>
-        </div>
-        {tradeError && (
-          <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-            {tradeError}
-          </p>
-        )}
-        {tradeResult && (
-          <div className="mt-4 text-sm">
-            {tradeResult.note && <p className="text-zinc-500">{tradeResult.note}</p>}
-            {tradeResult.paper_trade && (
-              <p>
-                {tradeResult.paper_trade.direction} · stake {tradeResult.paper_trade.stake} ·
-                status {tradeResult.paper_trade.status}
-                {tradeResult.paper_trade.error && ` — ${tradeResult.paper_trade.error}`}
-              </p>
-            )}
           </div>
         )}
       </section>
