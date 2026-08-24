@@ -6,7 +6,26 @@ import { PAIRS, type BacktestRun, type PaperTrade, type RLPolicy, type RLSignal 
 
 const RL_INTERVAL = "1h"; // v1 is scoped to 1h only -- see PROGRESS.md
 
+// Same formula as trading-signals/page.tsx, duplicated rather than shared -- this project
+// keeps sizing logic local to whichever page displays it, not in lib/. Relevant here
+// specifically because RL signals are meant to be executed manually on whatever broker you
+// actually have (see PROGRESS.md -- no Deriv access in this region), so a lot size needs to
+// travel with the signal regardless of the paper-trade endpoint.
+function usdPerUnit(pair: string, entryPrice: number): number {
+  return pair === "USD/JPY" ? 1 / entryPrice : 1;
+}
+
+function calculateLotSize(pair: string, entryPrice: number, stopPrice: number, riskAmountUsd: number): number {
+  const stopDistance = Math.abs(entryPrice - stopPrice);
+  if (stopDistance === 0) return 0;
+  const units = riskAmountUsd / (stopDistance * usdPerUnit(pair, entryPrice));
+  return units / 100_000;
+}
+
 export default function RLPage() {
+  const [accountBalance, setAccountBalance] = useState(10000);
+  const [riskPercent, setRiskPercent] = useState(1);
+
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [episodes, setEpisodes] = useState(100);
   const [trainFrac, setTrainFrac] = useState(0.7);
@@ -114,6 +133,33 @@ export default function RLPage() {
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Position sizing</h2>
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          Applied to every signal below — lot size = (account balance &times; risk %) &divide;
+          (stop distance in price &times; USD value per unit), same formula and same 4-pair
+          quote-currency assumptions as the Trading Signals page. For executing on whatever
+          broker you actually have access to, not the (currently unusable) Deriv paper-trade
+          button.
+        </p>
+        <div className="mt-3 flex flex-wrap items-end gap-3">
+          <Field label="Account balance (USD)">
+            <input
+              type="number" step="100" min="0" value={accountBalance}
+              onChange={(e) => setAccountBalance(Number(e.target.value))}
+              className="select w-32"
+            />
+          </Field>
+          <Field label="Risk per trade (%)">
+            <input
+              type="number" step="0.1" min="0.1" max="10" value={riskPercent}
+              onChange={(e) => setRiskPercent(Number(e.target.value))}
+              className="select w-24"
+            />
+          </Field>
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Train a policy</h2>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Pair">
@@ -188,6 +234,12 @@ export default function RLPage() {
                 <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
                   Target {generated.signal.target_price.toFixed(5)} · Stop {generated.signal.stop_price.toFixed(5)}
                 </p>
+                <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                  Lot size {calculateLotSize(
+                    generated.signal.pair, generated.signal.entry_price, generated.signal.stop_price,
+                    accountBalance * (riskPercent / 100),
+                  ).toFixed(2)} (risking ${(accountBalance * (riskPercent / 100)).toFixed(0)})
+                </p>
               </>
             ) : (
               <p className="text-lg font-semibold text-zinc-400">HOLD</p>
@@ -198,12 +250,14 @@ export default function RLPage() {
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Paper trade (demo account)</h2>
+        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Paper trade (Deriv demo account)</h2>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Manual only — not run by the cron. Generates a signal the same way as above and, if
-          directional, executes it on the Deriv <strong>demo</strong> account. Depends on the
-          Deriv API auth issue being resolved separately — expect this to fail with that known
-          error until then, not a sign this feature is broken.
+          directional, executes it on the Deriv <strong>demo</strong> account.
+          <strong> Not usable if Deriv isn&apos;t available in your region</strong> — in that
+          case, manually execute the signals from the table below on whatever broker you
+          actually have (use the lot size shown there). This button will also fail on the
+          existing Deriv API auth issue, separately from the region question.
         </p>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Pair">
@@ -249,23 +303,38 @@ export default function RLPage() {
                   <th className="px-4 py-2">Direction</th>
                   <th className="px-4 py-2">Entry</th>
                   <th className="px-4 py-2">Exit</th>
+                  <th className="px-4 py-2">Stop</th>
+                  <th className="px-4 py-2">Lot size</th>
+                  <th className="px-4 py-2">Risk / reward</th>
                   <th className="px-4 py-2">Status</th>
                   <th className="px-4 py-2">When</th>
                 </tr>
               </thead>
               <tbody>
-                {recentSignals.map((s) => (
-                  <tr key={s._id ?? `${s.pair}-${s.timestamp}`} className="border-t border-zinc-100 dark:border-zinc-800">
-                    <td className="px-4 py-2">{s.pair} · {s.interval}</td>
-                    <td className={`px-4 py-2 font-medium ${s.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                      {s.direction}
-                    </td>
-                    <td className="px-4 py-2">{s.entry_price.toFixed(5)}</td>
-                    <td className="px-4 py-2">{s.target_price.toFixed(5)}</td>
-                    <td className="px-4 py-2">{s.status}</td>
-                    <td className="px-4 py-2 text-xs text-zinc-500">{new Date(s.timestamp).toLocaleString()}</td>
-                  </tr>
-                ))}
+                {recentSignals.map((s) => {
+                  const riskAmountUsd = accountBalance * (riskPercent / 100);
+                  const lots = calculateLotSize(s.pair, s.entry_price, s.stop_price, riskAmountUsd);
+                  const rewardUsd = riskAmountUsd * (Math.abs(s.target_price - s.entry_price) / Math.abs(s.entry_price - s.stop_price));
+                  return (
+                    <tr key={s._id ?? `${s.pair}-${s.timestamp}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                      <td className="px-4 py-2">{s.pair} · {s.interval}</td>
+                      <td className={`px-4 py-2 font-medium ${s.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                        {s.direction}
+                      </td>
+                      <td className="px-4 py-2">{s.entry_price.toFixed(5)}</td>
+                      <td className="px-4 py-2">{s.target_price.toFixed(5)}</td>
+                      <td className="px-4 py-2">{s.stop_price.toFixed(5)}</td>
+                      <td className="px-4 py-2 font-mono">{lots.toFixed(2)}</td>
+                      <td className="px-4 py-2 text-xs">
+                        <span className="text-rose-600 dark:text-rose-400">-${riskAmountUsd.toFixed(0)}</span>
+                        {" / "}
+                        <span className="text-emerald-600 dark:text-emerald-400">+${rewardUsd.toFixed(0)}</span>
+                      </td>
+                      <td className="px-4 py-2">{s.status}</td>
+                      <td className="px-4 py-2 text-xs text-zinc-500">{new Date(s.timestamp).toLocaleString()}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
