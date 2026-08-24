@@ -4,6 +4,39 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-24 (cont.)
+
+**RL follow-ups, same day: widened to all intervals, added position sizing, dropped the
+Deriv integration entirely.**
+
+- User confirmed no Deriv access in their region at all -- the RL paper-trade endpoint
+  (`POST /rl/paper-trade/{interval}`) could never actually execute a trade, so it was
+  removed outright (endpoint, frontend button, `paperTradeRL` api wrapper), not left as a
+  known-broken feature. The original, pre-existing Paper Trading page/`paper_trading.py`
+  system is untouched -- this was scoped to RL's own integration only, confirmed explicitly
+  with the user before deleting anything.
+- Added a lot-size calculator to the RL page instead (same formula as
+  `trading-signals/page.tsx`) -- since execution is manual on whatever broker is actually
+  available, every RL signal now carries account-balance/risk-%-driven lot size and $
+  risk/reward alongside entry/target/stop.
+- Widened RL from 1h-only to all 5 intervals -- `/rl/train`/`/rl/signal` were already
+  interval-general (only the cron was 1h-gated), so this was mostly a cron change: training
+  stays gated to once daily across every interval (heavy -- many episodes over full candle
+  history), generate+score follow each interval's own natural cadence, same split already
+  used for ingest/generate/consensus. One independent policy per pair *per interval* now,
+  not just per pair. **Unverified risk, flagged not fixed**: 5min/15min candle history is
+  much larger than 1h's, so those `/rl/train` calls could take meaningfully longer per call
+  (possibly tens of seconds) -- worth confirming this doesn't hit a request timeout once
+  live, not assumed safe.
+- Fixed a real gap: a pending RL signal previously only resolved via `/rl/score`'s normal
+  walk-forward, which can take up to ~20 hours (default `max_lookforward`) before the signal
+  is stale. Since RL signals are meant to be traded manually and soon, generating a new
+  signal that disagrees with whatever's still pending for that pair/interval now
+  immediately marks the old one `expired` (updated in place, never deleted -- full history
+  stays visible) instead of leaving it to resolve on its own hours later.
+- Pushed as `f0fe5e1` (plus `7c2e7b3` for lot sizing and `b079367` for the stale-expiry fix,
+  both same day). **Not yet deployed/verified.**
+
 ## 2026-08-24
 
 **RL v1: a linear Q-learning agent that trades the 7 existing strategies itself, rather
