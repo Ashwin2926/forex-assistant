@@ -4,6 +4,62 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-24
+
+**RL v1: a linear Q-learning agent that trades the 7 existing strategies itself, rather
+than just grading a signal someone else generated.** Third independent signal source
+(`RLSignal`, mirrors `ConsensusSignal`'s shape), sitting alongside the rule engine and
+consensus — additive, not a replacement for either.
+
+- Also this session, before RL: lowered consensus's `REQUIRED_WEIGHT_FRACTION` 0.8 -> 0.6
+  (4-of-5 -> 3-of-5) after confirming it fired too rarely to be useful; a follow-up "run all
+  backtests" across all pairs/intervals showed the looser threshold mostly produced small,
+  consistent **negative** expectancy at real sample sizes (44-67 test signals) — a genuine
+  finding, not noise, and a real caveat on the current threshold. Also added `smart_money`
+  as a 7th consensus strategy (a mechanized, narrow liquidity-sweep approximation of ICT/
+  Smart Money Concepts — wick-dominant rejection at a swing level, target the opposite
+  swing level, stop just beyond the sweep's own extreme) and fixed a real bug where
+  `/ml/predict` was returning a fabricated `ml_hit_probability` for HOLD predictions (HOLD
+  never appears in the training set at all — there's no trade to hit or miss).
+- **State**: not raw indicators — the same 7 strategies' current votes (+1/-1/0 per
+  strategy), plus `atr_pct`. This is the literal mechanization of "use the existing
+  strategies to generate signals": the agent learns how to weight/combine them, an adaptive
+  version of what consensus's fixed threshold already does by hand. Computed once per bar
+  before training starts (strategy outputs don't depend on the policy), not recomputed on
+  every one of `episodes` passes.
+- **Action space is BUY/SELL/HOLD only** — no position sizing in v1. **Risk:reward is
+  enforced structurally**: every trade uses a fixed 1.5:1 target:stop ATR ratio
+  (`RL_TARGET_ATR_MULT`/`RL_STOP_ATR_MULT` in `rl_engine.py`), deliberately not sourced from
+  `RuleConfig`/`SWING_PAIR_OVERRIDES` (some of those, e.g. swing's global 0.5/1.25 default,
+  actually risk more than they target) — the user's "never risk more than the gain"
+  requirement is guaranteed by construction, not left for reward-driven discovery to
+  (maybe) find eventually.
+- **One independent policy per pair** (not shared/pooled) — matches "each strategy runs on
+  its own" confirmed earlier for the consensus strategies' independence. Scoped to the 1h
+  interval only for v1.
+- Training's test-slice evaluation is a real `BacktestRun` (`profile="rl"`), not a new
+  result shape — directly comparable to every other approach via the existing
+  `GET /backtest/runs?pair=X&profile=rl`.
+- Cron: training (many epsilon-greedy episodes over full candle history — genuinely heavier
+  than the ML classifier's sub-second refit) is gated to once daily; signal generation +
+  live scoring run hourly (cheap — a handful of strategy evaluations on the latest candle).
+  **Paper-trade execution deliberately stays manual/on-demand, not cron-wired** — same
+  "human stays in the loop for anything execution-adjacent" pattern the existing Paper
+  Trading page already follows.
+- **Known, deliberately deferred dependency**: `POST /rl/paper-trade/{interval}` reuses
+  `execute_paper_trade` unchanged, so it inherits the same broken Deriv auth (invalid
+  token / wrong auth flow in `deriv_client.py`) that paused paper trading earlier in this
+  project. Confirmed with the user this plan does NOT fix that — train/signal/score have
+  zero Deriv dependency and should be validated first; the Deriv auth fix is a separate,
+  later task.
+- New frontend `app/rl/page.tsx`: train (pair/episodes/train_frac -> evaluation card),
+  generate signal (q_values + entry/target/stop), paper trade (explicitly labeled with the
+  Deriv-dependency caveat), recent signals, training history. Nav link added.
+- Pushed as `7339936` (RL) and several commits before it (threshold/smart_money/ML-HOLD-fix).
+  **Not yet deployed/verified** — needs a FastAPI Cloud CLI deploy and a Vercel deploy, then
+  `POST /rl/train/1h?pair=EUR%2FUSD` + `POST /rl/signal/1h?pair=EUR%2FUSD` curl checks and a
+  `workflow_dispatch` to confirm the new cron steps go green.
+
 ## 2026-08-22
 
 **ML v1: supervised hit/miss classifier, not reinforcement learning — deliberately
