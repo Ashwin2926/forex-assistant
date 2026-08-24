@@ -15,19 +15,24 @@ STRATEGY_WEIGHTS: dict[str, float] = {fn.__name__.removeprefix("call_"): 1.0 for
 # forex volume (their own docs: "available not for all instrument types" -- spot FX has no
 # centralized tape to report it from, so no plan tier fixes this), so every call it makes is
 # HOLD, permanently. Weighting it 0 means it can't dilute the other strategies' threshold by
-# sitting in the denominator doing nothing -- the remaining 5 land back at exactly the
-# original 4-of-5 bar (0.8 * 5.0 = 4.0) instead of an unreachable 5-of-6. If a real volume
-# source (OANDA/MT5 tick volume, see PROGRESS.md) ever replaces Twelve Data for ingestion,
-# raise this back to 1.0 -- the strategy itself doesn't need to change, only this number.
+# sitting in the denominator doing nothing -- the remaining 5 land at whatever bar
+# REQUIRED_WEIGHT_FRACTION below sets (as if there were only 5 strategies) instead of an
+# unreachable 6-strategy bar. If a real volume source (OANDA/MT5 tick volume, see
+# PROGRESS.md) ever replaces Twelve Data for ingestion, raise this back to 1.0 -- the
+# strategy itself doesn't need to change, only this number.
 STRATEGY_WEIGHTS["volume_momentum"] = 0.0
 
 # Fraction of total vote weight that must agree on one direction. With volume_momentum at 0
-# and the other 5 equal at 1.0, total_weight is effectively 5.0, so this reproduces the
-# original "at most 1 of 5 dissents" bar exactly (0.8 * 5.0 = 4.0) -- but once a weight is
-# lowered for a strategy that's shown it doesn't belong in the majority (rather than zeroed
-# out for missing data), that strategy alone can no longer single-handedly block every
-# consensus the way a raw headcount would let it.
-REQUIRED_WEIGHT_FRACTION = 0.8
+# and the other 5 equal at 1.0, total_weight is effectively 5.0, so 0.6 means a real majority
+# (3-of-5) rather than the original near-unanimous 4-of-5 (0.8). Lowered from 0.8 on
+# 2026-08-24: requiring 4 of 5 philosophically different techniques (trend-following vs.
+# Bollinger mean-reversion in particular -- the 2026-08-21 backtest found Bollinger never
+# once agreed with the pack) made consensus fire so rarely it was closer to "wait for a
+# near-miracle" than "wait for a real majority." Re-backtest across all pairs/intervals
+# after any further change here -- more signals at a lower bar trades agreement-strength for
+# frequency, so this needs the same train/test validation as everything else, not just a
+# vibe check.
+REQUIRED_WEIGHT_FRACTION = 0.6
 
 # How close (in ATR multiples) agreeing strategies' entry/exit prices must be to count as
 # genuinely describing the same trade, not just the same direction -- two strategies both
