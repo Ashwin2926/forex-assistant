@@ -43,10 +43,14 @@ MIN_WARMUP_BARS = 30  # covers find_swing_levels/stochastic/ADX's own warmup nee
 
 def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig) -> list[list[float]]:
     """
-    One state vector per bar: each of the 7 strategies' current direction, encoded as a vote
-    (+1.0 BUY / -1.0 SELL / 0.0 HOLD), plus atr_pct for volatility context. This is the
-    literal mechanization of "use the existing strategies to generate signals" -- the agent
-    learns how to weight/combine them, an adaptive version of what consensus's fixed
+    One state vector per bar: each of the 7 strategies' current direction, encoded as
+    direction x strength (e.g. -0.8 for a strong SELL, -0.2 for a barely-there one, 0.0 for
+    HOLD) instead of a flat +-1, plus atr_pct for volatility context. `strength` (see
+    StrategyCall.strength / strategies.py) is each strategy's own normalized [0, 1] "how
+    strong was THIS bar's reading" -- a strategy that's barely triggered no longer looks
+    identical to one firing at full conviction. This is the literal mechanization of "use the
+    existing strategies to generate signals, weighting by how strong each one currently is" --
+    the agent learns how to weight/combine them, an adaptive version of what consensus's fixed
     REQUIRED_WEIGHT_FRACTION already does with a hand-picked threshold.
 
     Computed once for the whole df up front, not recomputed per training episode -- strategy
@@ -65,11 +69,15 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
         window_start = max(0, i + 1 - STATE_WINDOW_BARS)
         window = indicator_df.iloc[window_start: i + 1]
         calls = [fn(window, config) for fn in STRATEGIES]
-        vote_by_strategy = {c.strategy: c.direction for c in calls}
-        votes = [
-            1.0 if vote_by_strategy.get(name) == "BUY" else (-1.0 if vote_by_strategy.get(name) == "SELL" else 0.0)
-            for name in STRATEGY_NAMES
-        ]
+        call_by_strategy = {c.strategy: c for c in calls}
+        votes = []
+        for name in STRATEGY_NAMES:
+            call = call_by_strategy.get(name)
+            if call is None or call.direction == "HOLD":
+                votes.append(0.0)
+                continue
+            strength = call.strength if call.strength is not None else 1.0
+            votes.append(strength if call.direction == "BUY" else -strength)
         latest = indicator_df.iloc[i]
         atr_pct = float(latest["atr"] / latest["close"] * 100) if pd.notna(latest["atr"]) and latest["close"] else 0.0
         states.append(votes + [atr_pct])

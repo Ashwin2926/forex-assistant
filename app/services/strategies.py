@@ -32,6 +32,10 @@ SMC_WICK_BODY_MULT = 2.0
 SMC_STOP_BUFFER_ATR_MULT = 0.25
 
 
+def _clamp01(x: float) -> float:
+    return max(0.0, min(x, 1.0))
+
+
 def call_trend(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
     """Wraps the existing, already-backtested EMA/RSI/MACD engine unmodified -- this strategy
     IS today's live signal_engine.py, just reframed as one voice among five."""
@@ -40,7 +44,7 @@ def call_trend(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyC
     reasons, bullish_votes, bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(latest, prev, config)
     volatility_ok = next(r.passed for r in reasons if r.rule == "volatility_filter")
     session_ok = next((r.passed for r in reasons if r.rule == "session_filter"), True)
-    direction, _confidence = decide(
+    direction, confidence = decide(
         bullish_votes, bearish_votes, total_rules, volatility_ok and session_ok, rule_votes, rule_strengths
     )
 
@@ -56,6 +60,10 @@ def call_trend(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyC
         strategy="trend", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
         reasons=reasons,
+        # confidence is already a 0-100 blend of rule_strengths -- the same "how strong was
+        # this reading" score this strategy's own reasons are built from, just reused instead
+        # of re-deriving a separate strength number.
+        strength=_clamp01(confidence / 100) if direction in ("BUY", "SELL") else None,
     )
 
 
@@ -111,17 +119,23 @@ def call_bollinger(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> Strat
     else:
         reasons.append(SignalReason(rule="bollinger_touch", passed=False, detail="Skipped -- bands too narrow to trust a touch"))
 
+    strength = None
     if direction in ("BUY", "SELL"):
         target_price = float(latest["bb_middle"])
         stop_price = (
             entry_price - config.stop_atr_mult * atr_val if direction == "BUY"
             else entry_price + config.stop_atr_mult * atr_val
         )
+        # How far past the band, in ATR terms -- one full ATR beyond the band is already a
+        # sizeable extreme, so that's the "full strength" ceiling; a touch that's barely past
+        # the band reads as weak.
+        band_edge = latest["bb_lower"] if direction == "BUY" else latest["bb_upper"]
+        strength = _clamp01(abs(entry_price - band_edge) / atr_val) if atr_val > 0 else None
 
     return StrategyCall(
         strategy="bollinger", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons,
+        reasons=reasons, strength=strength,
     )
 
 
@@ -177,15 +191,19 @@ def call_support_resistance(df: pd.DataFrame, config: RuleConfig = RuleConfig())
     else:
         reasons.append(SignalReason(rule="swing_level_reaction", passed=False, detail="No breakout or bounce at a nearby level"))
 
+    strength = None
     if direction in ("BUY", "SELL"):
         target_price, stop_price = compute_atr_target_stop(
             entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
         )
+        # reasons[-1] is whichever of the 4 breakout/bounce branches fired -- its value is
+        # already the distance past the level; one full ATR past it is a decisive move.
+        strength = _clamp01(abs(reasons[-1].value) / atr_val) if atr_val > 0 else None
 
     return StrategyCall(
         strategy="support_resistance", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons,
+        reasons=reasons, strength=strength,
     )
 
 
@@ -210,15 +228,21 @@ def call_candlestick(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> Str
     )]
 
     target_price = stop_price = None
+    # Genuinely binary, unlike every other strategy here -- a pattern either matched this bar
+    # or it didn't, with no natural in-between reading to grade (detect_candlestick_pattern
+    # doesn't expose partial-match info). Full strength on a match rather than inventing a
+    # fake gradient; None means "no vote," same as everywhere else.
+    strength = None
     if direction in ("BUY", "SELL"):
         target_price, stop_price = compute_atr_target_stop(
             entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
         )
+        strength = 1.0
 
     return StrategyCall(
         strategy="candlestick", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons,
+        reasons=reasons, strength=strength,
     )
 
 
@@ -267,15 +291,20 @@ def call_stoch_adx(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> Strat
     else:
         reasons.append(SignalReason(rule="stochastic_cross", passed=False, detail="Skipped -- ADX below trend threshold"))
 
+    strength = None
     if direction in ("BUY", "SELL"):
         target_price, stop_price = compute_atr_target_stop(
             entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
         )
+        # ADX 50+ is already a very strong trend by common technical-analysis convention, so
+        # that's the "full strength" ceiling -- not the crossover itself, since ADX is what
+        # this strategy actually gates on (the crossover only fires direction, not conviction).
+        strength = _clamp01(adx_val / 50)
 
     return StrategyCall(
         strategy="stoch_adx", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons,
+        reasons=reasons, strength=strength,
     )
 
 
@@ -324,16 +353,25 @@ def call_volume_momentum(df: pd.DataFrame, config: RuleConfig = RuleConfig()) ->
 
     direction = "HOLD"
     target_price = stop_price = None
+    strength = None
     if volume_confirmed and momentum_strong:
         direction = "BUY" if roc > 0 else "SELL"
         target_price, stop_price = compute_atr_target_stop(
             entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
         )
+        # Averages two independently-normalized components -- volume ratio against 2x its own
+        # confirmation threshold, momentum against 2x its own ATR-relative threshold -- rather
+        # than either alone, since this strategy's whole thesis is that both need to agree
+        # (currently moot: volume_momentum is weighted 0 in consensus.STRATEGY_WEIGHTS since
+        # Twelve Data can't supply real forex volume, but this stays ready for if that changes).
+        volume_strength = _clamp01(volume_ratio / (VOLUME_CONFIRMATION_MULT * 2))
+        momentum_strength = _clamp01((roc_price_move / atr_val) / (MOMENTUM_ROC_ATR_MULT * 2)) if atr_val > 0 else 0.0
+        strength = (volume_strength + momentum_strength) / 2
 
     return StrategyCall(
         strategy="volume_momentum", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons,
+        reasons=reasons, strength=strength,
     )
 
 
@@ -405,10 +443,15 @@ def call_smart_money(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> Str
     else:
         reasons.append(SignalReason(rule="liquidity_sweep", passed=False, detail="No wick-dominant rejection at a recent swing level"))
 
+    # reasons[-1].value is the wick/body ratio when a sweep fired -- 3x the minimum threshold
+    # (SMC_WICK_BODY_MULT) is treated as a maximally decisive rejection, self-referential to
+    # this strategy's own trigger the same way stoch_adx's ceiling relates to its own gate.
+    strength = _clamp01(reasons[-1].value / (SMC_WICK_BODY_MULT * 3)) if direction in ("BUY", "SELL") else None
+
     return StrategyCall(
         strategy="smart_money", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons,
+        reasons=reasons, strength=strength,
     )
 
 

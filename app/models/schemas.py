@@ -102,6 +102,13 @@ class StrategyCall(BaseModel):
     target_price: Optional[float] = None  # None when direction == HOLD
     stop_price: Optional[float] = None
     reasons: list[SignalReason]
+    # How strong THIS bar's reading is for this strategy, normalized to roughly [0, 1] --
+    # 0/None when direction is HOLD (no conviction to grade). Each strategy defines its own
+    # normalization against its own natural scale (see strategies.py) since e.g. ADX's 0-100
+    # range and a wick/body ratio aren't comparable without one. Consumed by the RL agent
+    # (rl_engine.py) as vote strength instead of a flat +-1; consensus doesn't currently use
+    # this (its threshold is headcount/weight-based, not per-vote strength).
+    strength: Optional[float] = None
 
 
 class ConsensusSignal(BaseModel):
