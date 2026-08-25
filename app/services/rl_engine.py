@@ -84,16 +84,31 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
     return states
 
 
+ADAGRAD_EPSILON = 1e-8  # avoids division by zero on a feature's very first update
+
+
 class LinearQPolicy:
     """
     q(state, action) = dot(weights[action], state). One weight vector per action, same
     length/order as RL_FEATURE_NAMES -- as interpretable as the ML page's
     feature_coefficients table, and simple enough that pure numpy-free Python is plenty fast
     for an 8-feature state.
+
+    Updates use Adagrad (per-weight adaptive learning rate, accumulated sum of squared past
+    gradients) instead of one flat alpha for every feature -- the strategies here fire at very
+    different rates by design (trend votes on ~68% of bars, smart_money on ~4%, see
+    PROGRESS.md), so a flat learning rate lets frequently-firing strategies dominate the
+    learned weights mostly through sheer repetition, not necessarily through being more
+    predictive per occurrence. A feature that's 0 on every bar a strategy doesn't fire (which
+    is most bars, for the rare ones) contributes 0 to its own gradient on those steps, so its
+    Adagrad accumulator only grows on the bars it actually votes -- giving rare strategies a
+    larger effective step size per occurrence instead of quietly lagging behind on raw
+    exposure alone.
     """
 
     def __init__(self, feature_count: int):
         self.weights: dict[str, list[float]] = {a: [0.0] * feature_count for a in ACTIONS}
+        self.sum_sq_grad: dict[str, list[float]] = {a: [0.0] * feature_count for a in ACTIONS}
 
     def q_values(self, state: list[float]) -> dict[str, float]:
         return {a: sum(w * s for w, s in zip(self.weights[a], state)) for a in ACTIONS}
@@ -108,7 +123,13 @@ class LinearQPolicy:
         best_next_q = max(self.q_values(next_state).values()) if next_state is not None else 0.0
         current_q = sum(w * s for w, s in zip(self.weights[action], state))
         td_error = (reward + gamma * best_next_q) - current_q
-        self.weights[action] = [w + alpha * td_error * s for w, s in zip(self.weights[action], state)]
+
+        grads = [td_error * s for s in state]
+        self.sum_sq_grad[action] = [sq + g * g for sq, g in zip(self.sum_sq_grad[action], grads)]
+        self.weights[action] = [
+            w + (alpha / ((sq ** 0.5) + ADAGRAD_EPSILON)) * g
+            for w, sq, g in zip(self.weights[action], self.sum_sq_grad[action], grads)
+        ]
 
 
 def _take_action(
