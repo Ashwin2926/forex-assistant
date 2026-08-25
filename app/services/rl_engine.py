@@ -40,6 +40,22 @@ DEFAULT_EPISODES = 100
 
 MIN_WARMUP_BARS = 30  # covers find_swing_levels/stochastic/ADX's own warmup needs
 
+# Which RuleConfig profile each interval's strategy calls should use -- RL previously used
+# "swing" (EMA 50/200, no session filter) unconditionally for every interval, including
+# 5min/15min. A 200-period EMA on 5-minute candles spans ~16.7 hours (multiple sessions),
+# far too slow to say anything meaningful about a 5-minute chart -- this project already
+# solved exactly this mismatch for the regular signal engine (intraday: EMA 9/21 + session
+# filter, cross-pair backtest-validated, see signal_engine.PROFILE_DEFAULTS), RL just never
+# adopted it. Same interval grouping the cron already uses for the regular engine/consensus.
+# Doesn't touch RL_TARGET_ATR_MULT/RL_STOP_ATR_MULT -- those stay fixed regardless of profile,
+# this only changes which EMA/RSI/MACD periods and session gating the 7 strategies compute
+# their votes with.
+INTRADAY_INTERVALS = {"5min", "15min"}
+
+
+def rl_config_profile(interval: str) -> str:
+    return "intraday" if interval in INTRADAY_INTERVALS else "swing"
+
 
 def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig) -> list[list[float]]:
     """

@@ -28,7 +28,7 @@ from app.services.consensus import check_consensus
 from app.services.ml_features import extract_features
 from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.rl_engine import (
-    train_rl_policy, choose_action, compute_strategy_vote_states,
+    train_rl_policy, choose_action, compute_strategy_vote_states, rl_config_profile,
     RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT, MIN_WARMUP_BARS,
 )
 from app.services.deriv_client import deriv_session, DerivAuthError
@@ -817,12 +817,17 @@ async def train_rl(
     (a real BacktestRun, profile="rl") so it's directly comparable to every other approach via
     GET /backtest/runs?pair=X&profile=rl.
 
+    Strategy calls use the intraday RuleConfig (short EMAs + session filter) for 5min/15min
+    and swing for everything else (rl_config_profile) -- same interval grouping the regular
+    signal engine already uses, so a 5-minute chart isn't read with EMA periods tuned for
+    multi-day trends.
+
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
-    config = default_config_for("swing", pair)
+    config = default_config_for(rl_config_profile(interval), pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
     docs = await cursor.to_list(length=None)
     if not docs:
@@ -941,7 +946,7 @@ async def create_rl_signal(interval: str, pair: str):
         )
     policy = RLPolicy(**{k: v for k, v in policy_doc.items() if k != "_id"})
 
-    config = default_config_for("swing", pair)
+    config = default_config_for(rl_config_profile(interval), pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
     docs = await cursor.to_list(length=500)
     docs.reverse()
