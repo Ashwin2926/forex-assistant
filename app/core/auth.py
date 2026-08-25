@@ -55,7 +55,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         settings = get_settings()
         service_token = request.headers.get("x-service-token", "")
-        if settings.auth_secret_key2 and service_token == settings.auth_secret_key2:
+        valid_service_tokens = {t for t in (settings.auth_secret_key2, settings.auth_secret_key3) if t}
+        if service_token and service_token in valid_service_tokens:
             return await call_next(request)
 
         auth_header = request.headers.get("authorization", "")

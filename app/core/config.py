@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     # on FastAPI Cloud. Unset by default, matching auth_secret_key's fail-closed behavior.
     auth_secret_key2: str = ""
 
+    # A second, independent X-Service-Token value -- deliberately separate from
+    # auth_secret_key2 so a manual/ad-hoc caller (e.g. Claude querying the API directly for
+    # analysis) can be given its own credential without touching the cron's already-working
+    # one. Either value alone is sufficient to authenticate as a service caller.
+    auth_secret_key3: str = ""
+
     @property
     def pairs_list(self) -> list[str]:
         return [p.strip() for p in self.forex_pairs.split(",")]
