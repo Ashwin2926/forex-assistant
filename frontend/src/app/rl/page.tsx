@@ -21,7 +21,7 @@ interface GenerateAllCell {
 export default function RLPage() {
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
-  const [episodes, setEpisodes] = useState(100);
+  const [episodes, setEpisodes] = useState(200);
   const [trainFrac, setTrainFrac] = useState(0.7);
   const [startingBalance, setStartingBalance] = useState(50);
   const [training, setTraining] = useState(false);

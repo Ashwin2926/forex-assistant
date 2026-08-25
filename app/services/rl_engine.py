@@ -55,7 +55,22 @@ LEARNING_RATE = 0.1
 DISCOUNT_GAMMA = 0.9
 EPSILON_START = 1.0
 EPSILON_MIN = 0.05
-DEFAULT_EPISODES = 100
+# Raised from 100 (the pre-sizing value, when ACTIONS had 3 entries) after the first sizing-
+# aware EUR/USD 5min/15min policies came back showing total_return_pct of -64% to -79% on a
+# $50 start despite a near-flat expectancy_pct (-0.01% to -0.02%) -- the gap between those two
+# numbers is exactly what you'd expect from geometric compounding under a weak/negative edge
+# (variance drag: even a strategy with ~breakeven arithmetic returns produces negative
+# geometric growth once you're actually sizing and compounding real bets, and 5min/15min
+# already run well below the ~40% hit rate this project's fixed 1.5:1 target:stop needs to
+# break even -- see PROGRESS.md). Going from 3 actions (HOLD/BUY/SELL) to 5 (adding the
+# SMALL/LARGE split) roughly halves how many training samples each BUY/SELL action sees per
+# episode at a fixed episode count, so on top of the weak-edge problem itself, the agent
+# likely hadn't converged enough yet to learn "avoid this, or at least don't size up into it"
+# -- LARGE in particular is the newest, least-visited action and the most expensive to get
+# wrong. Doubling episodes doesn't fix a genuinely weak edge, but it does give the agent a
+# real chance to learn to stay away from it (Q(HOLD)=0 should dominate once the negative
+# expected log-reward of trading is well-estimated) instead of still exploring into it.
+DEFAULT_EPISODES = 200
 
 MIN_WARMUP_BARS = 30  # covers find_swing_levels/stochastic/ADX's own warmup needs
 

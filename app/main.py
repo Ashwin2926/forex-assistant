@@ -33,7 +33,7 @@ from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.rl_engine import (
     train_rl_policy, choose_action, compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
-    RISK_FRACTION_BY_TIER,
+    RISK_FRACTION_BY_TIER, DEFAULT_EPISODES,
 )
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
@@ -855,7 +855,7 @@ async def _run_rl_training(
 
 @app.post("/rl/train/{interval}")
 async def train_rl(
-    interval: str, pair: str, episodes: int = 100, train_frac: float = 0.7, max_lookforward: int = 20,
+    interval: str, pair: str, episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
     starting_balance: float = DEFAULT_STARTING_BALANCE,
 ):
     """
@@ -924,7 +924,7 @@ async def run_train_all_job(job_id: str, episodes: int, train_frac: float, start
 @app.post("/rl/train-all")
 async def train_rl_all(
     background_tasks: BackgroundTasks,
-    episodes: int = 100, train_frac: float = 0.7, starting_balance: float = DEFAULT_STARTING_BALANCE,
+    episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, starting_balance: float = DEFAULT_STARTING_BALANCE,
 ):
     """
     Starts training every pair x interval combination (the same set the daily cron trains) as
