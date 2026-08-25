@@ -180,6 +180,38 @@ export interface RLPolicy {
   } | null;
 }
 
+export interface RLTrainAllCell {
+  pair: string;
+  interval: string;
+  ok: boolean;
+  error?: string | null;
+  policy_id?: string | null;
+  hit_rate_pct?: number | null;
+  expectancy_pct?: number | null;
+  directional_signals?: number | null;
+  hold_signals?: number | null;
+  starting_balance?: number | null;
+  ending_balance?: number | null;
+  total_return_pct?: number | null;
+}
+
+// A "train every pair x interval" batch run, tracked server-side (see app/main.py's
+// run_train_all_job) so the ~15-minute-total run survives the triggering browser tab being
+// closed, backgrounded, or losing connectivity -- the page just starts a job and polls
+// GET /rl/train-all/{job_id} instead of holding 20 sequential fetches open itself.
+export interface RLTrainAllJob {
+  job_id: string;
+  status: "running" | "done";
+  created_at: string;
+  finished_at?: string | null;
+  episodes: number;
+  train_frac: number;
+  starting_balance: number;
+  total: number;
+  completed: number;
+  results: RLTrainAllCell[];
+}
+
 export interface RLSignal {
   _id?: string;
   pair: string;

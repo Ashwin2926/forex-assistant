@@ -1,17 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLPolicy, type RLSignal, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
-interface TrainAllCell {
-  pair: string;
-  interval: string;
-  evaluation: BacktestRun | null;
-  policy: RLPolicy | null;
-  error?: string;
-}
+// How often to poll GET /rl/train-all/{job_id} while a batch run is in progress -- the job
+// itself takes ~15 minutes total (20 combos x ~40-50s each), so this just needs to be
+// frequent enough to feel live, not frequent enough to matter for load.
+const TRAIN_ALL_POLL_MS = 4000;
 
 interface GenerateAllCell {
   pair: string;
@@ -39,10 +36,9 @@ export default function RLPage() {
   const [recentSignals, setRecentSignals] = useState<RLSignal[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
 
-  const [trainAllResults, setTrainAllResults] = useState<TrainAllCell[]>([]);
-  const [trainAllProgress, setTrainAllProgress] = useState(0);
-  const [trainAllRunning, setTrainAllRunning] = useState(false);
-  const [expandedWeights, setExpandedWeights] = useState<string | null>(null);
+  const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
+  const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
+  const trainAllPollGuard = useRef<string | null>(null); // job_id currently being polled, to avoid a stray double-poll
 
   const [expandedHistoryWeights, setExpandedHistoryWeights] = useState<string | null>(null);
   const [expandedHistoryTrades, setExpandedHistoryTrades] = useState<string | null>(null);
@@ -76,9 +72,39 @@ export default function RLPage() {
     }
   }
 
+  // Trains sequentially server-side now (see app/main.py's run_train_all_job) -- this just
+  // polls GET /rl/train-all/{job_id} until status flips to "done". Recurses via setTimeout
+  // rather than setInterval so a slow poll response can't overlap the next one.
+  async function pollTrainAllJob(jobId: string) {
+    trainAllPollGuard.current = jobId;
+    let job: RLTrainAllJob;
+    try {
+      job = await api.getTrainAllRLJob(jobId);
+    } catch {
+      return; // transient network hiccup -- next mount or manual "Train all" click recovers
+    }
+    if (trainAllPollGuard.current !== jobId) return; // superseded by a newer job
+    setTrainAllJob(job);
+    if (job.status === "running") {
+      setTimeout(() => pollTrainAllJob(jobId), TRAIN_ALL_POLL_MS);
+    } else {
+      await loadPolicies();
+    }
+  }
+
   useEffect(() => {
     loadPolicies();
     loadRecentSignals();
+    // Rehydrate an in-progress "Train all" job on load/reload -- the job itself lives
+    // server-side now, so a reload should resume watching it, not lose track of it.
+    api.getLatestTrainAllRLJob().then((job) => {
+      if (job && job.status === "running") {
+        setTrainAllJob(job);
+        pollTrainAllJob(job.job_id);
+      } else if (job) {
+        setTrainAllJob(job);
+      }
+    }).catch(() => {});
   }, []);
 
   async function handleTrain() {
@@ -96,30 +122,17 @@ export default function RLPage() {
   }
 
   async function handleTrainAll() {
-    setTrainAllRunning(true);
-    setTrainAllResults([]);
-    setTrainAllProgress(0);
-    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
-    const results: TrainAllCell[] = [];
-    // Sequential, not Promise.all -- same reasoning as the consensus/ML "run all" grids:
-    // each call is a real training run (many episodes over that interval's full candle
-    // history), and 20 of those hitting the same backend instance at once would be far
-    // heavier than 20 concurrent live checks. Each cell catches its own error and the loop
-    // keeps going, so one pair/interval timing out (5min/15min are the likeliest candidates
-    // -- see PROGRESS.md) doesn't block the other 19.
-    for (const { pair: p, interval: i } of combos) {
-      try {
-        const result = await api.trainRLPolicy(p, i, { episodes, train_frac: trainFrac, starting_balance: startingBalance });
-        results.push({ pair: p, interval: i, evaluation: result.evaluation, policy: result.policy });
-      } catch (e) {
-        results.push({ pair: p, interval: i, evaluation: null, policy: null, error: e instanceof ApiError ? e.message : "Failed" });
-      }
-      setTrainAllProgress(results.length);
-      setTrainAllResults([...results]);
+    setTrainAllStartError(null);
+    try {
+      const job = await api.startTrainAllRL({ episodes, train_frac: trainFrac, starting_balance: startingBalance });
+      setTrainAllJob(job);
+      pollTrainAllJob(job.job_id);
+    } catch (e) {
+      setTrainAllStartError(e instanceof ApiError ? e.message : "Couldn't start training.");
     }
-    setTrainAllRunning(false);
-    await loadPolicies();
   }
+
+  const trainAllRunning = trainAllJob?.status === "running";
 
   async function handleGenerateAll() {
     setGenerateAllRunning(true);
@@ -252,13 +265,20 @@ export default function RLPage() {
           <div className="flex items-center justify-between">
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Or train all 4 pairs &times; 5 intervals at once (using the episodes/train
-              fraction above) — same thing the cron does once daily, run on demand.
+              fraction above) — same thing the cron does once daily, run on demand. Runs
+              server-side (~15 min total) once started, so it&apos;s safe to close this tab —
+              reopening the page picks the same run back up.
             </p>
             <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">
-              {trainAllRunning ? `Training ${trainAllProgress}/20…` : "Train all"}
+              {trainAllRunning ? `Training ${trainAllJob?.completed ?? 0}/${trainAllJob?.total ?? 20}…` : "Train all"}
             </button>
           </div>
-          {trainAllResults.length > 0 && (
+          {trainAllStartError && (
+            <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
+              {trainAllStartError}
+            </p>
+          )}
+          {trainAllJob && trainAllJob.results.length > 0 && (
             <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
               <table className="w-full text-left text-xs">
                 <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
@@ -270,55 +290,38 @@ export default function RLPage() {
                     <th className="px-3 py-1.5">Trades</th>
                     <th className="px-3 py-1.5">Holds</th>
                     <th className="px-3 py-1.5">Ending balance</th>
-                    <th className="px-3 py-1.5"></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {trainAllResults.map((cell) => {
+                  {trainAllJob.results.map((cell) => {
                     const key = `${cell.pair}-${cell.interval}`;
-                    const run = cell.evaluation;
-                    const isExpanded = expandedWeights === key;
                     return (
-                      <>
-                        <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
-                          <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
-                          <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
-                          {cell.error ? (
-                            <td className="px-3 py-1.5 text-zinc-400" colSpan={6}>{cell.error}</td>
-                          ) : (
-                            <>
-                              <td className="px-3 py-1.5">{run?.hit_rate_pct != null ? `${run.hit_rate_pct}%` : "—"}</td>
-                              <td className={`px-3 py-1.5 ${run?.expectancy_pct != null && run.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                                {run?.expectancy_pct != null ? `${run.expectancy_pct >= 0 ? "+" : ""}${run.expectancy_pct}%` : "—"}
-                              </td>
-                              <td className="px-3 py-1.5">{run?.directional_signals ?? "—"}</td>
-                              <td className="px-3 py-1.5">{run?.hold_signals ?? "—"}</td>
-                              <td className={`px-3 py-1.5 font-mono ${run?.total_return_pct != null && run.total_return_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                                {run?.ending_balance != null ? `$${run.ending_balance}` : "—"}
-                              </td>
-                              <td className="px-3 py-1.5">
-                                <button
-                                  onClick={() => setExpandedWeights(isExpanded ? null : key)}
-                                  className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
-                                >
-                                  {isExpanded ? "Hide" : "Show"} weights
-                                </button>
-                              </td>
-                            </>
-                          )}
-                        </tr>
-                        {isExpanded && cell.policy && (
-                          <tr key={`${key}-weights`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
-                            <td colSpan={8} className="px-3 py-2">
-                              <WeightsTable policy={cell.policy} />
+                      <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
+                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
+                        {!cell.ok ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>{cell.error}</td>
+                        ) : (
+                          <>
+                            <td className="px-3 py-1.5">{cell.hit_rate_pct != null ? `${cell.hit_rate_pct}%` : "—"}</td>
+                            <td className={`px-3 py-1.5 ${cell.expectancy_pct != null && cell.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {cell.expectancy_pct != null ? `${cell.expectancy_pct >= 0 ? "+" : ""}${cell.expectancy_pct}%` : "—"}
                             </td>
-                          </tr>
+                            <td className="px-3 py-1.5">{cell.directional_signals ?? "—"}</td>
+                            <td className="px-3 py-1.5">{cell.hold_signals ?? "—"}</td>
+                            <td className={`px-3 py-1.5 font-mono ${cell.total_return_pct != null && cell.total_return_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {cell.ending_balance != null ? `$${cell.ending_balance}` : "—"}
+                            </td>
+                          </>
                         )}
-                      </>
+                      </tr>
                     );
                   })}
                 </tbody>
               </table>
+              <p className="border-t border-zinc-100 px-3 py-2 text-xs text-zinc-400 dark:border-zinc-800">
+                Weights for each freshly-trained policy are in Training history below.
+              </p>
             </div>
           )}
         </div>

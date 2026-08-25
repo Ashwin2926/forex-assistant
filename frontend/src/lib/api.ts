@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLPolicy, RLSignal, RuleConfig, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -208,6 +208,23 @@ export const api = {
       `/rl/train/${interval}?${qs.toString()}`,
       { method: "POST" },
     );
+  },
+
+  startTrainAllRL(opts: { episodes?: number; train_frac?: number; starting_balance?: number } = {}) {
+    const qs = new URLSearchParams();
+    if (opts.episodes !== undefined) qs.set("episodes", String(opts.episodes));
+    if (opts.train_frac !== undefined) qs.set("train_frac", String(opts.train_frac));
+    if (opts.starting_balance !== undefined) qs.set("starting_balance", String(opts.starting_balance));
+    const query = qs.toString();
+    return request<RLTrainAllJob>(`/rl/train-all${query ? `?${query}` : ""}`, { method: "POST" });
+  },
+
+  getTrainAllRLJob(jobId: string) {
+    return request<RLTrainAllJob>(`/rl/train-all/${jobId}`);
+  },
+
+  getLatestTrainAllRLJob() {
+    return request<RLTrainAllJob | null>(`/rl/train-all-latest`);
   },
 
   listRLPolicies(params: { pair?: string; interval?: string; limit?: number } = {}) {

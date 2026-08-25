@@ -299,6 +299,46 @@ class RLSignal(BaseModel):
     source: Literal["live", "backtest"] = "live"
 
 
+class RLTrainAllCell(BaseModel):
+    """One pair/interval's outcome within an RLTrainAllJob -- mirrors what the single
+    POST /rl/train endpoint returns, flattened for the progress table."""
+    pair: str
+    interval: str
+    ok: bool
+    error: Optional[str] = None
+    policy_id: Optional[str] = None
+    hit_rate_pct: Optional[float] = None
+    expectancy_pct: Optional[float] = None
+    directional_signals: Optional[int] = None
+    hold_signals: Optional[int] = None
+    starting_balance: Optional[float] = None
+    ending_balance: Optional[float] = None
+    total_return_pct: Optional[float] = None
+
+
+class RLTrainAllJob(BaseModel):
+    """
+    Tracks a "train every pair x interval" batch run server-side (app/main.py's
+    run_train_all_job background task), so the ~15-minute-total run survives the
+    triggering browser tab being closed, backgrounded, or losing connectivity -- the
+    frontend just starts a job and polls GET /rl/train-all/{job_id} instead of holding 20
+    sequential fetches open itself. Persisted in Mongo rather than kept in-process memory
+    because FastAPI Cloud can recycle the instance between requests; an in-memory dict
+    would silently lose progress the same way the old in-process APScheduler did (see
+    .github/workflows/keep-fresh.yml's history note).
+    """
+    job_id: str
+    status: Literal["running", "done"]
+    created_at: datetime
+    finished_at: Optional[datetime] = None
+    episodes: int
+    train_frac: float
+    starting_balance: float
+    total: int
+    completed: int = 0
+    results: list[RLTrainAllCell] = []
+
+
 class PaperTrade(BaseModel):
     """
     A live signal executed as a Deriv Multipliers contract on a virtual (demo) account.

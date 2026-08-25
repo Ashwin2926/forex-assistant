@@ -1,7 +1,9 @@
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from datetime import datetime
+import uuid
 import pandas as pd
 
 from app.core.config import get_settings
@@ -17,8 +19,9 @@ from app.core.database import (
     ml_runs_collection,
     rl_policies_collection,
     rl_signals_collection,
+    rl_train_jobs_collection,
 )
-from app.models.schemas import LoginRequest, RuleConfig, RLPolicy, RLSignal
+from app.models.schemas import LoginRequest, RuleConfig, RLPolicy, RLSignal, RLTrainAllJob, RLTrainAllCell
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, spread_cost_pct
@@ -805,6 +808,51 @@ def _rl_state_from_candles(docs: list[dict], config: RuleConfig) -> tuple[list[f
     return states[-1], df
 
 
+RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
+
+
+async def _run_rl_training(
+    pair: str, interval: str, episodes: int, train_frac: float, max_lookforward: int, starting_balance: float,
+):
+    """
+    Shared by POST /rl/train and the /rl/train-all background job below -- fetches candle
+    history, runs training, and persists the policy/evaluation/trade log. Raises ValueError
+    for the caller to turn into whatever error shape fits its own endpoint (a 400 for the
+    single endpoint, a per-cell error string for the batch job).
+
+    train_rl_policy itself is a blocking, CPU-bound pandas replay (~40-50s per pair/interval
+    against the full backfilled history) -- run via run_in_threadpool so it doesn't tie up the
+    event loop, which matters a lot more here than it did for a single call, since the batch
+    job below calls this 20 times in a row and other requests (status polling, live signal
+    generation, the cron) still need to get through during those ~15 minutes.
+    """
+    if not 0 < train_frac < 1:
+        raise ValueError("train_frac must be between 0 and 1 (exclusive).")
+    if starting_balance <= 0:
+        raise ValueError("starting_balance must be positive.")
+
+    config = default_config_for(rl_config_profile(interval), pair)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
+    docs = await cursor.to_list(length=None)
+    if not docs:
+        raise ValueError(f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.")
+
+    df = pd.DataFrame(docs)
+    policy, eval_run, trade_signals = await run_in_threadpool(
+        train_rl_policy, df, pair, interval, config, episodes=episodes, train_frac=train_frac,
+        max_lookforward=max_lookforward, starting_balance=starting_balance,
+    )
+
+    # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
+    # own persistence) tagged with eval_run.run_id -- GET /backtest/runs/{run_id}/signals
+    # already answers "which trades passed and which failed" for free, no new endpoint.
+    if trade_signals:
+        await backtest_signals_collection.insert_many([s.model_dump() for s in trade_signals])
+    await backtest_runs_collection.insert_one(eval_run.model_dump())
+    await rl_policies_collection.insert_one(policy.model_dump())
+    return policy, eval_run
+
+
 @app.post("/rl/train/{interval}")
 async def train_rl(
     interval: str, pair: str, episodes: int = 100, train_frac: float = 0.7, max_lookforward: int = 20,
@@ -828,38 +876,97 @@ async def train_rl(
     multi-day trends.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
+
+    For training every pair x interval at once, see POST /rl/train-all instead -- doing that
+    here by simply looping client-side is what used to make the frontend's "Train all" a
+    ~15-minute sequence of fetches the browser tab had to hold open the whole time.
+    """
+    try:
+        policy, eval_run = await _run_rl_training(pair, interval, episodes, train_frac, max_lookforward, starting_balance)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"policy": policy, "evaluation": eval_run}
+
+
+async def run_train_all_job(job_id: str, episodes: int, train_frac: float, starting_balance: float):
+    """
+    The actual batch loop, scheduled via BackgroundTasks from POST /rl/train-all so it keeps
+    running after that request has already returned -- trains every pair x interval
+    combination sequentially (same set .github/workflows/keep-fresh.yml's cron trains once
+    daily), writing progress to rl_train_jobs_collection after each combo so GET
+    /rl/train-all/{job_id} always reflects real progress, not just "still running somewhere."
+    """
+    for pair in settings.pairs_list:
+        for interval in RL_INTERVALS:
+            try:
+                policy, eval_run = await _run_rl_training(
+                    pair, interval, episodes, train_frac, max_lookforward=20, starting_balance=starting_balance,
+                )
+                cell = RLTrainAllCell(
+                    pair=pair, interval=interval, ok=True, policy_id=policy.policy_id,
+                    hit_rate_pct=eval_run.hit_rate_pct, expectancy_pct=eval_run.expectancy_pct,
+                    directional_signals=eval_run.directional_signals, hold_signals=eval_run.hold_signals,
+                    starting_balance=eval_run.starting_balance, ending_balance=eval_run.ending_balance,
+                    total_return_pct=eval_run.total_return_pct,
+                )
+            except Exception as e:
+                cell = RLTrainAllCell(pair=pair, interval=interval, ok=False, error=str(e))
+            await rl_train_jobs_collection.update_one(
+                {"job_id": job_id},
+                {"$push": {"results": cell.model_dump()}, "$inc": {"completed": 1}},
+            )
+    await rl_train_jobs_collection.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "done", "finished_at": datetime.utcnow()}},
+    )
+
+
+@app.post("/rl/train-all")
+async def train_rl_all(
+    background_tasks: BackgroundTasks,
+    episodes: int = 100, train_frac: float = 0.7, starting_balance: float = DEFAULT_STARTING_BALANCE,
+):
+    """
+    Starts training every pair x interval combination (the same set the daily cron trains) as
+    a server-side background job and returns immediately with a job_id -- poll GET
+    /rl/train-all/{job_id} for progress. Runs server-side specifically so the ~15-minute total
+    duration (20 combos, ~40-50s each) doesn't depend on the triggering browser tab staying
+    open, foregrounded, or connected the whole time; the previous frontend-driven version held
+    20 sequential fetches open in the tab and a lost connection partway through (mobile screen
+    lock, backgrounding, a network switch) would abandon the run silently.
     """
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
     if starting_balance <= 0:
         raise HTTPException(status_code=400, detail="starting_balance must be positive.")
 
-    config = default_config_for(rl_config_profile(interval), pair)
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
-    docs = await cursor.to_list(length=None)
-    if not docs:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.",
-        )
+    job_id = uuid.uuid4().hex[:12]
+    job = RLTrainAllJob(
+        job_id=job_id, status="running", created_at=datetime.utcnow(),
+        episodes=episodes, train_frac=train_frac, starting_balance=starting_balance,
+        total=len(settings.pairs_list) * len(RL_INTERVALS),
+    )
+    await rl_train_jobs_collection.insert_one(job.model_dump())
+    background_tasks.add_task(run_train_all_job, job_id, episodes, train_frac, starting_balance)
+    return job
 
-    df = pd.DataFrame(docs)
-    try:
-        policy, eval_run, trade_signals = train_rl_policy(
-            df, pair, interval, config, episodes=episodes, train_frac=train_frac,
-            max_lookforward=max_lookforward, starting_balance=starting_balance,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-    # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
-    # own persistence) tagged with eval_run.run_id -- GET /backtest/runs/{run_id}/signals
-    # already answers "which trades passed and which failed" for free, no new endpoint.
-    if trade_signals:
-        await backtest_signals_collection.insert_many([s.model_dump() for s in trade_signals])
-    await backtest_runs_collection.insert_one(eval_run.model_dump())
-    await rl_policies_collection.insert_one(policy.model_dump())
-    return {"policy": policy, "evaluation": eval_run}
+@app.get("/rl/train-all/{job_id}")
+async def get_train_all_job(job_id: str):
+    doc = await rl_train_jobs_collection.find_one({"job_id": job_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No train-all job {job_id}.")
+    return RLTrainAllJob(**{k: v for k, v in doc.items() if k != "_id"})
+
+
+@app.get("/rl/train-all-latest")
+async def get_latest_train_all_job():
+    """Lets the frontend rehydrate an in-progress job after a reload or reopen -- otherwise
+    there's no way to tell "nothing running" apart from "was running, the tab just reloaded"."""
+    doc = await rl_train_jobs_collection.find_one(sort=[("created_at", -1)])
+    if not doc:
+        return None
+    return RLTrainAllJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 
 @app.get("/rl/policies")
