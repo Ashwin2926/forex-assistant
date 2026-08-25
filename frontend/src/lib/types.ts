@@ -165,8 +165,10 @@ export interface RLPolicy {
   feature_names: string[];
   eval_run_id: string;
   // The balance this policy was trained against -- predict-time needs this same reference
-  // point to compute the live balance_log_ratio feature correctly.
-  starting_balance: number;
+  // point to compute the live balance_log_ratio feature correctly. Absent on policies trained
+  // before position sizing existed (GET /rl/policies returns raw Mongo docs, not validated
+  // through the RLPolicy Pydantic model, so an old doc really can be missing this key).
+  starting_balance?: number | null;
   // Only present from GET /rl/policies (enriched server-side from the linked BacktestRun) --
   // absent on the RLPolicy returned directly by POST /rl/train.
   evaluation?: {
@@ -223,11 +225,13 @@ export interface RLSignal {
   stop_price: number;
   q_values: Record<string, number>;
   policy_id: string;
-  // What the agent chose to risk, and against what balance.
-  size_tier: "SMALL" | "LARGE";
-  risk_fraction: number;
-  balance_at_signal: number;
-  position_size_units: number;
+  // What the agent chose to risk, and against what balance -- absent on RLSignal documents
+  // created before sizing existed (GET /rl/signals returns raw Mongo docs, not validated
+  // through the RLSignal Pydantic model, so an old doc really can be missing these keys).
+  size_tier?: "SMALL" | "LARGE" | null;
+  risk_fraction?: number | null;
+  balance_at_signal?: number | null;
+  position_size_units?: number | null;
   status: SignalStatus;
   outcome_price?: number | null;
   outcome_timestamp?: string | null;

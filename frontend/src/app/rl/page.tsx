@@ -393,11 +393,11 @@ export default function RLPage() {
                                   <td className="px-3 py-1.5">{s.entry_price.toFixed(5)}</td>
                                   <td className="px-3 py-1.5">{s.target_price.toFixed(5)}</td>
                                   <td className={`px-3 py-1.5 font-mono ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>
-                                    {s.size_tier}
+                                    {s.size_tier ?? "—"}
                                   </td>
                                 </>
                               )}
-                              <td className="px-3 py-1.5 font-mono">{s ? s.position_size_units.toFixed(0) : "—"}</td>
+                              <td className="px-3 py-1.5 font-mono">{s?.position_size_units != null ? s.position_size_units.toFixed(0) : "—"}</td>
                               <td className="px-3 py-1.5">
                                 {cell.qValues && (
                                   <button
@@ -461,9 +461,9 @@ export default function RLPage() {
                     <td className="px-4 py-2">{s.entry_price.toFixed(5)}</td>
                     <td className="px-4 py-2">{s.target_price.toFixed(5)}</td>
                     <td className="px-4 py-2">{s.stop_price.toFixed(5)}</td>
-                    <td className={`px-4 py-2 font-mono ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>{s.size_tier}</td>
-                    <td className="px-4 py-2 font-mono">{s.position_size_units.toFixed(0)}</td>
-                    <td className="px-4 py-2 font-mono">${s.balance_at_signal}</td>
+                    <td className={`px-4 py-2 font-mono ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>{s.size_tier ?? "—"}</td>
+                    <td className="px-4 py-2 font-mono">{s.position_size_units != null ? s.position_size_units.toFixed(0) : "—"}</td>
+                    <td className="px-4 py-2 font-mono">{s.balance_at_signal != null ? `$${s.balance_at_signal}` : "—"}</td>
                     <td className="px-4 py-2"><StatusBadge status={s.status} /></td>
                     <td className="px-4 py-2 text-xs text-zinc-500">{new Date(s.timestamp).toLocaleString()}</td>
                   </tr>
