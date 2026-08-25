@@ -127,6 +127,10 @@ export interface BacktestRun {
   avg_confidence_hit: number | null;
   avg_confidence_miss: number | null;
   rule_stats: RuleStat[];
+  // RL sizing-aware eval runs only (profile "rl") -- null/absent for every other BacktestRun.
+  starting_balance?: number | null;
+  ending_balance?: number | null;
+  total_return_pct?: number | null;
 }
 
 export interface MLCalibrationBucket {
