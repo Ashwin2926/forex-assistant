@@ -1,3 +1,4 @@
+import math
 import random
 import uuid
 import pandas as pd
@@ -8,17 +9,35 @@ from app.services.indicators import add_all_indicators
 from app.services.signal_engine import compute_atr_target_stop, label_outcome, spread_cost_pct
 from app.services.strategies import STRATEGIES
 
-ACTIONS = ["HOLD", "BUY", "SELL"]
+# Direction+size actions -- 2 tiers (not 3) deliberately, to keep the action space close to
+# the original 3 (HOLD/BUY/SELL) rather than 7. Every extra action means fewer training
+# samples per action, the exact problem Adagrad and the recent history backfill were just
+# built to address -- adding more tiers would directly work against that.
+ACTIONS = ["HOLD", "BUY_SMALL", "BUY_LARGE", "SELL_SMALL", "SELL_LARGE"]
+
+# Starting guesses, not backtested -- same caveat as every other unvalidated constant in this
+# project (PROXIMITY_ATR_MULT, SMC_WICK_BODY_MULT, etc.).
+RISK_FRACTION_BY_TIER = {"SMALL": 0.01, "LARGE": 0.03}  # % of current balance risked
+DEFAULT_STARTING_BALANCE = 50.0
+MIN_VIABLE_BALANCE = 1.0  # below this, ruin -- can't size a real position, walk/episode ends
+RUIN_REWARD = -10.0  # large fixed penalty when a trade would wipe the balance out entirely
 
 # Names in the same order STRATEGIES itself is declared -- derived, not hand-typed, so this
 # can't drift out of sync the same way consensus.py's STRATEGY_WEIGHTS already avoids that.
 STRATEGY_NAMES = [fn.__name__.removeprefix("call_") for fn in STRATEGIES]
-RL_FEATURE_NAMES = [f"{name}_vote" for name in STRATEGY_NAMES] + ["atr_pct"]
+
+# The market-only state -- precomputable once per bar, independent of the policy or any
+# balance (see compute_strategy_vote_states). balance_log_ratio is appended separately per
+# decision (full_rl_state) since it changes trade-to-trade and can't be precomputed the same way.
+RL_MARKET_FEATURE_NAMES = [f"{name}_vote" for name in STRATEGY_NAMES] + ["atr_pct"]
+RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
 
 # Fixed, not sourced from RuleConfig/SWING_PAIR_OVERRIDES -- some of those (e.g. swing's
 # global default target_atr_mult=0.5/stop_atr_mult=1.25) risk MORE than they target, which
 # is exactly what the user said this agent must never do. A 1.5:1 reward:risk floor is
 # guaranteed by construction here, not left for the agent to discover through reward alone.
+# Sizing (RISK_FRACTION_BY_TIER) is additive on top of this -- it changes how much capital is
+# committed to the trade, never this ratio.
 RL_TARGET_ATR_MULT = 1.5
 RL_STOP_ATR_MULT = 1.0
 
@@ -57,17 +76,38 @@ def rl_config_profile(interval: str) -> str:
     return "intraday" if interval in INTRADAY_INTERVALS else "swing"
 
 
+def usd_per_unit(pair: str, entry_price: float) -> float:
+    """
+    Ports trading-signals/page.tsx's calculateLotSize convention server-side -- same 4-pair
+    quote-currency assumption (USD/JPY converts via its own rate since it quotes in JPY; the
+    other 3 quote in USD directly). Needed here because sizing now drives the reward itself,
+    not just a display number.
+    """
+    return 1 / entry_price if pair == "USD/JPY" else 1.0
+
+
+def position_size_units(balance: float, risk_fraction: float, entry_price: float, stop_price: float, pair: str) -> float:
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance == 0 or balance <= 0:
+        return 0.0
+    return (balance * risk_fraction) / (stop_distance * usd_per_unit(pair, entry_price))
+
+
 def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig) -> list[list[float]]:
     """
-    One state vector per bar: each of the 7 strategies' current direction, encoded as
-    direction x strength (e.g. -0.8 for a strong SELL, -0.2 for a barely-there one, 0.0 for
-    HOLD) instead of a flat +-1, plus atr_pct for volatility context. `strength` (see
-    StrategyCall.strength / strategies.py) is each strategy's own normalized [0, 1] "how
-    strong was THIS bar's reading" -- a strategy that's barely triggered no longer looks
-    identical to one firing at full conviction. This is the literal mechanization of "use the
-    existing strategies to generate signals, weighting by how strong each one currently is" --
-    the agent learns how to weight/combine them, an adaptive version of what consensus's fixed
-    REQUIRED_WEIGHT_FRACTION already does with a hand-picked threshold.
+    One market-state vector per bar (RL_MARKET_FEATURE_NAMES, 8 features): each of the 7
+    strategies' current direction, encoded as direction x strength (e.g. -0.8 for a strong
+    SELL, -0.2 for a barely-there one, 0.0 for HOLD) instead of a flat +-1, plus atr_pct for
+    volatility context. `strength` (see StrategyCall.strength / strategies.py) is each
+    strategy's own normalized [0, 1] "how strong was THIS bar's reading" -- a strategy that's
+    barely triggered no longer looks identical to one firing at full conviction. This is the
+    literal mechanization of "use the existing strategies to generate signals, weighting by
+    how strong each one currently is" -- the agent learns how to weight/combine them, an
+    adaptive version of what consensus's fixed REQUIRED_WEIGHT_FRACTION already does with a
+    hand-picked threshold.
+
+    Doesn't include the balance feature -- see full_rl_state, which appends it per-decision,
+    since balance changes trade-to-trade and can't be precomputed the same way these can.
 
     Computed once for the whole df up front, not recomputed per training episode -- strategy
     outputs are deterministic given a bar's window and don't depend on the policy at all, so
@@ -80,7 +120,7 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
             # Most strategies need at least a prev bar (candlestick patterns, MACD cross);
             # these earliest rows are always before MIN_WARMUP_BARS anyway, never selected
             # as a real decision point -- a zero state here is a placeholder, not a live read.
-            states.append([0.0] * len(RL_FEATURE_NAMES))
+            states.append([0.0] * len(RL_MARKET_FEATURE_NAMES))
             continue
         window_start = max(0, i + 1 - STATE_WINDOW_BARS)
         window = indicator_df.iloc[window_start: i + 1]
@@ -100,6 +140,18 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
     return states
 
 
+def full_rl_state(market_state: list[float], balance: float, starting_balance: float) -> list[float]:
+    """
+    Appends the one balance-dependent feature to an otherwise-precomputed market state --
+    log(balance / starting_balance), 0 at the reference point, positive when ahead, negative
+    when behind. Without this the agent has no way to condition its sizing choice on how the
+    account is actually doing (e.g. sizing down after a drawdown). Guards balance<=0 (already
+    at/past ruin) with a large negative stand-in rather than crashing on log(0).
+    """
+    balance_log_ratio = math.log(balance / starting_balance) if balance > 0 else -10.0
+    return market_state + [balance_log_ratio]
+
+
 ADAGRAD_EPSILON = 1e-8  # avoids division by zero on a feature's very first update
 
 
@@ -108,7 +160,7 @@ class LinearQPolicy:
     q(state, action) = dot(weights[action], state). One weight vector per action, same
     length/order as RL_FEATURE_NAMES -- as interpretable as the ML page's
     feature_coefficients table, and simple enough that pure numpy-free Python is plenty fast
-    for an 8-feature state.
+    for a 9-feature state.
 
     Updates use Adagrad (per-weight adaptive learning rate, accumulated sum of squared past
     gradients) instead of one flat alpha for every feature -- the strategies here fire at very
@@ -148,41 +200,59 @@ class LinearQPolicy:
         ]
 
 
-def _take_action(
-    df: pd.DataFrame, indicator_df: pd.DataFrame, i: int, action: str, pair: str, max_lookforward: int,
-) -> tuple[float, int]:
+def _take_action_sized(
+    df: pd.DataFrame, indicator_df: pd.DataFrame, i: int, action: str, pair: str, max_lookforward: int, balance: float,
+) -> tuple[float, int, float]:
     """
-    Executes one action at bar i, returns (reward, bars_to_advance). HOLD advances by 1 bar
-    with reward 0.0. BUY/SELL opens a position at RL_TARGET_ATR_MULT/RL_STOP_ATR_MULT,
-    resolves it via the same label_outcome/spread_cost_pct every other part of this project
-    uses, and advances by candles_to_outcome -- single-position-at-a-time, matching every
-    other trading concept here (paper trading, live signals): the agent can't open a second
-    position while one is still open.
+    Executes one sized action at bar i, returns (reward, bars_to_advance, new_balance). HOLD
+    advances 1 bar, balance unchanged, reward 0.0. A BUY_TIER/SELL_TIER action sizes a real
+    position against the CURRENT balance (position_size_units), resolves it via the same
+    label_outcome/spread_cost_pct every other part of this project uses, and converts the
+    resulting pct_move into a dollar P&L against that position size.
+
+    Reward is log(new_balance / balance) -- the Kelly-criterion-standard objective for
+    compounding growth, which also naturally and severely penalizes ruin (log of a near-zero
+    balance is deeply negative) without needing a bolted-on penalty; RUIN_REWARD is only a
+    guard for the literal balance<=0 edge the log can't represent. Single-position-at-a-time
+    via candles_to_outcome, same as every other trading concept here.
     """
     if action == "HOLD":
-        return 0.0, 1
+        return 0.0, 1, balance
+
+    direction, tier = action.split("_")
+    risk_fraction = RISK_FRACTION_BY_TIER[tier]
 
     entry_price = float(df.loc[i, "close"])
     atr_val = float(indicator_df.loc[i, "atr"])
-    target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, action, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT)
+    target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT)
+    units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
+
     future_candles = df.iloc[i + 1: i + 1 + max_lookforward]
     status, outcome_price, _outcome_ts, candles_to_outcome = label_outcome(
-        future_candles, action, target_price, stop_price, max_lookforward
+        future_candles, direction, target_price, stop_price, max_lookforward
     )
     # Callers only ever invoke this with i bounded so max_lookforward future candles exist
     # (same guarantee run_backtest's last_evaluable bound already relies on).
     assert status != "pending", "internal error: rl_engine ran out of candles unexpectedly"
 
     pct_move = ((outcome_price - entry_price) / entry_price) * 100
-    if action == "SELL":
+    if direction == "SELL":
         pct_move = -pct_move
     pct_move -= spread_cost_pct(pair, entry_price)
-    return pct_move, candles_to_outcome
+
+    dollar_pnl = units * usd_per_unit(pair, entry_price) * (pct_move / 100) * entry_price
+    new_balance = balance + dollar_pnl
+
+    if new_balance <= 0:
+        return RUIN_REWARD, candles_to_outcome, 0.0
+    reward = math.log(new_balance / balance) if balance > 0 else RUIN_REWARD
+    return reward, candles_to_outcome, new_balance
 
 
 def train_rl_policy(
     df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
     episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
+    starting_balance: float = DEFAULT_STARTING_BALANCE,
 ) -> tuple[RLPolicy, BacktestRun, list[Signal]]:
     """
     Trains a LinearQPolicy via epsilon-greedy Q-learning over the train slice (chronological
@@ -191,7 +261,10 @@ def train_rl_policy(
     exploration) on the untouched test slice -- returned as a real BacktestRun (profile="rl"),
     reusing BacktestRun.profile the same way run_consensus_backtest reuses it for
     "consensus", so RL's expectancy_pct is directly comparable to every other approach via
-    the existing GET /backtest/runs?pair=X&profile=rl.
+    the existing GET /backtest/runs?pair=X&profile=rl. The eval run also carries
+    starting_balance/ending_balance/total_return_pct -- a real "what would $X have grown to"
+    simulation, not just an average per-trade return, since sizing makes growth compounding
+    and path-dependent rather than a flat mean.
 
     Also returns one Signal per individual test-slice trade (hit/miss/expired), tagged with
     the eval BacktestRun's run_id -- reuses run_backtest's own persistence path
@@ -205,10 +278,12 @@ def train_rl_policy(
     """
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1 (exclusive).")
+    if starting_balance <= 0:
+        raise ValueError("starting_balance must be positive.")
 
     df = df.reset_index(drop=True)
     indicator_df = add_all_indicators(df, config)
-    states = compute_strategy_vote_states(indicator_df, config)
+    market_states = compute_strategy_vote_states(indicator_df, config)
 
     min_warmup = max(config.ema_slow, MIN_WARMUP_BARS)
     split_idx = int(len(df) * train_frac)
@@ -234,19 +309,25 @@ def train_rl_policy(
 
     for _episode in range(episodes):
         i = min_warmup
+        balance = starting_balance
         while i <= train_last:
-            state = states[i]
+            state = full_rl_state(market_states[i], balance, starting_balance)
             action = policy.epsilon_greedy(state, epsilon)
-            reward, advance = _take_action(df, indicator_df, i, action, pair, max_lookforward)
+            reward, advance, balance = _take_action_sized(df, indicator_df, i, action, pair, max_lookforward, balance)
             next_i = i + advance
-            next_state = states[next_i] if next_i <= train_last else None
+            ruined = balance < MIN_VIABLE_BALANCE
+            next_state = full_rl_state(market_states[next_i], balance, starting_balance) if (next_i <= train_last and not ruined) else None
             policy.update(state, action, reward, next_state, LEARNING_RATE, DISCOUNT_GAMMA)
+            if ruined:
+                break  # out of capital -- nothing left to trade with for the rest of this episode
             i = next_i
         epsilon = max(EPSILON_MIN, epsilon * epsilon_decay)
 
     # Greedy evaluation on the untouched test slice -- same walk-forward, single-position-at-
     # a-time shape as training, just epsilon=0 and no weight updates. Tallied the same way
-    # run_backtest tallies hits/misses/expired/pct_move, for a directly comparable BacktestRun.
+    # run_backtest tallies hits/misses/expired/pct_move, for a directly comparable BacktestRun,
+    # plus a real balance walk (starting_balance -> ending_balance) since sizing makes growth
+    # compounding rather than a flat per-trade average.
     eval_run_id = uuid.uuid4().hex[:12]
     hold_count = 0
     hits = misses = expired = 0
@@ -255,9 +336,10 @@ def train_rl_policy(
     all_pcts: list[float] = []
     trade_signals: list[Signal] = []
 
+    balance = starting_balance
     i = test_start
     while i <= test_last:
-        state = states[i]
+        state = full_rl_state(market_states[i], balance, starting_balance)
         q = policy.q_values(state)
         action = max(q, key=q.get)
         if action == "HOLD":
@@ -265,19 +347,26 @@ def train_rl_policy(
             i += 1
             continue
 
+        direction, tier = action.split("_")
+        risk_fraction = RISK_FRACTION_BY_TIER[tier]
         entry_price = float(df.loc[i, "close"])
         atr_val = float(indicator_df.loc[i, "atr"])
-        target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, action, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT)
+        target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT)
+        units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
         future_candles = df.iloc[i + 1: i + 1 + max_lookforward]
         status, outcome_price, outcome_ts, candles_to_outcome = label_outcome(
-            future_candles, action, target_price, stop_price, max_lookforward
+            future_candles, direction, target_price, stop_price, max_lookforward
         )
         assert status != "pending", "internal error: rl_engine ran out of candles unexpectedly"
 
         pct_move = ((outcome_price - entry_price) / entry_price) * 100
-        if action == "SELL":
+        if direction == "SELL":
             pct_move = -pct_move
         pct_move -= spread_cost_pct(pair, entry_price)
+
+        dollar_pnl = units * usd_per_unit(pair, entry_price) * (pct_move / 100) * entry_price
+        balance_before = balance
+        balance = max(balance + dollar_pnl, 0.0)
 
         if status == "hit":
             hits += 1
@@ -292,16 +381,22 @@ def train_rl_policy(
 
         trade_signals.append(Signal(
             pair=pair, profile="swing", interval=interval, timestamp=df.loc[i, "timestamp"],
-            direction=action, confidence=0.0, reasons=[], price_at_signal=round(entry_price, 5),
+            direction=direction, confidence=0.0, reasons=[], price_at_signal=round(entry_price, 5),
             status=status, outcome_price=round(float(outcome_price), 5), outcome_timestamp=outcome_ts,
             outcome_pct_move=round(pct_move, 5), source="backtest", run_id=eval_run_id,
             target_price=round(target_price, 5), stop_price=round(stop_price, 5),
             candles_to_outcome=candles_to_outcome,
+            size_tier=tier, risk_fraction=risk_fraction, balance_at_signal=round(balance_before, 2),
+            position_size_units=round(units, 2),
         ))
 
+        if balance < MIN_VIABLE_BALANCE:
+            break  # ruined on the test walk itself -- out of capital, stop evaluating further
         i += candles_to_outcome
 
     directional_signals = hits + misses + expired
+    ending_balance = round(balance, 2)
+    total_return_pct = round((ending_balance - starting_balance) / starting_balance * 100, 2)
     eval_run = BacktestRun(
         run_id=eval_run_id,
         pair=pair,
@@ -324,6 +419,9 @@ def train_rl_policy(
         avg_loss_pct=round(sum(loss_pcts) / len(loss_pcts), 4) if loss_pcts else None,
         expectancy_pct=round(sum(all_pcts) / len(all_pcts), 4) if all_pcts else None,
         rule_stats=[],  # no per-rule attribution concept here, unlike run_backtest/run_consensus_backtest
+        starting_balance=starting_balance,
+        ending_balance=ending_balance,
+        total_return_pct=total_return_pct,
     )
 
     rl_policy = RLPolicy(
@@ -336,13 +434,26 @@ def train_rl_policy(
         weights=policy.weights,
         feature_names=RL_FEATURE_NAMES,
         eval_run_id=eval_run.run_id,
+        starting_balance=starting_balance,
     )
 
     return rl_policy, eval_run, trade_signals
 
 
 def choose_action(policy: RLPolicy, state: list[float]) -> tuple[str, dict[str, float]]:
-    """Greedy action selection from a persisted policy -- used by the signal/predict endpoints."""
+    """
+    Greedy action selection from a persisted policy -- used by the signal/predict endpoints.
+    Raises ValueError (turned into a clean 400 by the caller) if the policy's weights don't
+    match the current ACTIONS set -- a policy trained before an action-space change (like
+    HOLD/BUY/SELL -> the 5 sizing actions) is stale, not usable as-is, and a raw KeyError from
+    a mismatched lookup would be a confusing way to find that out.
+    """
+    if set(policy.weights.keys()) != set(ACTIONS):
+        raise ValueError(
+            f"RL policy {policy.policy_id} for {policy.pair}/{policy.interval} was trained "
+            f"against a different action set (stale after an RL update) -- retrain via "
+            f"POST /rl/train/{policy.interval}?pair={policy.pair} first."
+        )
     q_policy = LinearQPolicy(len(policy.feature_names))
     q_policy.weights = policy.weights
     q_values = q_policy.q_values(state)

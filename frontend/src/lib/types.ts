@@ -34,6 +34,12 @@ export interface Signal {
   target_price?: number | null;
   stop_price?: number | null;
   candles_to_outcome?: number | null;
+  // RL sizing-aware trade log only (see rl_engine.train_rl_policy) -- null/absent for every
+  // other Signal.
+  size_tier?: "SMALL" | "LARGE" | null;
+  risk_fraction?: number | null;
+  balance_at_signal?: number | null;
+  position_size_units?: number | null;
 }
 
 export interface StrategyCall {
@@ -154,6 +160,9 @@ export interface RLPolicy {
   weights: Record<string, number[]>;
   feature_names: string[];
   eval_run_id: string;
+  // The balance this policy was trained against -- predict-time needs this same reference
+  // point to compute the live balance_log_ratio feature correctly.
+  starting_balance: number;
   // Only present from GET /rl/policies (enriched server-side from the linked BacktestRun) --
   // absent on the RLPolicy returned directly by POST /rl/train.
   evaluation?: {
@@ -161,6 +170,9 @@ export interface RLPolicy {
     expectancy_pct: number | null;
     directional_signals: number;
     hold_signals: number;
+    starting_balance: number | null;
+    ending_balance: number | null;
+    total_return_pct: number | null;
   } | null;
 }
 
@@ -175,6 +187,11 @@ export interface RLSignal {
   stop_price: number;
   q_values: Record<string, number>;
   policy_id: string;
+  // What the agent chose to risk, and against what balance.
+  size_tier: "SMALL" | "LARGE";
+  risk_fraction: number;
+  balance_at_signal: number;
+  position_size_units: number;
   status: SignalStatus;
   outcome_price?: number | null;
   outcome_timestamp?: string | null;

@@ -87,6 +87,15 @@ class Signal(BaseModel):
     stop_price: Optional[float] = None
     candles_to_outcome: Optional[int] = None
 
+    # RL sizing-aware trade log only (rl_engine.train_rl_policy's test-slice trades,
+    # persisted to backtest_signals_collection the same way regular backtest signals are) --
+    # None for every other Signal. Same "reuse the existing model, add optional fields"
+    # precedent as BacktestRun's starting_balance/ending_balance/total_return_pct.
+    size_tier: Optional[Literal["SMALL", "LARGE"]] = None
+    risk_fraction: Optional[float] = None
+    balance_at_signal: Optional[float] = None
+    position_size_units: Optional[float] = None
+
 
 class StrategyCall(BaseModel):
     """
@@ -189,6 +198,14 @@ class BacktestRun(BaseModel):
 
     rule_stats: list[RuleStat] = []
 
+    # RL sizing-aware runs only (profile="rl", see rl_engine.train_rl_policy) -- None for
+    # every other backtest type. expectancy_pct above is still a flat per-trade average;
+    # these three track the actual compounding walk (starting_balance -> ending_balance),
+    # since sizing makes growth path-dependent rather than reducible to a mean.
+    starting_balance: Optional[float] = None
+    ending_balance: Optional[float] = None
+    total_return_pct: Optional[float] = None
+
 
 class MLCalibrationBucket(BaseModel):
     """
@@ -226,10 +243,12 @@ class MLTrainResult(BaseModel):
 class RLPolicy(BaseModel):
     """
     The learned brain of the RL agent (app/services/rl_engine.py) -- a linear Q-function, one
-    weight vector per action (BUY/SELL/HOLD), over the 7 strategies' votes plus atr_pct.
-    Persisted because, unlike the ML classifier's sub-second refit on ~270 rows, training
-    (many epsilon-greedy episodes over thousands of candles) isn't cheap enough to redo on
-    every request -- predict-time just loads the latest one and picks the greedy action.
+    weight vector per action (HOLD + BUY/SELL x SMALL/LARGE size tiers), over the 7
+    strategies' votes, atr_pct, and a balance_log_ratio feature (how the account is doing
+    relative to where it started). Persisted because, unlike the ML classifier's sub-second
+    refit on ~270 rows, training (many epsilon-greedy episodes over thousands of candles)
+    isn't cheap enough to redo on every request -- predict-time just loads the latest one and
+    picks the greedy action.
     """
     policy_id: str
     pair: str
@@ -240,6 +259,10 @@ class RLPolicy(BaseModel):
     weights: dict[str, list[float]]  # action -> weight vector, same order as feature_names
     feature_names: list[str]
     eval_run_id: str  # the BacktestRun (profile="rl") that evaluated this policy on the test slice
+    # The balance this policy was trained against -- predict-time needs the SAME reference
+    # point to compute the live balance_log_ratio feature, or that feature would mean
+    # something different at inference than it did during training.
+    starting_balance: float
 
 
 class RLSignal(BaseModel):
@@ -260,6 +283,13 @@ class RLSignal(BaseModel):
     stop_price: float
     q_values: dict[str, float]
     policy_id: str
+
+    # What the agent chose to risk, and against what balance -- makes the trade log (and the
+    # live signal itself) fully auditable now that sizing isn't a separate, fixed calculator.
+    size_tier: Literal["SMALL", "LARGE"]
+    risk_fraction: float
+    balance_at_signal: float
+    position_size_units: float
 
     status: Literal["pending", "hit", "miss", "expired"] = "pending"
     outcome_price: Optional[float] = None

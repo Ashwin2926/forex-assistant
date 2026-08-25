@@ -197,12 +197,13 @@ export const api = {
   trainRLPolicy(
     pair: string,
     interval: string,
-    opts: { episodes?: number; train_frac?: number; max_lookforward?: number } = {},
+    opts: { episodes?: number; train_frac?: number; max_lookforward?: number; starting_balance?: number } = {},
   ) {
     const qs = new URLSearchParams({ pair });
     if (opts.episodes !== undefined) qs.set("episodes", String(opts.episodes));
     if (opts.train_frac !== undefined) qs.set("train_frac", String(opts.train_frac));
     if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
+    if (opts.starting_balance !== undefined) qs.set("starting_balance", String(opts.starting_balance));
     return request<{ policy: RLPolicy; evaluation: BacktestRun }>(
       `/rl/train/${interval}?${qs.toString()}`,
       { method: "POST" },
@@ -218,11 +219,13 @@ export const api = {
     return request<RLPolicy[]>(`/rl/policies${query ? `?${query}` : ""}`);
   },
 
-  generateRLSignal(pair: string, interval: string) {
+  generateRLSignal(pair: string, interval: string, balance?: number) {
     // pair goes in the query string, not the path — a literal '/' in a path segment
     // breaks Starlette's routing even when percent-encoded.
+    const qs = new URLSearchParams({ pair });
+    if (balance !== undefined) qs.set("balance", String(balance));
     return request<{ signal: RLSignal | null; q_values: Record<string, number> }>(
-      `/rl/signal/${interval}?pair=${encodeURIComponent(pair)}`,
+      `/rl/signal/${interval}?${qs.toString()}`,
       { method: "POST" },
     );
   },

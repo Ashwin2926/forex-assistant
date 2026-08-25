@@ -28,8 +28,9 @@ from app.services.consensus import check_consensus
 from app.services.ml_features import extract_features
 from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.rl_engine import (
-    train_rl_policy, choose_action, compute_strategy_vote_states, rl_config_profile,
-    RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT, MIN_WARMUP_BARS,
+    train_rl_policy, choose_action, compute_strategy_vote_states, rl_config_profile, full_rl_state,
+    position_size_units, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
+    RISK_FRACTION_BY_TIER,
 )
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
@@ -807,15 +808,19 @@ def _rl_state_from_candles(docs: list[dict], config: RuleConfig) -> tuple[list[f
 @app.post("/rl/train/{interval}")
 async def train_rl(
     interval: str, pair: str, episodes: int = 100, train_frac: float = 0.7, max_lookforward: int = 20,
+    starting_balance: float = DEFAULT_STARTING_BALANCE,
 ):
     """
     Trains a linear Q-policy (app/services/rl_engine.py) for this pair/interval via
     epsilon-greedy Q-learning over historical candle replay -- an adaptive alternative to
     consensus's fixed weighted-vote threshold, learning how to weight the same 7 strategies
-    instead of using a hand-picked REQUIRED_WEIGHT_FRACTION. One independent policy per pair,
+    instead of using a hand-picked REQUIRED_WEIGHT_FRACTION, AND how much to risk on each
+    trade (2 size tiers, see rl_engine.RISK_FRACTION_BY_TIER) against a compounding account
+    balance starting at `starting_balance` (default $50). One independent policy per pair,
     not shared across pairs. Persists both the learned RLPolicy and its test-slice evaluation
-    (a real BacktestRun, profile="rl") so it's directly comparable to every other approach via
-    GET /backtest/runs?pair=X&profile=rl.
+    (a real BacktestRun, profile="rl", now including starting_balance/ending_balance/
+    total_return_pct alongside the usual hit_rate/expectancy) so it's directly comparable to
+    every other approach via GET /backtest/runs?pair=X&profile=rl.
 
     Strategy calls use the intraday RuleConfig (short EMAs + session filter) for 5min/15min
     and swing for everything else (rl_config_profile) -- same interval grouping the regular
@@ -826,6 +831,8 @@ async def train_rl(
     """
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
+    if starting_balance <= 0:
+        raise HTTPException(status_code=400, detail="starting_balance must be positive.")
 
     config = default_config_for(rl_config_profile(interval), pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
@@ -839,7 +846,8 @@ async def train_rl(
     df = pd.DataFrame(docs)
     try:
         policy, eval_run, trade_signals = train_rl_policy(
-            df, pair, interval, config, episodes=episodes, train_frac=train_frac, max_lookforward=max_lookforward,
+            df, pair, interval, config, episodes=episodes, train_frac=train_frac,
+            max_lookforward=max_lookforward, starting_balance=starting_balance,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -886,6 +894,9 @@ async def list_rl_policies(pair: str | None = None, interval: str | None = None,
             "expectancy_pct": run["expectancy_pct"],
             "directional_signals": run["directional_signals"],
             "hold_signals": run["hold_signals"],
+            "starting_balance": run.get("starting_balance"),
+            "ending_balance": run.get("ending_balance"),
+            "total_return_pct": run.get("total_return_pct"),
         } if run else None
     return docs
 
@@ -918,24 +929,34 @@ async def _expire_stale_rl_signal(pending: dict, current_price: float) -> None:
 
 
 @app.post("/rl/signal/{interval}")
-async def create_rl_signal(interval: str, pair: str):
+async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_STARTING_BALANCE):
     """
     Loads the most recently trained RLPolicy for this pair/interval, computes the current
-    state from live strategy calls on the latest candles (compute_strategy_vote_states, same
-    encoding used during training), and picks the greedy action. Only BUY/SELL get stored --
-    HOLD never produces an RLSignal, same as ConsensusSignal.
+    state from live strategy calls on the latest candles PLUS the supplied `balance` (same
+    encoding used during training, via rl_engine.full_rl_state -- `balance` is your real
+    current account balance, not a value this backend tracks itself, since there's no way to
+    know whether a prior signal was actually taken or what it filled at on an external
+    broker), and picks the greedy action. Only BUY/SELL get stored -- HOLD never produces an
+    RLSignal, same as ConsensusSignal. The chosen size tier (SMALL/LARGE) is sized against
+    `balance` via position_size_units, so the signal is always grounded in your actual
+    account, not an assumed one.
 
     If a different decision now disagrees with whatever RL signal is still "pending" for this
     pair/interval (new direction, new action is HOLD, or price has moved enough that the
     entry itself changed), that old pending signal is marked "expired" immediately (see
     _expire_stale_rl_signal) instead of being left to resolve on its own hours later --
     "pending" should mean "still the agent's current live view," not "might still resolve
-    eventually." An exact repeat of the still-pending signal is left alone and returned as-is
-    (same de-dupe idea create_consensus_signal already uses), so re-running this before the
-    underlying candle has advanced doesn't spuriously expire-then-recreate it.
+    eventually." An exact repeat of the still-pending signal (same direction/entry/target) is
+    left alone and returned as-is (same de-dupe idea create_consensus_signal already uses,
+    intentionally not re-sizing an already-shown pending signal just because `balance`
+    happened to differ on this call), so re-running this before the underlying candle has
+    advanced doesn't spuriously expire-then-recreate it.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
+    if balance <= 0:
+        raise HTTPException(status_code=400, detail="balance must be positive.")
+
     policy_doc = await rl_policies_collection.find_one(
         {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
     )
@@ -959,8 +980,12 @@ async def create_rl_signal(interval: str, pair: str):
                     f"Run /ingest/{interval} first."
         )
 
-    state, df = _rl_state_from_candles(docs, config)
-    action, q_values = choose_action(policy, state)
+    market_state, df = _rl_state_from_candles(docs, config)
+    state = full_rl_state(market_state, balance, policy.starting_balance)
+    try:
+        action, q_values = choose_action(policy, state)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     current_price = float(df.iloc[-1]["close"])
 
     pending = await rl_signals_collection.find_one(
@@ -972,17 +997,23 @@ async def create_rl_signal(interval: str, pair: str):
             await _expire_stale_rl_signal(pending, current_price)
         return {"signal": None, "q_values": q_values}
 
+    direction, tier = action.split("_")
+    risk_fraction = RISK_FRACTION_BY_TIER[tier]
+
     latest = df.iloc[-1]
     entry_price = current_price
     atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
     target_price, stop_price = compute_atr_target_stop(
-        entry_price, atr_val, action, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT,
+        entry_price, atr_val, direction, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT,
     )
+    units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
 
     rl_signal = RLSignal(
-        pair=pair, interval=interval, timestamp=latest["timestamp"], direction=action,
+        pair=pair, interval=interval, timestamp=latest["timestamp"], direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
         q_values=q_values, policy_id=policy.policy_id,
+        size_tier=tier, risk_fraction=risk_fraction, balance_at_signal=round(balance, 2),
+        position_size_units=round(units, 2),
     )
 
     if (
