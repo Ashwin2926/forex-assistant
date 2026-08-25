@@ -595,7 +595,8 @@ export default function RLPage() {
   );
 }
 
-const ACTION_DISPLAY_ORDER = ["BUY", "SELL", "HOLD"];
+// Covers both the current 5-action space and pre-v2 policies (plain BUY/SELL) still in the DB.
+const ACTION_DISPLAY_ORDER = ["BUY_LARGE", "BUY_SMALL", "BUY", "SELL_SMALL", "SELL_LARGE", "SELL", "HOLD"];
 
 function WeightsTable({ policy }: { policy: RLPolicy }) {
   const actions = ACTION_DISPLAY_ORDER.filter((a) => a in policy.weights);
