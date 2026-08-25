@@ -833,12 +833,17 @@ async def train_rl(
 
     df = pd.DataFrame(docs)
     try:
-        policy, eval_run = train_rl_policy(
+        policy, eval_run, trade_signals = train_rl_policy(
             df, pair, interval, config, episodes=episodes, train_frac=train_frac, max_lookforward=max_lookforward,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
+    # own persistence) tagged with eval_run.run_id -- GET /backtest/runs/{run_id}/signals
+    # already answers "which trades passed and which failed" for free, no new endpoint.
+    if trade_signals:
+        await backtest_signals_collection.insert_many([s.model_dump() for s in trade_signals])
     await backtest_runs_collection.insert_one(eval_run.model_dump())
     await rl_policies_collection.insert_one(policy.model_dump())
     return {"policy": policy, "evaluation": eval_run}
@@ -846,6 +851,13 @@ async def train_rl(
 
 @app.get("/rl/policies")
 async def list_rl_policies(pair: str | None = None, interval: str | None = None, limit: int = 20):
+    """
+    Each policy is enriched with its test-slice evaluation summary (hit_rate_pct,
+    expectancy_pct, directional_signals, hold_signals -- pulled from the linked BacktestRun
+    via eval_run_id) so this list doubles as a learning-progress view: read down the rows for
+    a given pair/interval over successive trainings to see whether hit rate/expectancy is
+    actually trending anywhere, not just when the most recent training happened.
+    """
     query = {}
     if pair:
         query["pair"] = pair
@@ -853,8 +865,23 @@ async def list_rl_policies(pair: str | None = None, interval: str | None = None,
         query["interval"] = interval
     cursor = rl_policies_collection.find(query).sort("created_at", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
+
+    eval_run_ids = [d["eval_run_id"] for d in docs if d.get("eval_run_id")]
+    eval_runs = {}
+    if eval_run_ids:
+        eval_cursor = backtest_runs_collection.find({"run_id": {"$in": eval_run_ids}})
+        async for run in eval_cursor:
+            eval_runs[run["run_id"]] = run
+
     for d in docs:
         d["_id"] = str(d["_id"])
+        run = eval_runs.get(d.get("eval_run_id"))
+        d["evaluation"] = {
+            "hit_rate_pct": run["hit_rate_pct"],
+            "expectancy_pct": run["expectancy_pct"],
+            "directional_signals": run["directional_signals"],
+            "hold_signals": run["hold_signals"],
+        } if run else None
     return docs
 
 

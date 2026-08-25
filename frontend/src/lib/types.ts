@@ -154,6 +154,14 @@ export interface RLPolicy {
   weights: Record<string, number[]>;
   feature_names: string[];
   eval_run_id: string;
+  // Only present from GET /rl/policies (enriched server-side from the linked BacktestRun) --
+  // absent on the RLPolicy returned directly by POST /rl/train.
+  evaluation?: {
+    hit_rate_pct: number | null;
+    expectancy_pct: number | null;
+    directional_signals: number;
+    hold_signals: number;
+  } | null;
 }
 
 export interface RLSignal {

@@ -3,7 +3,7 @@ import uuid
 import pandas as pd
 from datetime import datetime
 from typing import Optional
-from app.models.schemas import BacktestRun, RLPolicy, RuleConfig
+from app.models.schemas import BacktestRun, RLPolicy, RuleConfig, Signal
 from app.services.indicators import add_all_indicators
 from app.services.signal_engine import compute_atr_target_stop, label_outcome, spread_cost_pct
 from app.services.strategies import STRATEGIES
@@ -138,7 +138,7 @@ def _take_action(
 def train_rl_policy(
     df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
     episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
-) -> tuple[RLPolicy, BacktestRun]:
+) -> tuple[RLPolicy, BacktestRun, list[Signal]]:
     """
     Trains a LinearQPolicy via epsilon-greedy Q-learning over the train slice (chronological
     split, same discipline as run_backtest's eval_start_index -- NOT a random shuffle, which
@@ -147,6 +147,16 @@ def train_rl_policy(
     reusing BacktestRun.profile the same way run_consensus_backtest reuses it for
     "consensus", so RL's expectancy_pct is directly comparable to every other approach via
     the existing GET /backtest/runs?pair=X&profile=rl.
+
+    Also returns one Signal per individual test-slice trade (hit/miss/expired), tagged with
+    the eval BacktestRun's run_id -- reuses run_backtest's own persistence path
+    (backtest_signals_collection + GET /backtest/runs/{run_id}/signals) instead of inventing
+    a separate trade-log mechanism, so "which trades passed and which failed" is answered by
+    an endpoint that already exists. profile="swing" is a compatibility value only (Signal
+    has no RL-specific profile literal), same convention already used elsewhere when an
+    RL-generated decision needs to pass through a Signal-shaped interface; reasons=[] since
+    there's no rule-by-rule breakdown for a learned policy the way there is for the rule
+    engine.
     """
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1 (exclusive).")
@@ -192,11 +202,13 @@ def train_rl_policy(
     # Greedy evaluation on the untouched test slice -- same walk-forward, single-position-at-
     # a-time shape as training, just epsilon=0 and no weight updates. Tallied the same way
     # run_backtest tallies hits/misses/expired/pct_move, for a directly comparable BacktestRun.
+    eval_run_id = uuid.uuid4().hex[:12]
     hold_count = 0
     hits = misses = expired = 0
     win_pcts: list[float] = []
     loss_pcts: list[float] = []
     all_pcts: list[float] = []
+    trade_signals: list[Signal] = []
 
     i = test_start
     while i <= test_last:
@@ -212,7 +224,7 @@ def train_rl_policy(
         atr_val = float(indicator_df.loc[i, "atr"])
         target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, action, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT)
         future_candles = df.iloc[i + 1: i + 1 + max_lookforward]
-        status, outcome_price, _outcome_ts, candles_to_outcome = label_outcome(
+        status, outcome_price, outcome_ts, candles_to_outcome = label_outcome(
             future_candles, action, target_price, stop_price, max_lookforward
         )
         assert status != "pending", "internal error: rl_engine ran out of candles unexpectedly"
@@ -233,11 +245,20 @@ def train_rl_policy(
             (win_pcts if pct_move >= 0 else loss_pcts).append(pct_move)
         all_pcts.append(pct_move)
 
+        trade_signals.append(Signal(
+            pair=pair, profile="swing", interval=interval, timestamp=df.loc[i, "timestamp"],
+            direction=action, confidence=0.0, reasons=[], price_at_signal=round(entry_price, 5),
+            status=status, outcome_price=round(float(outcome_price), 5), outcome_timestamp=outcome_ts,
+            outcome_pct_move=round(pct_move, 5), source="backtest", run_id=eval_run_id,
+            target_price=round(target_price, 5), stop_price=round(stop_price, 5),
+            candles_to_outcome=candles_to_outcome,
+        ))
+
         i += candles_to_outcome
 
     directional_signals = hits + misses + expired
     eval_run = BacktestRun(
-        run_id=uuid.uuid4().hex[:12],
+        run_id=eval_run_id,
         pair=pair,
         interval=interval,
         profile="rl",
@@ -272,7 +293,7 @@ def train_rl_policy(
         eval_run_id=eval_run.run_id,
     )
 
-    return rl_policy, eval_run
+    return rl_policy, eval_run, trade_signals
 
 
 def choose_action(policy: RLPolicy, state: list[float]) -> tuple[str, dict[str, float]]:

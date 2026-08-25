@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLPolicy, type RLSignal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLPolicy, type RLSignal, type Signal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
 // Same formula as trading-signals/page.tsx, duplicated rather than shared -- this project
@@ -64,6 +64,11 @@ export default function RLPage() {
   const [trainAllProgress, setTrainAllProgress] = useState(0);
   const [trainAllRunning, setTrainAllRunning] = useState(false);
   const [expandedWeights, setExpandedWeights] = useState<string | null>(null);
+
+  const [expandedHistoryWeights, setExpandedHistoryWeights] = useState<string | null>(null);
+  const [expandedHistoryTrades, setExpandedHistoryTrades] = useState<string | null>(null);
+  const [tradeLogs, setTradeLogs] = useState<Record<string, Signal[]>>({});
+  const [tradeLogsLoading, setTradeLogsLoading] = useState<string | null>(null);
 
   const [generateAllResults, setGenerateAllResults] = useState<GenerateAllCell[]>([]);
   const [generateAllProgress, setGenerateAllProgress] = useState(0);
@@ -169,6 +174,25 @@ export default function RLPage() {
     }
     setGenerateAllRunning(false);
     await loadRecentSignals();
+  }
+
+  async function handleShowTrades(policy: RLPolicy) {
+    const key = policy.policy_id;
+    if (expandedHistoryTrades === key) {
+      setExpandedHistoryTrades(null);
+      return;
+    }
+    setExpandedHistoryTrades(key);
+    if (tradeLogs[policy.eval_run_id]) return; // already cached
+    setTradeLogsLoading(policy.eval_run_id);
+    try {
+      const signals = await api.getBacktestRunSignals(policy.eval_run_id);
+      setTradeLogs((prev) => ({ ...prev, [policy.eval_run_id]: signals }));
+    } catch {
+      setTradeLogs((prev) => ({ ...prev, [policy.eval_run_id]: [] }));
+    } finally {
+      setTradeLogsLoading(null);
+    }
   }
 
   return (
@@ -509,6 +533,10 @@ export default function RLPage() {
 
       <section>
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Training history</h2>
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          Read down a given pair/interval&apos;s rows over successive trainings to see whether
+          hit rate/expectancy is actually improving, not just whichever number is newest.
+        </p>
         {policiesLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
         {!policiesLoading && policies.length === 0 && (
           <p className="mt-4 text-sm text-zinc-500">No trained policies yet — train one above.</p>
@@ -521,18 +549,95 @@ export default function RLPage() {
                   <th className="px-4 py-2">Pair</th>
                   <th className="px-4 py-2">Episodes</th>
                   <th className="px-4 py-2">Train fraction</th>
+                  <th className="px-4 py-2">Test hit rate</th>
+                  <th className="px-4 py-2">Test expectancy</th>
                   <th className="px-4 py-2">When</th>
+                  <th className="px-4 py-2"></th>
                 </tr>
               </thead>
               <tbody>
-                {policies.map((p) => (
-                  <tr key={p.policy_id} className="border-t border-zinc-100 dark:border-zinc-800">
-                    <td className="px-4 py-2">{p.pair} · {p.interval}</td>
-                    <td className="px-4 py-2">{p.episodes}</td>
-                    <td className="px-4 py-2">{p.train_frac}</td>
-                    <td className="px-4 py-2 text-xs text-zinc-500">{new Date(p.created_at).toLocaleString()}</td>
-                  </tr>
-                ))}
+                {policies.map((p) => {
+                  const evaluation = p.evaluation;
+                  const weightsOpen = expandedHistoryWeights === p.policy_id;
+                  const tradesOpen = expandedHistoryTrades === p.policy_id;
+                  const trades = tradeLogs[p.eval_run_id];
+                  return (
+                    <>
+                      <tr key={p.policy_id} className="border-t border-zinc-100 dark:border-zinc-800">
+                        <td className="px-4 py-2">{p.pair} · {p.interval}</td>
+                        <td className="px-4 py-2">{p.episodes}</td>
+                        <td className="px-4 py-2">{p.train_frac}</td>
+                        <td className="px-4 py-2">{evaluation?.hit_rate_pct != null ? `${evaluation.hit_rate_pct}%` : "—"}</td>
+                        <td className={`px-4 py-2 ${evaluation?.expectancy_pct != null && evaluation.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                          {evaluation?.expectancy_pct != null ? `${evaluation.expectancy_pct >= 0 ? "+" : ""}${evaluation.expectancy_pct}%` : "—"}
+                        </td>
+                        <td className="px-4 py-2 text-xs text-zinc-500">{new Date(p.created_at).toLocaleString()}</td>
+                        <td className="px-4 py-2 text-xs whitespace-nowrap">
+                          <button
+                            onClick={() => setExpandedHistoryWeights(weightsOpen ? null : p.policy_id)}
+                            className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
+                          >
+                            {weightsOpen ? "Hide" : "Show"} weights
+                          </button>
+                          {" · "}
+                          <button
+                            onClick={() => handleShowTrades(p)}
+                            className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
+                          >
+                            {tradesOpen ? "Hide" : "Show"} trades
+                          </button>
+                        </td>
+                      </tr>
+                      {weightsOpen && (
+                        <tr key={`${p.policy_id}-weights`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
+                          <td colSpan={7} className="px-4 py-2">
+                            <WeightsTable policy={p} />
+                          </td>
+                        </tr>
+                      )}
+                      {tradesOpen && (
+                        <tr key={`${p.policy_id}-trades`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
+                          <td colSpan={7} className="px-4 py-2">
+                            {tradeLogsLoading === p.eval_run_id && <p className="text-xs text-zinc-500">Loading…</p>}
+                            {trades && trades.length === 0 && <p className="text-xs text-zinc-500">No test-slice trades (all HOLD).</p>}
+                            {trades && trades.length > 0 && (
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-left text-xs">
+                                  <thead className="text-zinc-500 dark:text-zinc-400">
+                                    <tr>
+                                      <th className="px-2 py-1">Direction</th>
+                                      <th className="px-2 py-1">Entry</th>
+                                      <th className="px-2 py-1">Outcome</th>
+                                      <th className="px-2 py-1">Move</th>
+                                      <th className="px-2 py-1">Status</th>
+                                      <th className="px-2 py-1">When</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {trades.map((t, idx) => (
+                                      <tr key={t._id ?? idx} className="border-t border-zinc-200 dark:border-zinc-700">
+                                        <td className={`px-2 py-1 font-medium ${t.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                                          {t.direction}
+                                        </td>
+                                        <td className="px-2 py-1 font-mono">{t.price_at_signal.toFixed(5)}</td>
+                                        <td className="px-2 py-1 font-mono">{t.outcome_price != null ? t.outcome_price.toFixed(5) : "—"}</td>
+                                        <td className={`px-2 py-1 ${t.outcome_pct_move != null && t.outcome_pct_move >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                                          {t.outcome_pct_move != null ? `${t.outcome_pct_move >= 0 ? "+" : ""}${t.outcome_pct_move.toFixed(4)}%` : "—"}
+                                        </td>
+                                        <td className="px-2 py-1"><StatusBadge status={t.status} /></td>
+                                        <td className="px-2 py-1 text-zinc-500">{new Date(t.timestamp).toLocaleString()}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </>
+                  );
+                })}
               </tbody>
             </table>
           </div>
