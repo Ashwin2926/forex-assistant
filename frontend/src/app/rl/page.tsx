@@ -753,20 +753,33 @@ export default function RLPage() {
 }
 
 // Per-trade "confidence" -- a softmax over the stored q_values, read at the chosen action.
-// Q-values aren't probabilities (they're expected log-growth, can be any sign/magnitude), but
-// softmax is the standard, defensible way to turn "how much better did the agent think this
-// action was than the alternatives" into a 0-100% figure without retraining or changing what
-// gets stored -- purely a display-time transform over data every RLSignal already has.
-// Numerically stable (subtracts the max before exponentiating). Returns null if qValues is
-// missing or doesn't contain the chosen action (e.g. a pre-v2 signal using the old BUY/SELL
-// action names against q_values that were never restructured to match).
+// Q-values aren't probabilities (they're expected log-growth per trade, a reward scale that's
+// naturally tiny -- real observed values sit around +/-0.001 to 0.005), so a PLAIN softmax on
+// the raw values is useless: exp(0.002) vs exp(0.0005) are within a fraction of a percent of
+// each other regardless of which action actually "won" by a meaningful margin, which is
+// exactly why every trade was showing ~20% (1/5 actions, i.e. indistinguishable-from-uniform).
+// Z-score normalizing the q-values first (mean 0, unit variance) before softmax fixes this --
+// it's the *relative* spread between actions in units of their own standard deviation that
+// should drive confidence, not their absolute tiny scale. If every action is genuinely tied
+// (std ~0, real if a policy's weights haven't diverged from init yet), this correctly reports
+// a plain 1/n uniform split instead of blowing up dividing by ~zero.
+// Returns null if qValues is missing or doesn't contain the chosen action (e.g. a pre-v2
+// signal using the old BUY/SELL action names against q_values that were never restructured).
 function actionConfidence(qValues: Record<string, number> | null | undefined, action: string | null | undefined): number | null {
   if (!qValues || !action || !(action in qValues)) return null;
   const entries = Object.values(qValues);
-  const max = Math.max(...entries);
-  const exps = entries.map((v) => Math.exp(v - max));
+  const n = entries.length;
+  if (n === 0) return null;
+  const mean = entries.reduce((a, b) => a + b, 0) / n;
+  const variance = entries.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
+  const std = Math.sqrt(variance);
+  if (std < 1e-9) return 100 / n; // genuinely tied -- report the honest uniform split
+  const scaled = entries.map((v) => (v - mean) / std);
+  const max = Math.max(...scaled);
+  const exps = scaled.map((v) => Math.exp(v - max));
   const sumExp = exps.reduce((a, b) => a + b, 0);
-  const chosenExp = Math.exp(qValues[action] - max);
+  const chosenScaled = (qValues[action] - mean) / std;
+  const chosenExp = Math.exp(chosenScaled - max);
   return sumExp > 0 ? (chosenExp / sumExp) * 100 : null;
 }
 
