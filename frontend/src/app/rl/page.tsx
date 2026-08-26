@@ -253,6 +253,12 @@ export default function RLPage() {
                 {overallAccuracy.total_hits}/{overallAccuracy.total_resolved} resolved live trades
                 {" "}(hit/miss/expired, every pair &amp; interval combined)
               </p>
+              {overallAccuracy.total_superseded > 0 && (
+                <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
+                  +{overallAccuracy.total_superseded} superseded (the agent changed its mind
+                  before these resolved — not counted above)
+                </p>
+              )}
             </>
           )}
         </div>

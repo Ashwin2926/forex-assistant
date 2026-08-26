@@ -1008,16 +1008,23 @@ async def list_rl_policies(pair: str | None = None, interval: str | None = None,
     return docs
 
 
-async def _expire_stale_rl_signal(pending: dict, current_price: float) -> None:
+async def _supersede_pending_rl_signal(pending: dict, current_price: float) -> None:
     """
-    Marks a pending RL signal expired because the policy's live view has moved on (a newer
-    decision at the same pair/interval disagrees with it), rather than leaving it to resolve
-    naturally against label_outcome's max_lookforward window (up to ~20 hours at 1h). This
-    project treats "pending" as "still the agent's current live view" for RL signals
+    Marks a pending RL signal "superseded" because the policy's live view has moved on (a
+    newer decision at the same pair/interval disagrees with it), rather than leaving it to
+    resolve naturally against label_outcome's max_lookforward window (up to ~20 hours at 1h).
+    This project treats "pending" as "still the agent's current live view" for RL signals
     specifically, since they're meant to be traded manually and soon -- a stale one hanging
     around for most of a day isn't a real trade opportunity anymore. The record is UPDATED,
     never deleted -- same "keep history, don't erase it" convention as every other status
-    transition in this project (hit/miss/expired all go through update_one, not delete_one).
+    transition in this project.
+
+    Deliberately a status distinct from "expired" (see RLSignal.status's docstring) -- this
+    was originally folded into "expired" and it quietly wrecked GET /rl/accuracy: a policy
+    that changes its mind often (most likely on the faster, less-converged 5min/15min
+    intervals) superseded the large majority of its own signals well before label_outcome
+    ever got a chance to judge them, making the agent look far less accurate than its actual
+    resolved (hit/miss/genuinely-expired) trades show.
     """
     pct_move = ((current_price - pending["entry_price"]) / pending["entry_price"]) * 100
     if pending["direction"] == "SELL":
@@ -1026,7 +1033,7 @@ async def _expire_stale_rl_signal(pending: dict, current_price: float) -> None:
     await rl_signals_collection.update_one(
         {"_id": pending["_id"]},
         {"$set": {
-            "status": "expired",
+            "status": "superseded",
             "outcome_price": round(current_price, 5),
             "outcome_timestamp": datetime.utcnow(),
             "outcome_pct_move": round(pct_move, 5),
@@ -1050,8 +1057,8 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
 
     If a different decision now disagrees with whatever RL signal is still "pending" for this
     pair/interval (new direction, new action is HOLD, or price has moved enough that the
-    entry itself changed), that old pending signal is marked "expired" immediately (see
-    _expire_stale_rl_signal) instead of being left to resolve on its own hours later --
+    entry itself changed), that old pending signal is marked "superseded" immediately (see
+    _supersede_pending_rl_signal) instead of being left to resolve on its own hours later --
     "pending" should mean "still the agent's current live view," not "might still resolve
     eventually." An exact repeat of the still-pending signal (same direction/entry/target) is
     left alone and returned as-is (same de-dupe idea create_consensus_signal already uses,
@@ -1101,7 +1108,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
 
     if action == "HOLD":
         if pending is not None:
-            await _expire_stale_rl_signal(pending, current_price)
+            await _supersede_pending_rl_signal(pending, current_price)
         return {"signal": None, "q_values": q_values}
 
     direction, tier = action.split("_")
@@ -1136,7 +1143,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     if pending is not None:
         # The agent's view has moved on (different direction or entry) -- the old signal is
         # no longer what the agent would trade right now.
-        await _expire_stale_rl_signal(pending, current_price)
+        await _supersede_pending_rl_signal(pending, current_price)
 
     await rl_signals_collection.insert_one(rl_signal.model_dump())
     return {"signal": rl_signal, "q_values": q_values}
@@ -1159,6 +1166,13 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
     shape as GET /signals/accuracy, over rl_signals_collection instead. source="live" only
     (excludes the per-training test-slice trades in backtest_signals_collection, which are a
     different, already-visible thing via Training history's "Show trades").
+
+    hit/miss/expired only -- "superseded" signals (the agent changed its mind before
+    label_outcome ever got to judge one, see RLSignal.status's docstring) are deliberately
+    excluded from the hit-rate denominator, since they're not a real win/loss/timeout. Their
+    count is still surfaced separately (total_superseded) so it's visible why the total
+    signal count and total_resolved can differ a lot, especially on faster/less-converged
+    intervals whose policy changes its mind often.
     """
     query: dict = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
     if pair:
@@ -1177,6 +1191,9 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
     total_misses = await rl_signals_collection.count_documents({**query, "status": "miss"})
     total_expired = await rl_signals_collection.count_documents({**query, "status": "expired"})
     total_resolved = total_hits + total_misses + total_expired
+    total_superseded = await rl_signals_collection.count_documents(
+        {**{k: v for k, v in query.items() if k != "status"}, "status": "superseded"}
+    )
 
     return {
         "pair": pair,
@@ -1191,6 +1208,7 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
         "total_misses": total_misses,
         "total_expired": total_expired,
         "total_hit_rate_pct": round(total_hits / total_resolved * 100, 1) if total_resolved else None,
+        "total_superseded": total_superseded,
     }
 
 

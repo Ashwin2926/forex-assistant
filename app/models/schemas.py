@@ -291,7 +291,16 @@ class RLSignal(BaseModel):
     balance_at_signal: float
     position_size_units: float
 
-    status: Literal["pending", "hit", "miss", "expired"] = "pending"
+    # "superseded" is distinct from "expired": expired means label_outcome walked the full
+    # max_lookforward window and neither target nor stop was touched (a real "the market
+    # didn't move enough" outcome). superseded means a later decision at the same
+    # pair/interval disagreed with this one before it ever got that chance (see
+    # _supersede_pending_rl_signal in main.py) -- not a real win/loss/timeout, just the
+    # agent changing its mind. Conflating the two into one "expired" bucket was making
+    # GET /rl/accuracy's hit rate look far worse than the agent's actual resolved
+    # performance, since a fast-moving policy on a volatile interval can supersede most of
+    # its own signals well before label_outcome would ever have judged them.
+    status: Literal["pending", "hit", "miss", "expired", "superseded"] = "pending"
     outcome_price: Optional[float] = None
     outcome_timestamp: Optional[datetime] = None
     outcome_pct_move: Optional[float] = None

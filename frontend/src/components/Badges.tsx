@@ -21,6 +21,9 @@ const statusStyles: Record<SignalStatus, string> = {
   hit: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
   miss: "bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300",
   expired: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
+  // RL-only: the agent changed its mind before this signal ever resolved naturally -- distinct
+  // from expired (a real timeout) so it doesn't visually read as a loss.
+  superseded: "bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300",
 };
 
 export function StatusBadge({ status }: { status: SignalStatus }) {

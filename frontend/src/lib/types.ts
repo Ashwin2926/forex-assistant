@@ -2,7 +2,7 @@
 
 export type Direction = "BUY" | "SELL" | "HOLD";
 export type Profile = "intraday" | "swing";
-export type SignalStatus = "pending" | "hit" | "miss" | "expired";
+export type SignalStatus = "pending" | "hit" | "miss" | "expired" | "superseded";
 export type SignalSource = "live" | "backtest";
 
 export interface SignalReason {
@@ -324,6 +324,9 @@ export interface RLAccuracy {
   total_misses: number;
   total_expired: number;
   total_hit_rate_pct: number | null;
+  // Signals the agent superseded (changed its mind) before label_outcome ever judged them --
+  // not counted toward hit_rate_pct/total_hit_rate_pct, surfaced separately for transparency.
+  total_superseded: number;
 }
 
 export interface SignalAccuracy {
