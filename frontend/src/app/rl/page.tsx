@@ -186,10 +186,13 @@ export default function RLPage() {
     if (!trainAllJob) return;
     setCancelling(true);
     try {
-      await api.cancelTrainAllRLJob(trainAllJob.job_id);
-      // Don't setTrainAllJob from the cancel response directly -- it hasn't stopped yet
-      // (cancel_requested just got set), the next poll tick will show status flip once the
-      // in-flight combo finishes and the loop actually exits.
+      // Cancel takes effect immediately server-side now (not just a flag the loop picks up
+      // between combos -- a hung combo would never come back around to check it), so the
+      // response already reflects status: "cancelled". No need to wait for the next poll.
+      const job = await api.cancelTrainAllRLJob(trainAllJob.job_id);
+      trainAllPollGuard.current = null; // stop any in-flight poll loop from overwriting this
+      setTrainAllJob(job);
+      await loadPolicies();
     } catch (e) {
       setTrainAllStartError(e instanceof ApiError ? e.message : "Couldn't stop training.");
     } finally {
@@ -408,20 +411,14 @@ export default function RLPage() {
               {trainAllRunning && (
                 <button
                   onClick={handleCancelTrainAll}
-                  disabled={cancelling || trainAllJob?.cancel_requested}
+                  disabled={cancelling}
                   className="rounded-md border border-rose-300 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-800 dark:text-rose-300 dark:hover:bg-rose-950"
                 >
-                  {trainAllJob?.cancel_requested ? "Stopping…" : "Stop"}
+                  {cancelling ? "Stopping…" : "Stop"}
                 </button>
               )}
             </div>
           </div>
-          {trainAllJob?.cancel_requested && trainAllRunning && (
-            <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
-              Stopping after the pair/interval currently in progress finishes — already-trained
-              policies from this run are kept, not rolled back.
-            </p>
-          )}
           {trainAllStartError && (
             <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
               {trainAllStartError}

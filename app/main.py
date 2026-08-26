@@ -899,17 +899,20 @@ async def run_train_all_job(job_id: str, episodes: int, train_frac: float, start
     Checks cancel_requested before starting each combo (cheap, single-doc lookup) so
     POST /rl/train-all/{job_id}/cancel can stop it -- cooperative, not preemptive: a combo
     already in flight always finishes (train_rl_policy can't be interrupted mid-call without
-    much more complexity), so cancelling stops the NEXT one from starting, not the current one.
+    much more complexity) UNLESS it hangs outright (seen in practice: a single combo running
+    60+ minutes when the whole 20-combo job should take ~15-30), in which case this loop's own
+    "next combo" check never runs at all. POST .../cancel therefore also force-marks the job
+    cancelled immediately, not just requests it -- see that endpoint's docstring. Every write
+    here is filtered on {"job_id": job_id, "status": "running"} specifically so that if a
+    force-cancelled job's stuck combo eventually wakes up and finishes on its own, its
+    leftover result/completion writes become no-ops instead of silently resurrecting a job
+    the user already told to stop.
     """
     for pair in settings.pairs_list:
         for interval in RL_INTERVALS:
-            job_doc = await rl_train_jobs_collection.find_one({"job_id": job_id}, {"cancel_requested": 1})
-            if job_doc and job_doc.get("cancel_requested"):
-                await rl_train_jobs_collection.update_one(
-                    {"job_id": job_id},
-                    {"$set": {"status": "cancelled", "finished_at": datetime.utcnow()}},
-                )
-                return
+            job_doc = await rl_train_jobs_collection.find_one({"job_id": job_id}, {"status": 1})
+            if not job_doc or job_doc.get("status") != "running":
+                return  # already cancelled (cooperatively or forced) -- stop here
             try:
                 policy, eval_run = await _run_rl_training(
                     pair, interval, episodes, train_frac, max_lookforward=20, starting_balance=starting_balance,
@@ -924,11 +927,11 @@ async def run_train_all_job(job_id: str, episodes: int, train_frac: float, start
             except Exception as e:
                 cell = RLTrainAllCell(pair=pair, interval=interval, ok=False, error=str(e))
             await rl_train_jobs_collection.update_one(
-                {"job_id": job_id},
+                {"job_id": job_id, "status": "running"},
                 {"$push": {"results": cell.model_dump()}, "$inc": {"completed": 1}},
             )
     await rl_train_jobs_collection.update_one(
-        {"job_id": job_id},
+        {"job_id": job_id, "status": "running"},
         {"$set": {"status": "done", "finished_at": datetime.utcnow()}},
     )
 
@@ -974,16 +977,27 @@ async def get_train_all_job(job_id: str):
 @app.post("/rl/train-all/{job_id}/cancel")
 async def cancel_train_all_job(job_id: str):
     """
-    Requests that a running train-all job stop before starting its next pair/interval --
-    see run_train_all_job's cancel_requested check. Already-completed combos and their
-    trained policies are kept, not rolled back; only the remaining ones are skipped.
+    Immediately marks a running train-all job "cancelled" -- not just a request the loop
+    picks up between combos. Originally this only set cancel_requested and waited for
+    run_train_all_job's own between-combo check, but that's a no-op if the in-flight combo
+    hangs outright rather than just running long (seen in practice: a single pair/interval
+    stuck for 60+ minutes with the whole job normally taking ~15-30). Since a hung combo
+    means that background task's own coroutine will never come back around to check a flag,
+    this endpoint updates the job document directly instead of waiting for it to.
+
+    Already-completed combos and their trained policies are kept, not rolled back; only the
+    remaining ones are skipped. If the stuck combo eventually finishes on its own after this,
+    its leftover write is a no-op -- see run_train_all_job's status="running" write guard.
     """
     doc = await rl_train_jobs_collection.find_one({"job_id": job_id})
     if not doc:
         raise HTTPException(status_code=404, detail=f"No train-all job {job_id}.")
     if doc["status"] != "running":
         raise HTTPException(status_code=400, detail=f"Job {job_id} is already {doc['status']}, nothing to cancel.")
-    await rl_train_jobs_collection.update_one({"job_id": job_id}, {"$set": {"cancel_requested": True}})
+    await rl_train_jobs_collection.update_one(
+        {"job_id": job_id, "status": "running"},
+        {"$set": {"cancel_requested": True, "status": "cancelled", "finished_at": datetime.utcnow()}},
+    )
     doc = await rl_train_jobs_collection.find_one({"job_id": job_id})
     return RLTrainAllJob(**{k: v for k, v in doc.items() if k != "_id"})
 
