@@ -227,6 +227,10 @@ export const api = {
     return request<RLTrainAllJob | null>(`/rl/train-all-latest`);
   },
 
+  cancelTrainAllRLJob(jobId: string) {
+    return request<RLTrainAllJob>(`/rl/train-all/${jobId}/cancel`, { method: "POST" });
+  },
+
   listRLPolicies(params: { pair?: string; interval?: string; limit?: number } = {}) {
     const qs = new URLSearchParams();
     if (params.pair) qs.set("pair", params.pair);

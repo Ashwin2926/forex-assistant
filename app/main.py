@@ -895,9 +895,21 @@ async def run_train_all_job(job_id: str, episodes: int, train_frac: float, start
     combination sequentially (same set .github/workflows/keep-fresh.yml's cron trains once
     daily), writing progress to rl_train_jobs_collection after each combo so GET
     /rl/train-all/{job_id} always reflects real progress, not just "still running somewhere."
+
+    Checks cancel_requested before starting each combo (cheap, single-doc lookup) so
+    POST /rl/train-all/{job_id}/cancel can stop it -- cooperative, not preemptive: a combo
+    already in flight always finishes (train_rl_policy can't be interrupted mid-call without
+    much more complexity), so cancelling stops the NEXT one from starting, not the current one.
     """
     for pair in settings.pairs_list:
         for interval in RL_INTERVALS:
+            job_doc = await rl_train_jobs_collection.find_one({"job_id": job_id}, {"cancel_requested": 1})
+            if job_doc and job_doc.get("cancel_requested"):
+                await rl_train_jobs_collection.update_one(
+                    {"job_id": job_id},
+                    {"$set": {"status": "cancelled", "finished_at": datetime.utcnow()}},
+                )
+                return
             try:
                 policy, eval_run = await _run_rl_training(
                     pair, interval, episodes, train_frac, max_lookforward=20, starting_balance=starting_balance,
@@ -956,6 +968,23 @@ async def get_train_all_job(job_id: str):
     doc = await rl_train_jobs_collection.find_one({"job_id": job_id})
     if not doc:
         raise HTTPException(status_code=404, detail=f"No train-all job {job_id}.")
+    return RLTrainAllJob(**{k: v for k, v in doc.items() if k != "_id"})
+
+
+@app.post("/rl/train-all/{job_id}/cancel")
+async def cancel_train_all_job(job_id: str):
+    """
+    Requests that a running train-all job stop before starting its next pair/interval --
+    see run_train_all_job's cancel_requested check. Already-completed combos and their
+    trained policies are kept, not rolled back; only the remaining ones are skipped.
+    """
+    doc = await rl_train_jobs_collection.find_one({"job_id": job_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No train-all job {job_id}.")
+    if doc["status"] != "running":
+        raise HTTPException(status_code=400, detail=f"Job {job_id} is already {doc['status']}, nothing to cancel.")
+    await rl_train_jobs_collection.update_one({"job_id": job_id}, {"$set": {"cancel_requested": True}})
+    doc = await rl_train_jobs_collection.find_one({"job_id": job_id})
     return RLTrainAllJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 

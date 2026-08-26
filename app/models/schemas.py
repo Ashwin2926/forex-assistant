@@ -337,7 +337,7 @@ class RLTrainAllJob(BaseModel):
     .github/workflows/keep-fresh.yml's history note).
     """
     job_id: str
-    status: Literal["running", "done"]
+    status: Literal["running", "done", "cancelled"]
     created_at: datetime
     finished_at: Optional[datetime] = None
     episodes: int
@@ -346,6 +346,11 @@ class RLTrainAllJob(BaseModel):
     total: int
     completed: int = 0
     results: list[RLTrainAllCell] = []
+    # Set by POST /rl/train-all/{job_id}/cancel -- checked between combos (not mid-combo; a
+    # single train_rl_policy call can't be interrupted partway through without much more
+    # complexity, so cancelling stops it from STARTING the next pair/interval, worst case
+    # waiting out the one already in flight, ~40-100s).
+    cancel_requested: bool = False
 
 
 class PaperTrade(BaseModel):

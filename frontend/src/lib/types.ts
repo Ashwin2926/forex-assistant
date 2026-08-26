@@ -203,7 +203,7 @@ export interface RLTrainAllCell {
 // GET /rl/train-all/{job_id} instead of holding 20 sequential fetches open itself.
 export interface RLTrainAllJob {
   job_id: string;
-  status: "running" | "done";
+  status: "running" | "done" | "cancelled";
   created_at: string;
   finished_at?: string | null;
   episodes: number;
@@ -212,6 +212,7 @@ export interface RLTrainAllJob {
   total: number;
   completed: number;
   results: RLTrainAllCell[];
+  cancel_requested: boolean;
 }
 
 export interface RLSignal {

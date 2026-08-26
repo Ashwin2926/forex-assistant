@@ -180,6 +180,23 @@ export default function RLPage() {
     }
   }
 
+  const [cancelling, setCancelling] = useState(false);
+
+  async function handleCancelTrainAll() {
+    if (!trainAllJob) return;
+    setCancelling(true);
+    try {
+      await api.cancelTrainAllRLJob(trainAllJob.job_id);
+      // Don't setTrainAllJob from the cancel response directly -- it hasn't stopped yet
+      // (cancel_requested just got set), the next poll tick will show status flip once the
+      // in-flight combo finishes and the loop actually exits.
+    } catch (e) {
+      setTrainAllStartError(e instanceof ApiError ? e.message : "Couldn't stop training.");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   const trainAllRunning = trainAllJob?.status === "running";
 
   // Live "confidence" while a Train all job runs -- test-slice hit rate averaged across the
@@ -380,10 +397,31 @@ export default function RLPage() {
               server-side (~15 min total) once started, so it&apos;s safe to close this tab —
               reopening the page picks the same run back up.
             </p>
-            <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">
-              {trainAllRunning ? `Training ${trainAllJob?.completed ?? 0}/${trainAllJob?.total ?? 20}…` : "Train all"}
-            </button>
+            <div className="flex shrink-0 items-center gap-2">
+              <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">
+                {trainAllRunning
+                  ? `Training ${trainAllJob?.completed ?? 0}/${trainAllJob?.total ?? 20}…`
+                  : trainAllJob?.status === "cancelled"
+                    ? "Train all (last run stopped)"
+                    : "Train all"}
+              </button>
+              {trainAllRunning && (
+                <button
+                  onClick={handleCancelTrainAll}
+                  disabled={cancelling || trainAllJob?.cancel_requested}
+                  className="rounded-md border border-rose-300 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-800 dark:text-rose-300 dark:hover:bg-rose-950"
+                >
+                  {trainAllJob?.cancel_requested ? "Stopping…" : "Stop"}
+                </button>
+              )}
+            </div>
           </div>
+          {trainAllJob?.cancel_requested && trainAllRunning && (
+            <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
+              Stopping after the pair/interval currently in progress finishes — already-trained
+              policies from this run are kept, not rolled back.
+            </p>
+          )}
           {trainAllStartError && (
             <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
               {trainAllStartError}
