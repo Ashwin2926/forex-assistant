@@ -309,6 +309,23 @@ export interface PaperTradeResult {
   note?: string;
 }
 
+export interface RLAccuracy {
+  pair: string | null;
+  interval: string | null;
+  // Rolling window, capped at the request's `limit` (default 100) -- plateaus there, not a running total.
+  sample_size: number;
+  hits: number;
+  misses: number;
+  expired: number;
+  hit_rate_pct: number | null;
+  // Real uncapped counts/rate across every resolved live RL signal matching the same filter.
+  total_resolved: number;
+  total_hits: number;
+  total_misses: number;
+  total_expired: number;
+  total_hit_rate_pct: number | null;
+}
+
 export interface SignalAccuracy {
   pair: string | null;
   profile: Profile | null;

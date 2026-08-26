@@ -1152,6 +1152,48 @@ async def list_rl_signals(pair: str | None = None, limit: int = 50):
     return docs
 
 
+@app.get("/rl/accuracy")
+async def rl_accuracy(pair: str | None = None, interval: str | None = None, limit: int = 100):
+    """
+    Overall live-trading accuracy for the RL agent -- same rolling-window-plus-real-total
+    shape as GET /signals/accuracy, over rl_signals_collection instead. source="live" only
+    (excludes the per-training test-slice trades in backtest_signals_collection, which are a
+    different, already-visible thing via Training history's "Show trades").
+    """
+    query: dict = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    if pair:
+        query["pair"] = pair
+    if interval:
+        query["interval"] = interval
+    cursor = rl_signals_collection.find(query).sort("timestamp", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+
+    hits = sum(1 for d in docs if d["status"] == "hit")
+    misses = sum(1 for d in docs if d["status"] == "miss")
+    expired = sum(1 for d in docs if d["status"] == "expired")
+    total = len(docs)
+
+    total_hits = await rl_signals_collection.count_documents({**query, "status": "hit"})
+    total_misses = await rl_signals_collection.count_documents({**query, "status": "miss"})
+    total_expired = await rl_signals_collection.count_documents({**query, "status": "expired"})
+    total_resolved = total_hits + total_misses + total_expired
+
+    return {
+        "pair": pair,
+        "interval": interval,
+        "sample_size": total,
+        "hits": hits,
+        "misses": misses,
+        "expired": expired,
+        "hit_rate_pct": round(hits / total * 100, 1) if total else None,
+        "total_resolved": total_resolved,
+        "total_hits": total_hits,
+        "total_misses": total_misses,
+        "total_expired": total_expired,
+        "total_hit_rate_pct": round(total_hits / total_resolved * 100, 1) if total_resolved else None,
+    }
+
+
 @app.post("/rl/score")
 async def score_rl_signals(max_lookforward: int = 20):
     """

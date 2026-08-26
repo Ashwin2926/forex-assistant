@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
 // How often to poll GET /rl/train-all/{job_id} while a batch run is in progress -- the job
@@ -35,6 +35,8 @@ export default function RLPage() {
 
   const [recentSignals, setRecentSignals] = useState<RLSignal[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
+
+  const [overallAccuracy, setOverallAccuracy] = useState<RLAccuracy | null>(null);
 
   const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
   const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
@@ -72,6 +74,14 @@ export default function RLPage() {
     }
   }
 
+  async function loadOverallAccuracy() {
+    try {
+      setOverallAccuracy(await api.getRLAccuracy({ limit: 200 }));
+    } catch {
+      // non-critical section
+    }
+  }
+
   // Trains sequentially server-side now (see app/main.py's run_train_all_job) -- this just
   // polls GET /rl/train-all/{job_id} until status flips to "done". Recurses via setTimeout
   // rather than setInterval so a slow poll response can't overlap the next one.
@@ -95,6 +105,7 @@ export default function RLPage() {
   useEffect(() => {
     loadPolicies();
     loadRecentSignals();
+    loadOverallAccuracy();
     // Rehydrate an in-progress "Train all" job on load/reload -- the job itself lives
     // server-side now, so a reload should resume watching it, not lose track of it.
     api.getLatestTrainAllRLJob().then((job) => {
@@ -133,6 +144,20 @@ export default function RLPage() {
   }
 
   const trainAllRunning = trainAllJob?.status === "running";
+
+  // Live "confidence" while a Train all job runs -- test-slice hit rate averaged across the
+  // pair/intervals completed so far, weighted by each one's own trade count (directional_signals)
+  // rather than a flat per-combo average, so a combo with 300 test trades isn't drowned out by
+  // one with 5. hit_rate_pct is itself hits/directional_signals*100, so hits is recoverable.
+  const trainingConfidence = (() => {
+    const cells = (trainAllJob?.results ?? []).filter(
+      (c) => c.ok && c.hit_rate_pct != null && c.directional_signals != null && c.directional_signals > 0,
+    );
+    const totalTrades = cells.reduce((sum, c) => sum + (c.directional_signals ?? 0), 0);
+    if (totalTrades === 0) return null;
+    const totalHits = cells.reduce((sum, c) => sum + (c.hit_rate_pct! / 100) * c.directional_signals!, 0);
+    return { pct: (totalHits / totalTrades) * 100, trades: totalTrades, combosDone: cells.length };
+  })();
 
   async function handleGenerateAll() {
     setGenerateAllRunning(true);
@@ -192,6 +217,45 @@ export default function RLPage() {
           so signals are sized against your real balance (below) and traded manually on
           whatever broker you actually have.
         </p>
+      </section>
+
+      <section className="flex flex-wrap gap-3">
+        <div className="min-w-[220px] flex-1 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+          <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
+            AI confidence {trainAllRunning ? "(training live)" : "(last training run)"}
+          </p>
+          {trainingConfidence == null ? (
+            <p className="mt-1 text-sm text-zinc-400">
+              {trainAllRunning ? "Waiting on the first pair/interval to finish…" : "No training run yet — click \"Train all\" below."}
+            </p>
+          ) : (
+            <>
+              <p className={`mt-1 text-2xl font-semibold ${trainingConfidence.pct >= 40 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                {trainingConfidence.pct.toFixed(1)}%
+              </p>
+              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                test-slice hit rate across {trainingConfidence.trades} trades
+                {" "}({trainingConfidence.combosDone}/{trainAllJob?.total ?? 20} pair/intervals{trainAllRunning ? " so far" : ""})
+              </p>
+            </>
+          )}
+        </div>
+        <div className="min-w-[220px] flex-1 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+          <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Overall trading accuracy (live signals)</p>
+          {!overallAccuracy || overallAccuracy.total_resolved === 0 ? (
+            <p className="mt-1 text-sm text-zinc-400">No resolved live RL signals yet.</p>
+          ) : (
+            <>
+              <p className={`mt-1 text-2xl font-semibold ${(overallAccuracy.total_hit_rate_pct ?? 0) >= 40 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                {overallAccuracy.total_hit_rate_pct}%
+              </p>
+              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                {overallAccuracy.total_hits}/{overallAccuracy.total_resolved} resolved live trades
+                {" "}(hit/miss/expired, every pair &amp; interval combined)
+              </p>
+            </>
+          )}
+        </div>
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">

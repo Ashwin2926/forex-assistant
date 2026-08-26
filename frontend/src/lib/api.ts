@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -245,6 +245,15 @@ export const api = {
       `/rl/signal/${interval}?${qs.toString()}`,
       { method: "POST" },
     );
+  },
+
+  getRLAccuracy(params: { pair?: string; interval?: string; limit?: number } = {}) {
+    const qs = new URLSearchParams();
+    if (params.pair) qs.set("pair", params.pair);
+    if (params.interval) qs.set("interval", params.interval);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const query = qs.toString();
+    return request<RLAccuracy>(`/rl/accuracy${query ? `?${query}` : ""}`);
   },
 
   listRLSignals(params: { pair?: string; limit?: number } = {}) {
