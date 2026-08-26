@@ -423,6 +423,7 @@ export default function RLPage() {
                     <th className="px-3 py-1.5">Pair</th>
                     <th className="px-3 py-1.5">Interval</th>
                     <th className="px-3 py-1.5">Direction</th>
+                    <th className="px-3 py-1.5">Confidence</th>
                     <th className="px-3 py-1.5">Entry</th>
                     <th className="px-3 py-1.5">Exit</th>
                     <th className="px-3 py-1.5">Size</th>
@@ -435,6 +436,7 @@ export default function RLPage() {
                     const key = `${cell.pair}-${cell.interval}`;
                     const s = cell.signal;
                     const qOpen = expandedQValues === key;
+                    const confidence = s ? actionConfidence(cell.qValues, s.size_tier ? `${s.direction}_${s.size_tier}` : s.direction) : null;
                     return (
                       <>
                         <tr
@@ -444,16 +446,17 @@ export default function RLPage() {
                           <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
                           <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
                           {cell.error ? (
-                            <td className="px-3 py-1.5 text-zinc-400" colSpan={6}>{cell.error}</td>
+                            <td className="px-3 py-1.5 text-zinc-400" colSpan={7}>{cell.error}</td>
                           ) : (
                             <>
                               {!s ? (
-                                <td className="px-3 py-1.5 text-zinc-400" colSpan={4}>HOLD</td>
+                                <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>HOLD</td>
                               ) : (
                                 <>
                                   <td className={`px-3 py-1.5 font-semibold ${s.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                                     {s.direction}
                                   </td>
+                                  <td className="px-3 py-1.5 font-mono">{confidence != null ? `${confidence.toFixed(0)}%` : "—"}</td>
                                   <td className="px-3 py-1.5">{s.entry_price.toFixed(5)}</td>
                                   <td className="px-3 py-1.5">{s.target_price.toFixed(5)}</td>
                                   <td className={`px-3 py-1.5 font-mono ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>
@@ -477,7 +480,7 @@ export default function RLPage() {
                         </tr>
                         {qOpen && cell.qValues && (
                           <tr key={`${key}-q`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
-                            <td colSpan={8} className="px-3 py-2">
+                            <td colSpan={9} className="px-3 py-2">
                               <QValueRow qValues={cell.qValues} />
                             </td>
                           </tr>
@@ -505,6 +508,7 @@ export default function RLPage() {
                 <tr>
                   <th className="px-4 py-2">Pair</th>
                   <th className="px-4 py-2">Direction</th>
+                  <th className="px-4 py-2">Confidence</th>
                   <th className="px-4 py-2">Entry</th>
                   <th className="px-4 py-2">Exit</th>
                   <th className="px-4 py-2">Stop</th>
@@ -516,12 +520,15 @@ export default function RLPage() {
                 </tr>
               </thead>
               <tbody>
-                {recentSignals.map((s) => (
+                {recentSignals.map((s) => {
+                  const confidence = actionConfidence(s.q_values, s.size_tier ? `${s.direction}_${s.size_tier}` : s.direction);
+                  return (
                   <tr key={s._id ?? `${s.pair}-${s.timestamp}`} className="border-t border-zinc-100 dark:border-zinc-800">
                     <td className="px-4 py-2">{s.pair} · {s.interval}</td>
                     <td className={`px-4 py-2 font-medium ${s.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                       {s.direction}
                     </td>
+                    <td className="px-4 py-2 font-mono">{confidence != null ? `${confidence.toFixed(0)}%` : "—"}</td>
                     <td className="px-4 py-2">{s.entry_price.toFixed(5)}</td>
                     <td className="px-4 py-2">{s.target_price.toFixed(5)}</td>
                     <td className="px-4 py-2">{s.stop_price.toFixed(5)}</td>
@@ -531,7 +538,8 @@ export default function RLPage() {
                     <td className="px-4 py-2"><StatusBadge status={s.status} /></td>
                     <td className="px-4 py-2 text-xs text-zinc-500">{new Date(s.timestamp).toLocaleString()}</td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -660,6 +668,24 @@ export default function RLPage() {
       </section>
     </div>
   );
+}
+
+// Per-trade "confidence" -- a softmax over the stored q_values, read at the chosen action.
+// Q-values aren't probabilities (they're expected log-growth, can be any sign/magnitude), but
+// softmax is the standard, defensible way to turn "how much better did the agent think this
+// action was than the alternatives" into a 0-100% figure without retraining or changing what
+// gets stored -- purely a display-time transform over data every RLSignal already has.
+// Numerically stable (subtracts the max before exponentiating). Returns null if qValues is
+// missing or doesn't contain the chosen action (e.g. a pre-v2 signal using the old BUY/SELL
+// action names against q_values that were never restructured to match).
+function actionConfidence(qValues: Record<string, number> | null | undefined, action: string | null | undefined): number | null {
+  if (!qValues || !action || !(action in qValues)) return null;
+  const entries = Object.values(qValues);
+  const max = Math.max(...entries);
+  const exps = entries.map((v) => Math.exp(v - max));
+  const sumExp = exps.reduce((a, b) => a + b, 0);
+  const chosenExp = Math.exp(qValues[action] - max);
+  return sumExp > 0 ? (chosenExp / sumExp) * 100 : null;
 }
 
 // Covers both the current 5-action space and pre-v2 policies (plain BUY/SELL) still in the DB.
