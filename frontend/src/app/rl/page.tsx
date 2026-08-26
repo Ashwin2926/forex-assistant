@@ -18,6 +18,34 @@ interface GenerateAllCell {
   error?: string;
 }
 
+type Trend = "up" | "down" | null;
+
+// Tracks whether a percentage is currently rising or falling compared to its own last value
+// -- not a multi-tick history, just "did it move since the last time this changed." Used by
+// both confidence widgets: training confidence updates on every poll while a job runs,
+// overall accuracy updates on the 60s refetch above.
+function useTrend(value: number | null): Trend {
+  const prevRef = useRef<number | null>(null);
+  const [trend, setTrend] = useState<Trend>(null);
+  useEffect(() => {
+    if (value == null) return;
+    if (prevRef.current != null && value !== prevRef.current) {
+      setTrend(value > prevRef.current ? "up" : "down");
+    }
+    prevRef.current = value;
+  }, [value]);
+  return trend;
+}
+
+function TrendArrow({ trend }: { trend: Trend }) {
+  if (!trend) return null;
+  return trend === "up" ? (
+    <span className="ml-1 align-middle text-base text-emerald-600 dark:text-emerald-400" title="Up since the last update">▲</span>
+  ) : (
+    <span className="ml-1 align-middle text-base text-rose-600 dark:text-rose-400" title="Down since the last update">▼</span>
+  );
+}
+
 export default function RLPage() {
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
@@ -118,6 +146,15 @@ export default function RLPage() {
     }).catch(() => {});
   }, []);
 
+  // Overall accuracy only changes as live signals resolve (roughly the cron's own cadence),
+  // not on every render -- refetch periodically so the trend arrow next to it (useTrend
+  // below) has something real to compare against over the course of a session, not just a
+  // single static snapshot from page load.
+  useEffect(() => {
+    const id = setInterval(loadOverallAccuracy, 60_000);
+    return () => clearInterval(id);
+  }, []);
+
   async function handleTrain() {
     setTraining(true);
     setTrainError(null);
@@ -158,6 +195,8 @@ export default function RLPage() {
     const totalHits = cells.reduce((sum, c) => sum + (c.hit_rate_pct! / 100) * c.directional_signals!, 0);
     return { pct: (totalHits / totalTrades) * 100, trades: totalTrades, combosDone: cells.length };
   })();
+  const trainingConfidenceTrend = useTrend(trainingConfidence?.pct ?? null);
+  const overallAccuracyTrend = useTrend(overallAccuracy?.total_hit_rate_pct ?? null);
 
   async function handleGenerateAll() {
     setGenerateAllRunning(true);
@@ -232,6 +271,7 @@ export default function RLPage() {
             <>
               <p className={`mt-1 text-2xl font-semibold ${trainingConfidence.pct >= 40 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                 {trainingConfidence.pct.toFixed(1)}%
+                <TrendArrow trend={trainingConfidenceTrend} />
               </p>
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
                 test-slice hit rate across {trainingConfidence.trades} trades
@@ -248,6 +288,7 @@ export default function RLPage() {
             <>
               <p className={`mt-1 text-2xl font-semibold ${(overallAccuracy.total_hit_rate_pct ?? 0) >= 40 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                 {overallAccuracy.total_hit_rate_pct}%
+                <TrendArrow trend={overallAccuracyTrend} />
               </p>
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
                 {overallAccuracy.total_hits}/{overallAccuracy.total_resolved} resolved live trades
