@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLMemorySummary, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -245,7 +245,9 @@ export const api = {
     // breaks Starlette's routing even when percent-encoded.
     const qs = new URLSearchParams({ pair });
     if (balance !== undefined) qs.set("balance", String(balance));
-    return request<{ signal: RLSignal | null; q_values: Record<string, number> }>(
+    // memory is absent when the action was HOLD (no trade, nothing to look up memory against)
+    // -- see create_rl_signal's early return in app/main.py.
+    return request<{ signal: RLSignal | null; q_values: Record<string, number>; memory?: RLMemorySummary }>(
       `/rl/signal/${interval}?${qs.toString()}`,
       { method: "POST" },
     );

@@ -217,6 +217,9 @@ export interface RLTrainAllJob {
 
 export interface RLSignal {
   _id?: string;
+  // Absent on any signal generated before this field existed -- GET /rl/signals returns raw
+  // Mongo docs, not validated through the RLSignal Pydantic model.
+  signal_id?: string;
   pair: string;
   interval: string;
   timestamp: string;
@@ -226,6 +229,9 @@ export interface RLSignal {
   stop_price: number;
   q_values: Record<string, number>;
   policy_id: string;
+  // The state vector this decision was made from -- see app/services/case_memory.py. Absent
+  // on pre-existing signals the same way size_tier etc. can be, below.
+  state?: number[];
   // What the agent chose to risk, and against what balance -- absent on RLSignal documents
   // created before sizing existed (GET /rl/signals returns raw Mongo docs, not validated
   // through the RLSignal Pydantic model, so an old doc really can be missing these keys).
@@ -239,6 +245,25 @@ export interface RLSignal {
   outcome_pct_move?: number | null;
   candles_to_outcome?: number | null;
   source: SignalSource;
+}
+
+// "Have we seen a state like this before, and how did it turn out" -- a k-nearest-neighbor
+// lookup against past resolved RLSignal state vectors (app/services/case_memory.py),
+// returned alongside every POST /rl/signal/{interval} response. hit_rate_pct excludes
+// "expired" neighbors from its denominator (same reasoning as RLAccuracy.directional_hit_rate_pct)
+// -- null when there aren't enough resolved cases yet, not a fabricated number.
+export interface RLMemorySummary {
+  cases_found: number;
+  hit_rate_pct: number | null;
+  avg_pct_move: number | null;
+  expired_pct: number | null;
+  avg_distance: number | null;
+  nearest: Array<{
+    signal_id?: string;
+    status?: SignalStatus;
+    outcome_pct_move?: number | null;
+    distance: number;
+  }>;
 }
 
 // Signal's normal fields plus the ML classifier's advisory hit probability -- returned by

@@ -33,7 +33,10 @@ from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.rl_engine import (
     train_rl_policy, choose_action, compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
-    RISK_FRACTION_BY_TIER, DEFAULT_EPISODES,
+    RISK_FRACTION_BY_TIER, DEFAULT_EPISODES, RL_FEATURE_NAMES,
+)
+from app.services.case_memory import (
+    memory_summary, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
 )
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
@@ -1155,6 +1158,14 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     `balance` via position_size_units, so the signal is always grounded in your actual
     account, not an assumed one.
 
+    The response also includes `memory` (app/services/case_memory.py) -- how similar past
+    resolved signals for this exact pair/interval actually turned out (hit rate among decided
+    outcomes, average pct move, how many nearest historical cases were used), a k-nearest-
+    neighbor lookup against every past state vector alongside whatever the linear Q-policy's
+    own weights say. It's informational, not a gate on the trade this endpoint returns -- the
+    point is making "have we been here before" inspectable, not silently overriding the
+    policy's decision with a separate heuristic.
+
     If a different decision now disagrees with whatever RL signal is still "pending" for this
     pair/interval (new direction, new action is HOLD, or price has moved enough that the
     entry itself changed), that old pending signal is marked "superseded" immediately (see
@@ -1223,12 +1234,23 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     )
     units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
 
+    # "Have we seen a state like this before, and how did it actually turn out" -- see
+    # case_memory.py. Computed against every resolved (never superseded) past RLSignal for
+    # this exact pair/interval that has a stored state vector; empty/none for a brand new
+    # pair/interval or one whose history predates the state field, same "surface as absent,
+    # not a fabricated number" convention as ml_model's None-when-not-enough-data.
+    memory_candidates = await rl_signals_collection.find(
+        {"pair": pair, "interval": interval, "status": {"$in": list(RESOLVED_STATUSES)}}
+    ).to_list(length=None)
+    memory = memory_summary(state, memory_candidates)
+
     rl_signal = RLSignal(
+        signal_id=uuid.uuid4().hex[:12],
         pair=pair, interval=interval, timestamp=latest["timestamp"], direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
         q_values=q_values, policy_id=policy.policy_id,
         size_tier=tier, risk_fraction=risk_fraction, balance_at_signal=round(balance, 2),
-        position_size_units=round(units, 2),
+        position_size_units=round(units, 2), state=state,
     )
 
     if (
@@ -1239,7 +1261,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     ):
         # Exact repeat of the still-live signal -- nothing has changed, return it as-is.
         pending["_id"] = str(pending["_id"])
-        return {"signal": pending, "q_values": q_values}
+        return {"signal": pending, "q_values": q_values, "memory": memory}
 
     if pending is not None:
         # The agent's view has moved on (different direction or entry) -- the old signal is
@@ -1247,7 +1269,67 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
         await _supersede_pending_rl_signal(pending, current_price)
 
     await rl_signals_collection.insert_one(rl_signal.model_dump())
-    return {"signal": rl_signal, "q_values": q_values}
+    return {"signal": rl_signal, "q_values": q_values, "memory": memory}
+
+
+@app.get("/rl/signals/{signal_id}/explain")
+async def explain_rl_signal(signal_id: str, k: int = 10):
+    """
+    For one resolved RL signal, answers "what was actually different this time" -- finds its
+    nearest historical neighbor (same pair/interval, by state-vector distance, see
+    app/services/case_memory.py) whose outcome DISAGREED with this one (a hit's nearest miss,
+    or a miss's nearest hit), and reports the top feature differences between the two states,
+    largest first. Not causal attribution -- a distance-ranked feature list, same
+    "inspectable, not a fabricated explanation" spirit as this project's other interpretability
+    surfaces (SignalReason.detail, ML's feature_coefficients). Meant for reviewing a specific
+    surprising outcome after the fact, not for live decision-making (see /rl/signal/{interval}
+    for the live `memory` summary instead).
+
+    404 if signal_id doesn't exist. 400 if the signal isn't resolved yet (still pending or
+    superseded -- there's no real outcome yet to explain), or if no disagreeing neighbor
+    exists in its k nearest cases (e.g. every nearby case was expired, or every nearby case
+    agreed with this one -- itself a meaningful "this looks like a consistent pattern" result,
+    surfaced as such rather than an error).
+    """
+    doc = await rl_signals_collection.find_one({"signal_id": signal_id})
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"No RL signal found with signal_id={signal_id}")
+    if doc["status"] not in RESOLVED_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Signal {signal_id} is '{doc['status']}', not yet resolved -- nothing to explain yet.",
+        )
+    if not doc.get("state"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Signal {signal_id} predates the state field -- no vector to compare against.",
+        )
+
+    candidates = await rl_signals_collection.find({
+        "pair": doc["pair"], "interval": doc["interval"],
+        "status": {"$in": list(RESOLVED_STATUSES)},
+        "signal_id": {"$ne": signal_id},
+    }).to_list(length=None)
+
+    nearest = nearest_cases(doc["state"], candidates, k=k)
+    neighbor = find_diverging_neighbor(doc["status"], nearest)
+    if neighbor is None:
+        return {
+            "signal_id": signal_id, "status": doc["status"], "cases_checked": len(nearest),
+            "diverging_neighbor": None,
+            "note": "No disagreeing neighbor among the nearest cases checked -- either every "
+                    "nearby case was expired, or every nearby case agreed with this outcome.",
+        }
+
+    feature_diffs = explain_divergence(doc["state"], neighbor["state"], RL_FEATURE_NAMES)
+    return {
+        "signal_id": signal_id, "status": doc["status"],
+        "diverging_neighbor": {
+            "signal_id": neighbor.get("signal_id"), "status": neighbor.get("status"),
+            "outcome_pct_move": neighbor.get("outcome_pct_move"), "distance": neighbor["distance"],
+        },
+        "feature_diffs": feature_diffs,
+    }
 
 
 @app.get("/rl/signals")

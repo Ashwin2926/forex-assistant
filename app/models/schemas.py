@@ -294,6 +294,10 @@ class RLSignal(BaseModel):
     role feature_coefficients/strategy_calls play elsewhere. HOLD never produces a stored
     RLSignal, same as ConsensusSignal.
     """
+    # A stable business key (uuid hex, same convention as policy_id/run_id/job_id elsewhere)
+    # -- needed so GET /rl/signals/{signal_id}/explain (case_memory.py) can look one up
+    # without exposing/parsing raw Mongo ObjectIds, which nothing else in this project does.
+    signal_id: str
     pair: str
     interval: str
     timestamp: datetime
@@ -303,6 +307,11 @@ class RLSignal(BaseModel):
     stop_price: float
     q_values: dict[str, float]
     policy_id: str
+    # The exact RL_FEATURE_NAMES-ordered state vector this decision was made from -- the raw
+    # material for case_memory.py's "have we seen something like this before, and how did it
+    # turn out" lookup. Empty for any signal generated before this field existed (state-less
+    # legacy records) -- case_memory simply skips those as candidates, never as an error.
+    state: list[float] = []
 
     # What the agent chose to risk, and against what balance -- makes the trade log (and the
     # live signal itself) fully auditable now that sizing isn't a separate, fixed calculator.

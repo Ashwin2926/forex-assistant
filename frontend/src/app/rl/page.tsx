@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
 // How often to poll GET /rl/train-all/{job_id} while a batch run is in progress -- the job
@@ -15,6 +15,7 @@ interface GenerateAllCell {
   interval: string;
   signal: RLSignal | null;
   qValues: Record<string, number> | null;
+  memory?: RLMemorySummary | null;
   error?: string;
 }
 
@@ -227,7 +228,7 @@ export default function RLPage() {
     for (const { pair: p, interval: i } of combos) {
       try {
         const result = await api.generateRLSignal(p, i, currentBalance);
-        results.push({ pair: p, interval: i, signal: result.signal, qValues: result.q_values });
+        results.push({ pair: p, interval: i, signal: result.signal, qValues: result.q_values, memory: result.memory ?? null });
       } catch (e) {
         results.push({ pair: p, interval: i, signal: null, qValues: null, error: e instanceof ApiError ? e.message : "Failed" });
       }
@@ -510,6 +511,7 @@ export default function RLPage() {
                     <th className="px-3 py-1.5">Interval</th>
                     <th className="px-3 py-1.5">Direction</th>
                     <th className="px-3 py-1.5">Confidence</th>
+                    <th className="px-3 py-1.5">Memory</th>
                     <th className="px-3 py-1.5">Entry</th>
                     <th className="px-3 py-1.5">Exit</th>
                     <th className="px-3 py-1.5">Size</th>
@@ -532,17 +534,22 @@ export default function RLPage() {
                           <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
                           <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
                           {cell.error ? (
-                            <td className="px-3 py-1.5 text-zinc-400" colSpan={7}>{cell.error}</td>
+                            <td className="px-3 py-1.5 text-zinc-400" colSpan={8}>{cell.error}</td>
                           ) : (
                             <>
                               {!s ? (
-                                <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>HOLD</td>
+                                <td className="px-3 py-1.5 text-zinc-400" colSpan={6}>HOLD</td>
                               ) : (
                                 <>
                                   <td className={`px-3 py-1.5 font-semibold ${s.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                                     {s.direction}
                                   </td>
                                   <td className="px-3 py-1.5 font-mono">{confidence != null ? `${confidence.toFixed(0)}%` : "—"}</td>
+                                  <td className="px-3 py-1.5 font-mono" title={cell.memory?.avg_pct_move != null ? `avg pct move: ${cell.memory.avg_pct_move}%, ${cell.memory.expired_pct}% expired` : undefined}>
+                                    {cell.memory && cell.memory.cases_found > 0
+                                      ? `${cell.memory.hit_rate_pct != null ? `${cell.memory.hit_rate_pct.toFixed(0)}%` : "—"} (${cell.memory.cases_found})`
+                                      : "no history"}
+                                  </td>
                                   <td className="px-3 py-1.5">{s.entry_price.toFixed(5)}</td>
                                   <td className="px-3 py-1.5">{s.target_price.toFixed(5)}</td>
                                   <td className={`px-3 py-1.5 font-mono ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>
@@ -566,7 +573,7 @@ export default function RLPage() {
                         </tr>
                         {qOpen && cell.qValues && (
                           <tr key={`${key}-q`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
-                            <td colSpan={9} className="px-3 py-2">
+                            <td colSpan={10} className="px-3 py-2">
                               <QValueRow qValues={cell.qValues} />
                             </td>
                           </tr>
