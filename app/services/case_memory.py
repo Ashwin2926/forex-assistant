@@ -127,6 +127,86 @@ def explain_divergence(
     return diffs[:top_n]
 
 
+# Below this many similar cases, memory doesn't know enough to override the Q-policy at all
+# -- a handful of neighbors is too easily dominated by one or two outliers. Starting guesses,
+# not independently tuned -- same caveat as every other unvalidated constant in this project;
+# revisit once enough gated/ungated live signals exist to compare.
+MIN_CASES_FOR_GATING = 5
+# Below this historical hit rate among similar past cases, memory says "don't take this trade
+# at all" -- roughly "clearly losing," not just "below breakeven."
+BLOCK_HIT_RATE_FLOOR = 25.0
+# Below this (but at/above BLOCK_HIT_RATE_FLOOR) -- still below the ~40% breakeven this
+# project's fixed 1.5:1 target:stop needs (see rl_engine.py's own comments) -- memory doesn't
+# block the trade outright, just refuses to let it size up to LARGE.
+DOWNSIZE_HIT_RATE_FLOOR = 40.0
+# A policy whose own overall resolved-trade record is at/above this is demonstrably doing
+# something right -- a thin, possibly-noisy slice of locally-similar cases (a handful of
+# neighbors) shouldn't be enough to fully block a trade from a policy with this track record,
+# even though it's still enough to justify the softer downsize-only caution above. Requires
+# MIN_DECIDED_FOR_POLICY_STRENGTH real decided trades before trusting this number at all --
+# a policy that's gone 3-for-4 isn't "demonstrably strong," it's a tiny sample.
+STRONG_POLICY_HIT_RATE_FLOOR = 50.0
+MIN_DECIDED_FOR_POLICY_STRENGTH = 10
+
+
+def memory_gate(memory: dict, size_tier: str) -> tuple[str, Optional[str]]:
+    """
+    The "act on it, not just report it" half of case memory -- takes the Q-policy's chosen
+    size_tier and either leaves it alone, downgrades LARGE to SMALL, or overrides the whole
+    trade to "HOLD", based on how similar past states (already filtered to the SAME direction
+    by the caller, see main.py's create_rl_signal) actually turned out. Same layered-safety-
+    rule philosophy as RL_TARGET_ATR_MULT/RL_STOP_ATR_MULT's own 1.5:1 floor -- "guaranteed by
+    construction here, not left for the agent to discover through reward alone" -- applied to
+    a different risk dimension (this decision's evidence base, not the reward shape itself).
+
+    memory is expected to carry policy_hit_rate_pct/policy_decided_trades (added by the caller
+    in main.py, NOT by memory_summary -- that function is scoped to case-level lookup only,
+    this is policy-level context) alongside the usual case-level fields. This exists because a
+    policy that's genuinely performing well overall shouldn't be fully blocked just because
+    ONE narrow, possibly-noisy local neighborhood looks weak -- a few similar-looking losses
+    next to a policy's otherwise-solid track record is exactly the kind of local variance a
+    small k-nearest-neighbor sample will show sometimes, not necessarily a real warning sign.
+    The softer downsize-to-SMALL still applies regardless of overall strength -- even a good
+    policy can have specific setups worth sizing down on -- only the outright HOLD block backs
+    off when the policy's own real record says otherwise.
+
+    Returns (new_size_tier_or_"HOLD", reason_or_None). reason is None exactly when no override
+    happened (not enough cases, or hit rate wasn't low enough to act on), so the caller can
+    tell "gate ran and approved this trade" apart from "gate didn't have an opinion."
+    """
+    cases_found = memory.get("cases_found", 0)
+    hit_rate_pct = memory.get("hit_rate_pct")
+    if cases_found < MIN_CASES_FOR_GATING or hit_rate_pct is None:
+        return size_tier, None
+
+    policy_hit_rate_pct = memory.get("policy_hit_rate_pct")
+    policy_decided_trades = memory.get("policy_decided_trades") or 0
+    policy_is_strong = (
+        policy_hit_rate_pct is not None
+        and policy_decided_trades >= MIN_DECIDED_FOR_POLICY_STRENGTH
+        and policy_hit_rate_pct >= STRONG_POLICY_HIT_RATE_FLOOR
+    )
+
+    if hit_rate_pct < BLOCK_HIT_RATE_FLOOR:
+        if policy_is_strong:
+            return "SMALL", (
+                f"memory: {cases_found} similar past cases resolved to only {hit_rate_pct}% "
+                f"hit rate, which would normally block this trade -- but this policy's own "
+                f"overall record is {policy_hit_rate_pct}% over {policy_decided_trades} decided "
+                f"trades, so capping size at SMALL instead of blocking outright"
+            )
+        return "HOLD", (
+            f"memory: {cases_found} similar past cases resolved to only {hit_rate_pct}% "
+            f"hit rate -- blocking this trade"
+        )
+    if hit_rate_pct < DOWNSIZE_HIT_RATE_FLOOR and size_tier == "LARGE":
+        return "SMALL", (
+            f"memory: {cases_found} similar past cases resolved to {hit_rate_pct}% hit rate "
+            f"(below breakeven for this project's 1.5:1 target:stop) -- capping size at SMALL"
+        )
+    return size_tier, None
+
+
 def find_diverging_neighbor(
     target_status: str, nearest: list[dict],
 ) -> Optional[dict]:

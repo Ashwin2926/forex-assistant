@@ -232,6 +232,9 @@ export interface RLSignal {
   // The state vector this decision was made from -- see app/services/case_memory.py. Absent
   // on pre-existing signals the same way size_tier etc. can be, below.
   state?: number[];
+  // Set when case_memory.memory_gate() downsized or blocked this trade against the raw
+  // Q-policy action -- null/absent means memory had nothing to say or agreed with the policy.
+  memory_override?: string | null;
   // What the agent chose to risk, and against what balance -- absent on RLSignal documents
   // created before sizing existed (GET /rl/signals returns raw Mongo docs, not validated
   // through the RLSignal Pydantic model, so an old doc really can be missing these keys).
@@ -264,6 +267,13 @@ export interface RLMemorySummary {
     outcome_pct_move?: number | null;
     distance: number;
   }>;
+  // This policy's own OVERALL resolved-trade record for this pair/interval (both directions,
+  // same math as RLAccuracy.directional_hit_rate_pct) -- distinct from hit_rate_pct above,
+  // which is scoped to the narrow same-direction nearest-neighbor slice. See
+  // case_memory.memory_gate's docstring for why a policy can look weak locally while still
+  // being strong overall, and why both numbers matter together.
+  policy_hit_rate_pct: number | null;
+  policy_decided_trades: number;
 }
 
 // Signal's normal fields plus the ML classifier's advisory hit probability -- returned by

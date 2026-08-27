@@ -16,6 +16,10 @@ interface GenerateAllCell {
   signal: RLSignal | null;
   qValues: Record<string, number> | null;
   memory?: RLMemorySummary | null;
+  // Set when memory_gate blocked the trade to HOLD outright (signal is null in that case) --
+  // a downsize-only override instead lives on signal.memory_override, since a trade still
+  // happened. See app/services/case_memory.py's memory_gate.
+  memoryOverride?: string | null;
   error?: string;
 }
 
@@ -228,7 +232,10 @@ export default function RLPage() {
     for (const { pair: p, interval: i } of combos) {
       try {
         const result = await api.generateRLSignal(p, i, currentBalance);
-        results.push({ pair: p, interval: i, signal: result.signal, qValues: result.q_values, memory: result.memory ?? null });
+        results.push({
+          pair: p, interval: i, signal: result.signal, qValues: result.q_values,
+          memory: result.memory ?? null, memoryOverride: result.memory_override ?? null,
+        });
       } catch (e) {
         results.push({ pair: p, interval: i, signal: null, qValues: null, error: e instanceof ApiError ? e.message : "Failed" });
       }
@@ -538,21 +545,32 @@ export default function RLPage() {
                           ) : (
                             <>
                               {!s ? (
-                                <td className="px-3 py-1.5 text-zinc-400" colSpan={6}>HOLD</td>
+                                <td className="px-3 py-1.5 text-zinc-400" colSpan={6} title={cell.memoryOverride ?? undefined}>
+                                  {cell.memoryOverride ? "HOLD (memory override)" : "HOLD"}
+                                </td>
                               ) : (
                                 <>
                                   <td className={`px-3 py-1.5 font-semibold ${s.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                                     {s.direction}
                                   </td>
                                   <td className="px-3 py-1.5 font-mono">{confidence != null ? `${confidence.toFixed(0)}%` : "—"}</td>
-                                  <td className="px-3 py-1.5 font-mono" title={cell.memory?.avg_pct_move != null ? `avg pct move: ${cell.memory.avg_pct_move}%, ${cell.memory.expired_pct}% expired` : undefined}>
+                                  <td
+                                    className="px-3 py-1.5 font-mono"
+                                    title={cell.memory ? (
+                                      `avg pct move: ${cell.memory.avg_pct_move ?? "—"}%, ${cell.memory.expired_pct ?? "—"}% expired -- `
+                                      + `policy's overall record: ${cell.memory.policy_hit_rate_pct ?? "—"}% over ${cell.memory.policy_decided_trades} decided trades`
+                                    ) : undefined}
+                                  >
                                     {cell.memory && cell.memory.cases_found > 0
                                       ? `${cell.memory.hit_rate_pct != null ? `${cell.memory.hit_rate_pct.toFixed(0)}%` : "—"} (${cell.memory.cases_found})`
                                       : "no history"}
                                   </td>
                                   <td className="px-3 py-1.5">{s.entry_price.toFixed(5)}</td>
                                   <td className="px-3 py-1.5">{s.target_price.toFixed(5)}</td>
-                                  <td className={`px-3 py-1.5 font-mono ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>
+                                  <td
+                                    className={`px-3 py-1.5 font-mono ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""} ${s.memory_override ? "underline decoration-dotted" : ""}`}
+                                    title={s.memory_override ?? undefined}
+                                  >
                                     {s.size_tier ?? "—"}
                                   </td>
                                 </>

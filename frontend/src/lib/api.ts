@@ -246,8 +246,13 @@ export const api = {
     const qs = new URLSearchParams({ pair });
     if (balance !== undefined) qs.set("balance", String(balance));
     // memory is absent when the action was HOLD (no trade, nothing to look up memory against)
-    // -- see create_rl_signal's early return in app/main.py.
-    return request<{ signal: RLSignal | null; q_values: Record<string, number>; memory?: RLMemorySummary }>(
+    // -- see create_rl_signal's early return in app/main.py. memory_override at the top level
+    // (not on `signal`) only appears when memory_gate blocked the trade to HOLD outright --
+    // when it only downsized LARGE->SMALL instead, the reason lives on signal.memory_override.
+    return request<{
+      signal: RLSignal | null; q_values: Record<string, number>;
+      memory?: RLMemorySummary; memory_override?: string | null;
+    }>(
       `/rl/signal/${interval}?${qs.toString()}`,
       { method: "POST" },
     );

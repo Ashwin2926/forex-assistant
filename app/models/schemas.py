@@ -312,6 +312,12 @@ class RLSignal(BaseModel):
     # turn out" lookup. Empty for any signal generated before this field existed (state-less
     # legacy records) -- case_memory simply skips those as candidates, never as an error.
     state: list[float] = []
+    # Set when case_memory.memory_gate() downsized or blocked this trade against what the raw
+    # Q-policy action would have been -- None means memory either had nothing to say (too few
+    # similar cases) or agreed with the policy's own choice. Kept on the record itself (not
+    # just the API response) so a downsized/blocked trade is auditable later via GET
+    # /rl/signals the same way every other decision here already is.
+    memory_override: Optional[str] = None
 
     # What the agent chose to risk, and against what balance -- makes the trade log (and the
     # live signal itself) fully auditable now that sizing isn't a separate, fixed calculator.

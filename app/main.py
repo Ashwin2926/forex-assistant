@@ -1223,6 +1223,49 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
         return {"signal": None, "q_values": q_values}
 
     direction, tier = action.split("_")
+
+    # "Have we seen a state like this before, and how did it actually turn out" -- see
+    # case_memory.py. Filtered to the SAME direction the policy just chose (not the whole
+    # pair/interval): the question memory needs to answer is specifically "how have BUY (or
+    # SELL) decisions that looked like this one actually gone," not a blend of both directions.
+    # Computed against every resolved (never superseded) past RLSignal with a stored state
+    # vector; empty/none for a brand new pair/interval or one whose history predates the state
+    # field, same "surface as absent, not a fabricated number" convention as ml_model's
+    # None-when-not-enough-data.
+    memory_candidates = await rl_signals_collection.find({
+        "pair": pair, "interval": interval, "direction": direction,
+        "status": {"$in": list(RESOLVED_STATUSES)},
+    }).to_list(length=None)
+    memory = memory_summary(state, memory_candidates)
+
+    # This policy's own OVERALL resolved-trade record for this pair/interval (both directions
+    # combined, same directional-hit-rate math as GET /rl/accuracy) -- distinct from the
+    # narrow, same-direction "similar cases" number above. A policy can be genuinely strong
+    # overall while still showing a weak LOCAL neighborhood for one specific setup (a handful
+    # of nearest cases is a small, sometimes-noisy sample) -- surfacing both numbers together,
+    # always, means a good policy's real track record doesn't get silently ignored just
+    # because memory_gate below is scoped to the narrower question. See memory_gate's own
+    # docstring for how the two get reconciled when they disagree.
+    overall_hits = await rl_signals_collection.count_documents(
+        {"pair": pair, "interval": interval, "status": "hit"}
+    )
+    overall_misses = await rl_signals_collection.count_documents(
+        {"pair": pair, "interval": interval, "status": "miss"}
+    )
+    overall_decided = overall_hits + overall_misses
+    memory["policy_hit_rate_pct"] = round(overall_hits / overall_decided * 100, 1) if overall_decided else None
+    memory["policy_decided_trades"] = overall_decided
+
+    # Act on memory, not just report it: memory_gate can downgrade LARGE->SMALL or override
+    # the whole trade to HOLD when similar past states have a poor track record -- see that
+    # function's own docstring for why this is a layered safety rule on top of the learned
+    # policy, same philosophy as the fixed 1.5:1 target:stop floor.
+    gated_tier, memory_override = memory_gate(memory, tier)
+    if gated_tier == "HOLD":
+        if pending is not None:
+            await _supersede_pending_rl_signal(pending, current_price)
+        return {"signal": None, "q_values": q_values, "memory": memory, "memory_override": memory_override}
+    tier = gated_tier
     risk_fraction = RISK_FRACTION_BY_TIER[tier]
 
     latest = df.iloc[-1]
@@ -1234,23 +1277,13 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     )
     units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
 
-    # "Have we seen a state like this before, and how did it actually turn out" -- see
-    # case_memory.py. Computed against every resolved (never superseded) past RLSignal for
-    # this exact pair/interval that has a stored state vector; empty/none for a brand new
-    # pair/interval or one whose history predates the state field, same "surface as absent,
-    # not a fabricated number" convention as ml_model's None-when-not-enough-data.
-    memory_candidates = await rl_signals_collection.find(
-        {"pair": pair, "interval": interval, "status": {"$in": list(RESOLVED_STATUSES)}}
-    ).to_list(length=None)
-    memory = memory_summary(state, memory_candidates)
-
     rl_signal = RLSignal(
         signal_id=uuid.uuid4().hex[:12],
         pair=pair, interval=interval, timestamp=latest["timestamp"], direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
         q_values=q_values, policy_id=policy.policy_id,
         size_tier=tier, risk_fraction=risk_fraction, balance_at_signal=round(balance, 2),
-        position_size_units=round(units, 2), state=state,
+        position_size_units=round(units, 2), state=state, memory_override=memory_override,
     )
 
     if (
@@ -1410,8 +1443,91 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
     }
 
 
+# How far live directional accuracy is allowed to fall below what the currently active
+# policy's own training-time backtest eval claimed before that's treated as real degradation
+# rather than ordinary live/backtest gap (this project's own /signals/accuracy docstring
+# already notes live performance "often won't match [backtest] at first, and that gap is
+# itself useful signal, not a bug to explain away" -- some gap is normal, this margin is
+# meant to catch something bigger than that). Starting guess, not independently tuned -- same
+# caveat as every other unvalidated constant in this project; revisit once enough triggered
+# retrains exist to check whether this margin catches real regressions without false-triggering
+# on ordinary noise.
+DEGRADATION_MARGIN_PCT = 15.0
+# Below this many live decided (hit+miss) trades, a live hit rate is too small a sample to
+# compare against a trained backtest number at all -- skip the check entirely rather than
+# risk retraining off 2-3 lucky/unlucky trades.
+MIN_LIVE_DECIDED_FOR_DEGRADATION_CHECK = 10
+
+
+async def _retrain_degraded_policy_background(pair: str, interval: str) -> None:
+    """
+    BackgroundTasks target for a degradation-triggered retrain -- a thin wrapper around
+    _run_rl_training so a failure here (e.g. a transient DB hiccup) doesn't surface as an
+    unhandled exception in server logs with no useful destination; same "don't let a
+    best-effort background job crash noisily" reasoning as run_train_all_job's own per-combo
+    try/except. Nothing to report the error TO here (unlike train-all, there's no job
+    document this is updating) -- silently skipping means it simply gets caught again by
+    the NEXT /rl/score cycle's degradation check, on already-fresh data.
+    """
+    try:
+        await _run_rl_training(pair, interval, DEFAULT_EPISODES, 0.7, 20, DEFAULT_STARTING_BALANCE)
+    except ValueError:
+        pass
+
+
+async def _check_and_retrain_degraded_policies(background_tasks: BackgroundTasks) -> list[dict]:
+    """
+    The training-side close of the memory-gate loop: if a pair/interval's LIVE directional
+    hit rate has fallen DEGRADATION_MARGIN_PCT or more below what its own currently active
+    policy claimed during its training-time backtest eval, kick off a warm-started retrain
+    (see train_rl_policy's warm_start param) in the background right now, instead of waiting
+    for the next scheduled once-daily training slot. Checks every pair/interval combination
+    every time this runs (cheap -- a handful of count_documents calls each, no heavy
+    computation), not just ones that had a signal resolve this cycle, so a policy that's been
+    quietly degrading for a while still gets caught the next time /rl/score fires.
+
+    Purely additive to the once-daily cron training -- this can only trigger EXTRA retrains
+    sooner, never skip or replace the scheduled one.
+    """
+    results = []
+    for pair in settings.pairs_list:
+        for interval in RL_INTERVALS:
+            live_hits = await rl_signals_collection.count_documents(
+                {"pair": pair, "interval": interval, "status": "hit"}
+            )
+            live_misses = await rl_signals_collection.count_documents(
+                {"pair": pair, "interval": interval, "status": "miss"}
+            )
+            decided = live_hits + live_misses
+            if decided < MIN_LIVE_DECIDED_FOR_DEGRADATION_CHECK:
+                continue
+
+            policy_doc = await rl_policies_collection.find_one(
+                {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
+            )
+            if policy_doc is None:
+                continue
+            eval_run = await backtest_runs_collection.find_one({"run_id": policy_doc.get("eval_run_id")})
+            trained_hit_rate_pct = eval_run.get("hit_rate_pct") if eval_run else None
+            if trained_hit_rate_pct is None:
+                continue
+
+            live_hit_rate_pct = round(live_hits / decided * 100, 1)
+            gap = trained_hit_rate_pct - live_hit_rate_pct
+            entry = {
+                "pair": pair, "interval": interval,
+                "live_hit_rate_pct": live_hit_rate_pct, "live_decided_trades": decided,
+                "trained_hit_rate_pct": trained_hit_rate_pct, "retrain_triggered": False,
+            }
+            if gap >= DEGRADATION_MARGIN_PCT:
+                background_tasks.add_task(_retrain_degraded_policy_background, pair, interval)
+                entry["retrain_triggered"] = True
+            results.append(entry)
+    return results
+
+
 @app.post("/rl/score")
-async def score_rl_signals(max_lookforward: int | None = None):
+async def score_rl_signals(background_tasks: BackgroundTasks, max_lookforward: int | None = None):
     """
     Closes the loop for live RL signals the same way /signals/score and /consensus/score do
     for their own collections -- the live, forward-going half of "backtest its signals and
@@ -1420,8 +1536,15 @@ async def score_rl_signals(max_lookforward: int | None = None):
     max_lookforward left unset (the default, what the cron always uses) gives each signal its
     own interval-appropriate window instead of one flat candle count for every interval -- see
     outcome_scoring.LIVE_MAX_LOOKFORWARD_BY_INTERVAL.
+
+    Also runs _check_and_retrain_degraded_policies after scoring -- see that function's own
+    docstring. Its results are returned under `degradation_check` alongside the usual scoring
+    tally so a caller (the cron logs, or a human) can see whether anything got flagged without
+    needing a separate endpoint.
     """
-    return await score_pending_rl_signals(max_lookforward=max_lookforward)
+    tally = await score_pending_rl_signals(max_lookforward=max_lookforward)
+    degradation_check = await _check_and_retrain_degraded_policies(background_tasks)
+    return {**tally, "degradation_check": degradation_check}
 
 
 @app.get("/paper-trade/account")
