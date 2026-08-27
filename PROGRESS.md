@@ -4,6 +4,98 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-27
+
+**Traced "0.9% accuracy, not learning" to a misleading metric (not a broken model), then
+closed a real gap: RL training now warm-starts and carries a case-based memory that gates
+live trades and triggers its own retrains on live degradation.**
+
+User reported the RL dashboard's "Overall trading accuracy" showing 0.9% and asked what
+`superseded` meant, believing it should count as a real win/loss. Investigated live via the
+deployed backend (`X-Service-Token` auth) before changing anything:
+
+- **The 0.9% figure was arithmetically correct but the wrong question.** Summed across all
+  5 intervals: `hits=3, misses=4, expired=325, total=332` → 3/332 = 0.9%. But 325 of those
+  332 are `expired` (never touched target *or* stop) — a non-event, not a loss. Among the 7
+  that actually resolved decisively, real accuracy is 3/7 = 43%. `superseded` (11-16/interval)
+  was already correctly excluded from this math — it wasn't the pollutant suspected.
+- **Every 5min/15min RL policy showed genuine negative expectancy** in its own backtest eval
+  (all 4 pairs, -52% to -87% total_return on $50 start) — confirmed via `GET /rl/policies`,
+  not assumed. Root cause traced to `rl_engine.py`: `LinearQPolicy` is strictly linear over
+  just 9 features, 7 of which are already-lossy `[0,1]` "strength" scalars each strategy
+  computes from much richer raw values (raw RSI, ADX, stochastic, MACD hist, Bollinger width,
+  volume ratio) before discarding them.
+- **The ML confidence classifier was training on genuinely stale data** — `keep-fresh.yml`
+  fires `/ml/train` every 20 min unconditionally, but a signal takes 100min-5hr to resolve;
+  3 consecutive runs came back byte-identical (no new resolved rows arrived between them).
+
+Fixes shipped (4 commits, `a9252ed`..`93ba2be`, all pushed to `master`):
+
+1. **Accuracy metric** (`a9252ed`): `/rl/accuracy` and `/signals/accuracy` now also report
+   `directional_hit_rate_pct` (hits/(hits+misses), excludes `expired` from the denominator)
+   and `resolution_breakdown_pct`. RL page shows the directional rate as the headline now,
+   not the old blended number. **Live-verified**: `directional_hit_rate_pct: 42.9` matched
+   the by-hand calculation exactly.
+2. **ML classifier** (`a9252ed`): added `pair_*`/`interval_*` one-hot features (previously
+   one shared model couldn't tell EUR/USD 5min apart from USD/JPY 1h) and
+   `class_weight="balanced"`. `/ml/train` now skips refitting (`skipped: true`) when the
+   resolved count hasn't changed since the last run; `force=true` bypasses this.
+   **Live-verified**: recall improved 0.25→0.375, calibration went from inverted
+   (0-40% bucket showing a *higher* actual hit rate than 40-60%) to properly monotonic
+   (70-100% bucket correctly highest at 75%).
+3. **Richer RL state** (`a9252ed`): `compute_strategy_vote_states` now also feeds 6 raw
+   continuous readings (adx, rsi-centered, stoch spread, macd_hist%, bb width%, volume
+   ratio) alongside the existing 7 vote features. `RL_TARGET_ATR_MULT`/`RL_STOP_ATR_MULT`
+   made profile-aware (`RL_ATR_MULTS_BY_PROFILE`) — structural only, values unchanged, real
+   tuning deferred. **Live-verified** via 8 retrains (both fast intervals, all 4 pairs): 6/8
+   improved, still negative everywhere but meaningfully less so (5min EUR/USD: -53%→-23%
+   return, 46% hit rate vs 25.6% before). Real, partial improvement — not a fix.
+4. **Warm-started training** (`da74e6d`): `RLPolicy` now persists `sum_sq_grad` (Adagrad's
+   accumulator) and `warm_started_from`. `train_rl_policy` continues from the prior policy's
+   weights AND optimizer state instead of zero-initializing every call, with a much lower
+   `EPSILON_START_RESUME` (0.2 vs the fresh-run 1.0) — starting a continuation at full random
+   exploration would apply real TD updates driven by noise on top of already-converged
+   weights, undoing prior learning before epsilon decays back down. Falls back to a fresh run
+   automatically if the prior policy's `feature_names` don't match (same guard added to
+   `choose_action` for live inference, closing a latent silent-truncation bug this session's
+   own feature-schema change would otherwise have hit).
+5. **Live scoring window** (`da74e6d`): `/signals/score`, `/consensus/score`, `/rl/score` no
+   longer share backtest/training's tight `max_lookforward=20` (a training-tractability
+   constraint that doesn't apply live). `LIVE_MAX_LOOKFORWARD_BY_INTERVAL` gives each
+   interval a realistic real-world holding window (200 candles at 5min down to 30 at 1day)
+   before falling back to `expired`.
+6. **Case-based memory** (`e31bc85`, new `app/services/case_memory.py`): every `RLSignal`
+   now stores its exact state vector (`state`) and a stable `signal_id`. `memory_summary()`
+   does a k-nearest-neighbor lookup over past resolved states (same pair/interval/direction)
+   and reports their real hit rate — returned alongside every `POST /rl/signal/{interval}`
+   response. New `GET /rl/signals/{signal_id}/explain` finds a resolved signal's nearest
+   neighbor with a *disagreeing* outcome and reports the top feature differences.
+7. **Closed the loop** (`93ba2be`): `memory_gate()` now *acts* on the memory lookup instead
+   of only reporting it — downgrades a chosen `LARGE` size to `SMALL`, or overrides the whole
+   trade to `HOLD`, when locally-similar past states have a poor hit rate. Explicitly
+   considers the policy's own OVERALL record too (`policy_hit_rate_pct`, always surfaced,
+   not just when gating fires) — a policy performing well overall only gets downsized, never
+   fully blocked, by one thin/noisy local neighborhood; only a policy with no strong overall
+   record backing it up gets blocked outright. Separately, `POST /rl/score` now also checks
+   every pair/interval's live hit rate against its policy's own training-time backtest claim,
+   and triggers a warm-started retrain in the background the moment live performance falls
+   15pts+ behind, instead of waiting for the once-daily scheduled slot.
+
+**Also found, in passing**: `keep-fresh.yml`'s cron is measurably less regular than its
+declared `*/20 * * * *` schedule — pulled 100 real run timestamps, median gap 23.6 min but
+45/99 gaps exceeded 25 min and one hit 3.5 hours. This is a known GitHub Actions limitation
+(scheduled workflows aren't guaranteed to fire on time under load), not a config bug, and
+doesn't by itself explain the expired-rate finding above (a late cycle delays resolution,
+it doesn't change the hit/miss/expired split, since scoring counts real candles elapsed, not
+wall-clock deadlines).
+
+**Not yet independently live-verified**: items 4-7 above (warm-start, live scoring window,
+case memory, gating, auto-retrain) — pushed and unit-tested locally (a pinned-down local
+venv with pandas/pydantic/scikit-learn/motor), but the live end-to-end check was handed off
+to the user to run manually rather than completed in-session. Confirmed this session that
+FastAPI Cloud now auto-redeploys on push to `master` (see corrected note in `CLAUDE.md` —
+supersedes the 2026-08-18 CLI-only finding).
+
 ## 2026-08-24 (cont.)
 
 **RL follow-ups, same day: widened to all intervals, added position sizing, dropped the

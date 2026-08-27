@@ -12,16 +12,15 @@ candles, optional Deriv demo-account paper trading. Backend deploys to **FastAPI
 
 ## Two platform gotchas that cost an entire debugging session to find (2026-08-18)
 
-1. **FastAPI Cloud dashboard "redeploy"/restart does NOT rebuild from git.** It just
-   restarts the existing already-built image. Confirmed by watching `deployment_id`
-   change every few minutes with zero build logs on any of them, while runtime behavior
-   never changed across ~6 different deployment IDs despite env var updates and code
-   pushes. The only thing that actually rebuilds from source is their **CLI** deploy
-   command, run from an authenticated terminal — this repo has no `pyproject.toml`, so
-   the CLI setup wizard's "directory where pyproject.toml lives" prompt should be left
-   **empty**, since `app/` and `requirements.txt` both live at the repo root. **Every
-   backend code change requires a manual CLI deploy afterward — a git push alone changes
-   nothing live.**
+1. ~~**FastAPI Cloud dashboard "redeploy"/restart does NOT rebuild from git...**~~
+   **Superseded 2026-08-27**: a plain `git push` to `master` now DOES trigger a real
+   rebuild+redeploy on FastAPI Cloud — confirmed twice in the same session (new response
+   fields showed up live within ~1-2 min of pushing, no CLI step run). Whatever the
+   dashboard-restart-only limitation was on 2026-08-18, it no longer applies as of this
+   date, or FastAPI Cloud added push-triggered deploys since. **Don't assume a CLI deploy
+   is required going forward** — but if a push ever again produces no live change, check
+   this assumption before spending a session re-debugging it, since it's plausible this
+   could regress or the platform's behavior could vary.
 2. **GitHub Actions schedule triggers go silently dormant if the workflow YAML is
    invalid**, and this is hard to detect: the run shows under the raw file path instead
    of the workflow's declared `name:`, the Jobs API returns empty for it, and
@@ -30,6 +29,13 @@ candles, optional Deriv demo-account paper trading. Backend deploys to **FastAPI
    shows in the web UI's run-detail page, not via the REST API. Root cause here was an
    unquoted `run: curl ... -H "X-Service-Token: $VAR" ...` — YAML disallows a bare `: `
    (colon-space) inside a plain scalar; fix is `run: |` block-literal style.
+
+**Related, milder finding (2026-08-27)**: even with valid YAML, `keep-fresh.yml`'s
+`*/20 * * * *` schedule doesn't fire exactly on time — pulled 100 real run timestamps via
+`gh run list`, median gap was 23.6 min (close enough) but 45/99 gaps exceeded 25 min and one
+hit 3.5 hours. This is GitHub's own documented behavior for scheduled workflows under load,
+not a bug to fix here — but worth knowing before assuming a cron-dependent job (candle
+ingestion, signal scoring) ran as recently as the schedule implies.
 
 **Vercel quirk**: frontend builds can land as `Preview` without auto-promoting to
 `Production` — may need a manual "Production rebuild" click even after a successful
