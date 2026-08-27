@@ -4,6 +4,19 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-08-27 (cont.)
+
+**Bug: every live `/rl/signal` call where the policy actually chose to trade was 500ing.**
+User reported generating signals and getting "all HOLD and failed all of them." Some were
+genuine HOLD decisions, the rest were a crash: `memory_gate` (added earlier today, see
+below) got called in `create_rl_signal` but was never added to the `case_memory` import at
+the top of `main.py` — only `memory_summary` was. Every non-HOLD decision hit
+`NameError: name 'memory_gate' is not defined` before it could return a signal, surfacing
+as a bare 500 with no detail (production error handling correctly hid the traceback from
+the client, which is why it needed a temporary diagnostic try/except, commit `4034529`, to
+actually see the `NameError` before fixing it for real in `7f60171`). Live-verified across
+5min/15min/1day x 3 pairs after the fix: all HTTP 200, no more 500s.
+
 ## 2026-08-27
 
 **Traced "0.9% accuracy, not learning" to a misleading metric (not a broken model), then
