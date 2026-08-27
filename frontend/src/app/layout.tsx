@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
 import { AuthGuard } from "@/components/AuthGuard";
 import { AuthNav } from "@/components/AuthNav";
+import { SyncNowButton } from "@/components/SyncNowButton";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -58,6 +59,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                 RL Agent
               </Link>
             </nav>
+            <SyncNowButton />
             <AuthNav />
           </div>
         </header>

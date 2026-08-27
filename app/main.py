@@ -1661,3 +1661,77 @@ async def list_paper_trade_history(status: str | None = None, limit: int = 100):
     for d in docs:
         d["_id"] = str(d["_id"])
     return docs
+
+
+@app.post("/ops/run-all-flows")
+async def run_all_flows():
+    """
+    Manually replicates everything .github/workflows/keep-fresh.yml does on a normal cron
+    firing -- ingest every interval, generate signals (regular + consensus + RL) across every
+    pair/interval, score all three, retrain the ML classifier -- in one call, synchronously.
+
+    Deliberately excludes RL TRAINING (POST /rl/train-all): that's the heavy, once-daily part
+    of the cron (many epsilon-greedy episodes per pair/interval, ~15-20 min total across 20
+    combos) and isn't what a stale-cron gap actually needs caught up -- a policy doesn't need
+    to be as fresh as the candles it reads (see rl_engine.py's own DEFAULT_EPISODES comment).
+    Trigger POST /rl/train-all separately if training itself has also gone stale.
+
+    For when the GitHub Actions cron has gone quiet for a while (its own scheduler isn't
+    always reliable under load -- confirmed live 2026-08-27, a ~5hr gap with zero runs despite
+    an active */20 schedule, see CLAUDE.md) and someone wants today's candles/signals caught
+    up right now instead of waiting on it or triggering the workflow on GitHub directly.
+
+    Every step is individually try/excepted so one pair/interval/step failing (a Twelve Data
+    quota hit, "no trained policy yet", etc.) doesn't stop the rest from running -- same
+    tolerance keep-fresh.yml's own `|| true` steps already have. Ingest uses output_size=5
+    (a light top-up, matching the cron's own per-cycle amount) -- not a deep backfill.
+    """
+    results: dict = {"ingest": {}, "signals": {}, "consensus": {}, "rl_signals": {}, "score": {}, "ml_train": None}
+
+    for interval in RL_INTERVALS:
+        try:
+            results["ingest"][interval] = await ingest(interval, output_size=5)
+        except Exception as e:
+            results["ingest"][interval] = f"error: {e}"
+
+    for interval in RL_INTERVALS:
+        profile = "intraday" if interval in ("5min", "15min") else "swing"
+        for pair in settings.pairs_list:
+            key = f"{pair}/{interval}"
+            try:
+                await create_signal(interval, profile, pair)
+                results["signals"][key] = "ok"
+            except Exception as e:
+                results["signals"][key] = f"error: {e}"
+            try:
+                await create_consensus_signal(interval, pair)
+                results["consensus"][key] = "ok"
+            except Exception as e:
+                results["consensus"][key] = f"error: {e}"
+            try:
+                await create_rl_signal(interval, pair)
+                results["rl_signals"][key] = "ok"
+            except Exception as e:
+                results["rl_signals"][key] = f"error: {e}"
+
+    try:
+        results["score"]["signals"] = await score_signals()
+    except Exception as e:
+        results["score"]["signals"] = f"error: {e}"
+    try:
+        results["score"]["consensus"] = await score_consensus_signals()
+    except Exception as e:
+        results["score"]["consensus"] = f"error: {e}"
+    try:
+        bg = BackgroundTasks()
+        results["score"]["rl"] = await score_rl_signals(bg)
+        await bg()  # run any degradation-triggered retrains synchronously, same call
+    except Exception as e:
+        results["score"]["rl"] = f"error: {e}"
+
+    try:
+        results["ml_train"] = await train_ml_model()
+    except Exception as e:
+        results["ml_train"] = f"error: {e}"
+
+    return results
