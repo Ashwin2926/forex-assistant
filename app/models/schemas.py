@@ -269,6 +269,20 @@ class RLPolicy(BaseModel):
     # point to compute the live balance_log_ratio feature, or that feature would mean
     # something different at inference than it did during training.
     starting_balance: float
+    # Adagrad's per-weight accumulated-squared-gradient state (see LinearQPolicy) -- persisted
+    # so a warm-started continuation (see train_rl_policy's warm_start param) resumes with the
+    # SAME adaptive per-feature step sizes the previous run had earned, instead of restarting
+    # every feature's accumulator at 0. Restarting it to 0 while keeping the warm-started
+    # weights would apply an artificially large first step to already-converged weights --
+    # actively undoing prior learning, not building on it. Empty dict for any policy trained
+    # before this field existed (pre-warm-start): train_rl_policy treats that the same as "no
+    # accumulator to resume," starting Adagrad fresh for that one warm start only.
+    sum_sq_grad: dict[str, list[float]] = {}
+    # policy_id of the prior policy this one continued from, or None if this was a fresh
+    # (non-warm-started) training run -- e.g. the very first run for a pair/interval, a run
+    # after RL_FEATURE_NAMES changed shape (old policy's features no longer match, so
+    # train_rl_policy falls back to fresh rather than guessing), or an explicit reset=True.
+    warm_started_from: Optional[str] = None
 
 
 class RLSignal(BaseModel):

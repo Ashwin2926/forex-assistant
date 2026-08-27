@@ -96,6 +96,15 @@ LEARNING_RATE = 0.1
 DISCOUNT_GAMMA = 0.9
 EPSILON_START = 1.0
 EPSILON_MIN = 0.05
+# Exploration start for a WARM-STARTED run only (see train_rl_policy's warm_start param) --
+# deliberately far below EPSILON_START's 1.0. A warm start already has weights that reflect
+# everything a prior run learned; starting exploration back at 100% random actions would
+# spend this run's early episodes applying real TD updates driven by pure noise on top of
+# those already-converged weights, actively degrading them before epsilon decays back down --
+# the opposite of "continue improving." Still decays to EPSILON_MIN by the end of `episodes`
+# the same way a fresh run does, just from a much lower starting point (light refinement, not
+# re-exploration).
+EPSILON_START_RESUME = 0.2
 # Raised from 100 (the pre-sizing value, when ACTIONS had 3 entries) after the first sizing-
 # aware EUR/USD 5min/15min policies came back showing total_return_pct of -64% to -79% on a
 # $50 start despite a near-flat expectancy_pct (-0.01% to -0.02%) -- the gap between those two
@@ -258,9 +267,24 @@ class LinearQPolicy:
     exposure alone.
     """
 
-    def __init__(self, feature_count: int):
-        self.weights: dict[str, list[float]] = {a: [0.0] * feature_count for a in ACTIONS}
-        self.sum_sq_grad: dict[str, list[float]] = {a: [0.0] * feature_count for a in ACTIONS}
+    def __init__(
+        self, feature_count: int,
+        initial_weights: Optional[dict[str, list[float]]] = None,
+        initial_sum_sq_grad: Optional[dict[str, list[float]]] = None,
+    ):
+        # initial_weights/initial_sum_sq_grad let a warm-started run continue from a prior
+        # policy's learned state instead of zero-initializing -- see train_rl_policy's
+        # warm_start param. Both default to zero when omitted (a fresh run) or when a warm
+        # start's own sum_sq_grad is empty (a policy persisted before that field existed --
+        # its weights still carry over, only the Adagrad accumulator restarts for it).
+        self.weights: dict[str, list[float]] = (
+            {a: list(initial_weights[a]) for a in ACTIONS} if initial_weights
+            else {a: [0.0] * feature_count for a in ACTIONS}
+        )
+        self.sum_sq_grad: dict[str, list[float]] = (
+            {a: list(initial_sum_sq_grad[a]) for a in ACTIONS} if initial_sum_sq_grad
+            else {a: [0.0] * feature_count for a in ACTIONS}
+        )
 
     def q_values(self, state: list[float]) -> dict[str, float]:
         return {a: sum(w * s for w, s in zip(self.weights[a], state)) for a in ACTIONS}
@@ -337,7 +361,7 @@ def _take_action_sized(
 def train_rl_policy(
     df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
     episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
-    starting_balance: float = DEFAULT_STARTING_BALANCE,
+    starting_balance: float = DEFAULT_STARTING_BALANCE, warm_start: Optional[RLPolicy] = None,
 ) -> tuple[RLPolicy, BacktestRun, list[Signal]]:
     """
     Trains a LinearQPolicy via epsilon-greedy Q-learning over the train slice (chronological
@@ -350,6 +374,20 @@ def train_rl_policy(
     starting_balance/ending_balance/total_return_pct -- a real "what would $X have grown to"
     simulation, not just an average per-trade return, since sizing makes growth compounding
     and path-dependent rather than a flat mean.
+
+    warm_start: the previously persisted RLPolicy for this pair/interval, if any -- continuing
+    from it (weights AND Adagrad's sum_sq_grad, see LinearQPolicy) instead of zero-initializing
+    is what lets repeated training runs actually build on prior findings rather than re-fitting
+    the same historical data from scratch every time (see main.py's /rl/train docstring for the
+    full "keep training" discussion). Only honored when warm_start.feature_names exactly
+    matches the current RL_FEATURE_NAMES -- a policy trained under an older/different feature
+    schema can't be warm-started into a differently-shaped state vector (same incompatibility
+    choose_action already guards against for live inference), so this silently and safely falls
+    back to a fresh run instead, rather than raising -- an outdated policy simply isn't grounds
+    to fail an otherwise-normal training request. When warm-starting, exploration also starts
+    from EPSILON_START_RESUME (well below the fresh-run EPSILON_START) -- see that constant's
+    own comment for why starting a continuation at full random exploration would actively
+    degrade weights it's supposed to be building on.
 
     Also returns one Signal per individual test-slice trade (hit/miss/expired), tagged with
     the eval BacktestRun's run_id -- reuses run_backtest's own persistence path
@@ -390,9 +428,15 @@ def train_rl_policy(
             f"max_lookforward={max_lookforward}. Ingest more history or raise train_frac."
         )
 
-    policy = LinearQPolicy(len(RL_FEATURE_NAMES))
-    epsilon = EPSILON_START
-    epsilon_decay = (EPSILON_MIN / EPSILON_START) ** (1 / max(episodes, 1))
+    use_warm_start = warm_start is not None and warm_start.feature_names == RL_FEATURE_NAMES
+    if use_warm_start:
+        policy = LinearQPolicy(len(RL_FEATURE_NAMES), warm_start.weights, warm_start.sum_sq_grad or None)
+        epsilon_start = EPSILON_START_RESUME
+    else:
+        policy = LinearQPolicy(len(RL_FEATURE_NAMES))
+        epsilon_start = EPSILON_START
+    epsilon = epsilon_start
+    epsilon_decay = (EPSILON_MIN / epsilon_start) ** (1 / max(episodes, 1))
 
     for _episode in range(episodes):
         i = min_warmup
@@ -524,6 +568,8 @@ def train_rl_policy(
         feature_names=RL_FEATURE_NAMES,
         eval_run_id=eval_run.run_id,
         starting_balance=starting_balance,
+        sum_sq_grad=policy.sum_sq_grad,
+        warm_started_from=warm_start.policy_id if use_warm_start else None,
     )
 
     return rl_policy, eval_run, trade_signals

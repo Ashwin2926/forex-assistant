@@ -190,13 +190,18 @@ async def list_signals(pair: str | None = None, limit: int = 50):
 
 
 @app.post("/signals/score")
-async def score_signals(max_lookforward: int = 20):
+async def score_signals(max_lookforward: int | None = None):
     """
     Checks every pending live signal against candles that have arrived since it fired,
     resolving status to hit/miss/expired wherever enough real data now exists — the live
     equivalent of what the backtester does against fixed history. Run this after each
     /ingest so newly-arrived candles get checked; the .github/workflows/keep-fresh.yml
     cron does both automatically every 15 minutes, this is for triggering it on demand.
+
+    max_lookforward left unset (the default) uses each signal's own interval-appropriate
+    window (outcome_scoring.LIVE_MAX_LOOKFORWARD_BY_INTERVAL) instead of one flat value for
+    every interval -- pass an explicit value here only to force the same window everywhere
+    (e.g. for a quick manual comparison against the old behavior).
     """
     return await score_pending_signals(max_lookforward=max_lookforward)
 
@@ -291,7 +296,7 @@ async def get_candles(interval: str, pair: str, profile: str = "swing", limit: i
 
 
 @app.post("/consensus/score")
-async def score_consensus_signals(max_lookforward: int = 20):
+async def score_consensus_signals(max_lookforward: int | None = None):
     """
     Closes the loop for live consensus signals the same way /signals/score does for regular
     ones -- resolves pending consensus signals to hit/miss/expired against candles that have
@@ -837,6 +842,7 @@ RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 async def _run_rl_training(
     pair: str, interval: str, episodes: int, train_frac: float, max_lookforward: int, starting_balance: float,
+    reset: bool = False,
 ):
     """
     Shared by POST /rl/train and the /rl/train-all background job below -- fetches candle
@@ -849,6 +855,14 @@ async def _run_rl_training(
     event loop, which matters a lot more here than it did for a single call, since the batch
     job below calls this 20 times in a row and other requests (status polling, live signal
     generation, the cron) still need to get through during those ~15 minutes.
+
+    Looks up this pair/interval's most recently persisted policy and passes it to
+    train_rl_policy as warm_start (unless reset=True) so training continues from what the
+    prior run learned instead of starting from zero weights every single time -- see
+    train_rl_policy's own docstring for why this is what actually makes "keep training"
+    accumulate instead of just re-fitting the same history repeatedly. Safe by construction:
+    train_rl_policy itself falls back to a fresh run if the found policy's feature_names don't
+    match the current schema, so this lookup never needs its own compatibility check.
     """
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1 (exclusive).")
@@ -861,10 +875,18 @@ async def _run_rl_training(
     if not docs:
         raise ValueError(f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.")
 
+    warm_start = None
+    if not reset:
+        prior_doc = await rl_policies_collection.find_one(
+            {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
+        )
+        if prior_doc is not None:
+            warm_start = RLPolicy(**{k: v for k, v in prior_doc.items() if k != "_id"})
+
     df = pd.DataFrame(docs)
     policy, eval_run, trade_signals = await run_in_threadpool(
         train_rl_policy, df, pair, interval, config, episodes=episodes, train_frac=train_frac,
-        max_lookforward=max_lookforward, starting_balance=starting_balance,
+        max_lookforward=max_lookforward, starting_balance=starting_balance, warm_start=warm_start,
     )
 
     # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
@@ -880,7 +902,7 @@ async def _run_rl_training(
 @app.post("/rl/train/{interval}")
 async def train_rl(
     interval: str, pair: str, episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
-    starting_balance: float = DEFAULT_STARTING_BALANCE,
+    starting_balance: float = DEFAULT_STARTING_BALANCE, reset: bool = False,
 ):
     """
     Trains a linear Q-policy (app/services/rl_engine.py) for this pair/interval via
@@ -904,9 +926,19 @@ async def train_rl(
     For training every pair x interval at once, see POST /rl/train-all instead -- doing that
     here by simply looping client-side is what used to make the frontend's "Train all" a
     ~15-minute sequence of fetches the browser tab had to hold open the whole time.
+
+    By default this continues from this pair/interval's most recently persisted policy (warm
+    start -- see train_rl_policy's docstring) rather than retraining from zero weights every
+    call, so repeated training actually builds on prior runs instead of just re-fitting the
+    same growing candle history from scratch each time. Pass reset=true to force a fresh
+    zero-initialized run instead (e.g. after deliberately changing RL_ATR_MULTS_BY_PROFILE or
+    another training-behavior constant, where continuing from the old policy's weights isn't
+    desired even though the feature schema itself hasn't changed).
     """
     try:
-        policy, eval_run = await _run_rl_training(pair, interval, episodes, train_frac, max_lookforward, starting_balance)
+        policy, eval_run = await _run_rl_training(
+            pair, interval, episodes, train_frac, max_lookforward, starting_balance, reset=reset,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"policy": policy, "evaluation": eval_run}
@@ -1079,7 +1111,8 @@ async def _supersede_pending_rl_signal(pending: dict, current_price: float) -> N
     """
     Marks a pending RL signal "superseded" because the policy's live view has moved on (a
     newer decision at the same pair/interval disagrees with it), rather than leaving it to
-    resolve naturally against label_outcome's max_lookforward window (up to ~20 hours at 1h).
+    resolve naturally against label_outcome's live window (see
+    outcome_scoring.LIVE_MAX_LOOKFORWARD_BY_INTERVAL -- several days at most intervals).
     This project treats "pending" as "still the agent's current live view" for RL signals
     specifically, since they're meant to be traded manually and soon -- a stale one hanging
     around for most of a day isn't a real trade opportunity anymore. The record is UPDATED,
@@ -1296,11 +1329,15 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
 
 
 @app.post("/rl/score")
-async def score_rl_signals(max_lookforward: int = 20):
+async def score_rl_signals(max_lookforward: int | None = None):
     """
     Closes the loop for live RL signals the same way /signals/score and /consensus/score do
     for their own collections -- the live, forward-going half of "backtest its signals and
     learn" (the historical-replay half is POST /rl/train itself).
+
+    max_lookforward left unset (the default, what the cron always uses) gives each signal its
+    own interval-appropriate window instead of one flat candle count for every interval -- see
+    outcome_scoring.LIVE_MAX_LOOKFORWARD_BY_INTERVAL.
     """
     return await score_pending_rl_signals(max_lookforward=max_lookforward)
 
