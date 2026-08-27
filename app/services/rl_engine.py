@@ -362,6 +362,7 @@ def train_rl_policy(
     df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
     episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
     starting_balance: float = DEFAULT_STARTING_BALANCE, warm_start: Optional[RLPolicy] = None,
+    target_atr_mult_override: Optional[float] = None, stop_atr_mult_override: Optional[float] = None,
 ) -> tuple[RLPolicy, BacktestRun, list[Signal]]:
     """
     Trains a LinearQPolicy via epsilon-greedy Q-learning over the train slice (chronological
@@ -398,13 +399,23 @@ def train_rl_policy(
     RL-generated decision needs to pass through a Signal-shaped interface; reasons=[] since
     there's no rule-by-rule breakdown for a learned policy the way there is for the rule
     engine.
+
+    target_atr_mult_override/stop_atr_mult_override: for sweeping candidate values against a
+    profile (see RL_ATR_MULTS_BY_PROFILE's own comment) without needing a code change +
+    redeploy per candidate. Omit both to use the profile's own RL_ATR_MULTS_BY_PROFILE entry
+    as before; the caller is responsible for keeping the >=1.5:1 target:stop ratio that
+    constant's comment requires if it overrides these -- this function doesn't enforce it,
+    the same way it doesn't validate any other RuleConfig-driven parameter.
     """
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1 (exclusive).")
     if starting_balance <= 0:
         raise ValueError("starting_balance must be positive.")
 
-    target_atr_mult, stop_atr_mult = rl_atr_mults(rl_config_profile(interval))
+    if target_atr_mult_override is not None and stop_atr_mult_override is not None:
+        target_atr_mult, stop_atr_mult = target_atr_mult_override, stop_atr_mult_override
+    else:
+        target_atr_mult, stop_atr_mult = rl_atr_mults(rl_config_profile(interval))
 
     df = df.reset_index(drop=True)
     indicator_df = add_all_indicators(df, config)

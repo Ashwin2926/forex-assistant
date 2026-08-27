@@ -851,7 +851,8 @@ RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 async def _run_rl_training(
     pair: str, interval: str, episodes: int, train_frac: float, max_lookforward: int, starting_balance: float,
-    reset: bool = False,
+    reset: bool = False, target_atr_mult_override: float | None = None, stop_atr_mult_override: float | None = None,
+    persist: bool = True,
 ):
     """
     Shared by POST /rl/train and the /rl/train-all background job below -- fetches candle
@@ -896,7 +897,18 @@ async def _run_rl_training(
     policy, eval_run, trade_signals = await run_in_threadpool(
         train_rl_policy, df, pair, interval, config, episodes=episodes, train_frac=train_frac,
         max_lookforward=max_lookforward, starting_balance=starting_balance, warm_start=warm_start,
+        target_atr_mult_override=target_atr_mult_override, stop_atr_mult_override=stop_atr_mult_override,
     )
+
+    if not persist:
+        # Dry run -- e.g. sweeping target_atr_mult_override/stop_atr_mult_override candidates.
+        # Must NOT touch rl_policies_collection: create_rl_signal always loads the most
+        # recently persisted policy and combines its weights with rl_atr_mults(profile) (the
+        # STORED default) at inference time, with no memory of what override a training run
+        # used. Persisting a policy trained under a different target/stop than what live
+        # inference will actually size trades with would leave the live system silently
+        # inconsistent -- weights calibrated to one reward scale, trades sized to another.
+        return policy, eval_run
 
     # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
     # own persistence) tagged with eval_run.run_id -- GET /backtest/runs/{run_id}/signals
@@ -912,6 +924,7 @@ async def _run_rl_training(
 async def train_rl(
     interval: str, pair: str, episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
     starting_balance: float = DEFAULT_STARTING_BALANCE, reset: bool = False,
+    target_atr_mult: float | None = None, stop_atr_mult: float | None = None, persist: bool = True,
 ):
     """
     Trains a linear Q-policy (app/services/rl_engine.py) for this pair/interval via
@@ -943,10 +956,19 @@ async def train_rl(
     zero-initialized run instead (e.g. after deliberately changing RL_ATR_MULTS_BY_PROFILE or
     another training-behavior constant, where continuing from the old policy's weights isn't
     desired even though the feature schema itself hasn't changed).
+
+    target_atr_mult/stop_atr_mult: override this profile's RL_ATR_MULTS_BY_PROFILE entry for
+    THIS call only -- for sweeping candidate values without a code change + redeploy per
+    candidate. Must pass persist=false alongside these (or leave persist at its default and
+    accept the training-behavior mismatch described in _run_rl_training's own docstring is
+    NOT what you want here) -- a policy trained under an override, if persisted, would become
+    the live policy for this pair/interval while live inference still sizes trades from the
+    profile's STORED default, not whatever override this call used.
     """
     try:
         policy, eval_run = await _run_rl_training(
             pair, interval, episodes, train_frac, max_lookforward, starting_balance, reset=reset,
+            target_atr_mult_override=target_atr_mult, stop_atr_mult_override=stop_atr_mult, persist=persist,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
