@@ -404,11 +404,16 @@ export interface SignalAccuracy {
 // shape of.
 export interface RunAllFlowsResult {
   ingest: Record<string, unknown>;
+  // Per pair/interval: "error: ..." on failure, otherwise a small summary object (not "ok"
+  // like the other sections -- retraining is worth surfacing hit_rate_pct/total_return_pct
+  // inline, not just pass/fail).
+  rl_training: Record<string, string | { policy_id: string; hit_rate_pct: number | null; total_return_pct: number | null }>;
   signals: Record<string, string>;
   consensus: Record<string, string>;
   rl_signals: Record<string, string>;
   score: { signals?: unknown; consensus?: unknown; rl?: unknown };
   ml_train: unknown;
+  fatal_error?: string;
 }
 
 // POST /ops/run-all-flows runs as a background job (the full sequence can take well over a
@@ -417,10 +422,14 @@ export interface RunAllFlowsResult {
 // same pattern as RLTrainAllJob.
 export interface RunAllFlowsJob {
   job_id: string;
-  status: "running" | "done";
+  status: "running" | "done" | "cancelled";
   created_at: string;
   finished_at?: string | null;
   results: RunAllFlowsResult | Record<string, never>;
+  current_step?: string | null;
+  completed_steps: number;
+  total_steps: number;
+  cancel_requested: boolean;
 }
 
 export interface CandlePoint {

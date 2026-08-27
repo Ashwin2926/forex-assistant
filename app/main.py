@@ -1705,96 +1705,179 @@ async def list_paper_trade_history(status: str | None = None, limit: int = 100):
     return docs
 
 
+async def _run_all_flows_step(job_id: str, results: dict, step_label: str) -> bool:
+    """
+    Shared checkpoint after each unit of work in _run_all_flows_job: persists progress
+    (current_step/completed_steps/results so far) and reports whether the job should keep
+    going. Every write is filtered on status="running" so a force-cancelled job can't be
+    resurrected by writes that happen to still be in flight when the cancel lands -- same
+    guard run_train_all_job uses. Returns False (caller should stop) if the job was
+    cancelled or the doc has vanished/changed status underneath it.
+    """
+    doc = await run_all_flows_jobs_collection.find_one_and_update(
+        {"job_id": job_id, "status": "running"},
+        {"$set": {"current_step": step_label, "results": results}, "$inc": {"completed_steps": 1}},
+    )
+    if doc is None:
+        return False  # already cancelled (or otherwise no longer running) -- stop here
+    return not doc.get("cancel_requested")
+
+
 async def _run_all_flows_job(job_id: str) -> None:
     """
     The actual work behind POST /ops/run-all-flows, run as a background task -- see that
-    endpoint's docstring for what this replicates and why RL training is excluded. Runs as a
+    endpoint's docstring for what this replicates. Runs as a
     BackgroundTasks target (started right after the job doc is created and the response
     already sent) specifically because the full sequence can take well over Cloudflare's
     ~100s proxy timeout, the same 524 this project already hit with a single /rl/train call
     -- a synchronous request/response here would just be a bigger version of that same
     problem, not a fix. Same "persist a job doc, poll it" pattern as run_train_all_job.
+
+    Writes progress after every checkpoint (_run_all_flows_step) and wraps the entire body
+    in try/except -- found live: users reported this "sometimes getting stuck or not
+    finishing," and the original version only ever wrote to Mongo once, at the very end, with
+    no top-level exception handling. Either a genuinely slow run OR an outright crash inside
+    it (an exception escaping every individual try/except below -- e.g. a bug in the newer
+    case-memory lookups this job also exercises via create_rl_signal) looked EXACTLY the
+    same from the outside: the job doc stuck at status="running" forever, no way to tell
+    which had happened or to do anything about it.
+
+    Includes RL training now (previously deliberately excluded -- see git history for why),
+    per explicit user request that "Sync now" mean everything: backfill, retrain, and
+    regenerate signals in one action, not ingest-and-signals with training left as a separate
+    manual step. Placed right after ingest and before live signal generation specifically so
+    the RL signals this same run produces come from the freshly-trained policy, not the
+    previous one.
     """
-    results: dict = {"ingest": {}, "signals": {}, "consensus": {}, "rl_signals": {}, "score": {}, "ml_train": None}
-
-    for i, interval in enumerate(RL_INTERVALS):
-        if i > 0:
-            # A normal scheduled cron tick only ever ingests ONE interval group at a time
-            # (see keep-fresh.yml's per-interval `if` gates) -- this job is the one path that
-            # deliberately ingests every interval in one go ("catch everything up now"), which
-            # is exactly what produced a live 429 from Twelve Data the first time this ran
-            # (5 intervals x 4 pairs = 20 requests fired back-to-back with zero spacing,
-            # landing right after an earlier manual workflow_dispatch had just done the same
-            # thing). This doesn't change the daily credit cost (still 1 credit/pair/interval
-            # either way) -- it only paces out the per-minute REQUEST rate this job itself
-            # generates, unrelated to whatever the normal cron happens to be doing at the
-            # same time.
-            await asyncio.sleep(8)
-        try:
-            results["ingest"][interval] = await ingest(interval, output_size=5)
-        except Exception as e:
-            results["ingest"][interval] = f"error: {e}"
-
-    for interval in RL_INTERVALS:
-        profile = "intraday" if interval in ("5min", "15min") else "swing"
-        for pair in settings.pairs_list:
-            key = f"{pair}/{interval}"
-            try:
-                await create_signal(interval, profile, pair)
-                results["signals"][key] = "ok"
-            except Exception as e:
-                results["signals"][key] = f"error: {e}"
-            try:
-                await create_consensus_signal(interval, pair)
-                results["consensus"][key] = "ok"
-            except Exception as e:
-                results["consensus"][key] = f"error: {e}"
-            try:
-                await create_rl_signal(interval, pair)
-                results["rl_signals"][key] = "ok"
-            except Exception as e:
-                results["rl_signals"][key] = f"error: {e}"
-
-    try:
-        results["score"]["signals"] = await score_signals()
-    except Exception as e:
-        results["score"]["signals"] = f"error: {e}"
-    try:
-        results["score"]["consensus"] = await score_consensus_signals()
-    except Exception as e:
-        results["score"]["consensus"] = f"error: {e}"
-    try:
-        bg = BackgroundTasks()
-        results["score"]["rl"] = await score_rl_signals(bg)
-        await bg()  # run any degradation-triggered retrains synchronously, same call
-    except Exception as e:
-        results["score"]["rl"] = f"error: {e}"
-
-    try:
-        results["ml_train"] = await train_ml_model()
-    except Exception as e:
-        results["ml_train"] = f"error: {e}"
-
+    results: dict = {
+        "ingest": {}, "rl_training": {}, "signals": {}, "consensus": {}, "rl_signals": {}, "score": {}, "ml_train": None,
+    }
+    # 5 ingest checkpoints + 20 RL-training checkpoints + 20 pair/interval checkpoints
+    # (signals+consensus+rl_signals together count as one unit of progress each) + 3 score
+    # checkpoints + 1 ml_train.
+    total_steps = len(RL_INTERVALS) + 2 * (len(RL_INTERVALS) * len(settings.pairs_list)) + 3 + 1
     await run_all_flows_jobs_collection.update_one(
-        {"job_id": job_id},
-        {"$set": {"status": "done", "finished_at": datetime.utcnow(), "results": results}},
+        {"job_id": job_id, "status": "running"}, {"$set": {"total_steps": total_steps}}
     )
+
+    try:
+        for i, interval in enumerate(RL_INTERVALS):
+            if i > 0:
+                # A normal scheduled cron tick only ever ingests ONE interval group at a time
+                # (see keep-fresh.yml's per-interval `if` gates) -- this job is the one path
+                # that deliberately ingests every interval in one go ("catch everything up
+                # now"), which is exactly what produced a live 429 from Twelve Data the first
+                # time this ran (5 intervals x 4 pairs = 20 requests fired back-to-back with
+                # zero spacing, landing right after an earlier manual workflow_dispatch had
+                # just done the same thing). This doesn't change the daily credit cost (still
+                # 1 credit/pair/interval either way) -- it only paces out the per-minute
+                # REQUEST rate this job itself generates, unrelated to whatever the normal
+                # cron happens to be doing at the same time.
+                await asyncio.sleep(8)
+            try:
+                results["ingest"][interval] = await ingest(interval, output_size=5)
+            except Exception as e:
+                results["ingest"][interval] = f"error: {e}"
+            if not await _run_all_flows_step(job_id, results, f"ingest {interval}"):
+                return
+
+        for interval in RL_INTERVALS:
+            for pair in settings.pairs_list:
+                key = f"{pair}/{interval}"
+                try:
+                    policy, eval_run = await _run_rl_training(
+                        pair, interval, DEFAULT_EPISODES, 0.7, max_lookforward=20, starting_balance=DEFAULT_STARTING_BALANCE,
+                    )
+                    results["rl_training"][key] = {
+                        "policy_id": policy.policy_id, "hit_rate_pct": eval_run.hit_rate_pct,
+                        "total_return_pct": eval_run.total_return_pct,
+                    }
+                except Exception as e:
+                    results["rl_training"][key] = f"error: {e}"
+                if not await _run_all_flows_step(job_id, results, f"train {key}"):
+                    return
+
+        for interval in RL_INTERVALS:
+            profile = "intraday" if interval in ("5min", "15min") else "swing"
+            for pair in settings.pairs_list:
+                key = f"{pair}/{interval}"
+                try:
+                    await create_signal(interval, profile, pair)
+                    results["signals"][key] = "ok"
+                except Exception as e:
+                    results["signals"][key] = f"error: {e}"
+                try:
+                    await create_consensus_signal(interval, pair)
+                    results["consensus"][key] = "ok"
+                except Exception as e:
+                    results["consensus"][key] = f"error: {e}"
+                try:
+                    await create_rl_signal(interval, pair)
+                    results["rl_signals"][key] = "ok"
+                except Exception as e:
+                    results["rl_signals"][key] = f"error: {e}"
+                if not await _run_all_flows_step(job_id, results, f"signals {key}"):
+                    return
+
+        try:
+            results["score"]["signals"] = await score_signals()
+        except Exception as e:
+            results["score"]["signals"] = f"error: {e}"
+        if not await _run_all_flows_step(job_id, results, "score signals"):
+            return
+
+        try:
+            results["score"]["consensus"] = await score_consensus_signals()
+        except Exception as e:
+            results["score"]["consensus"] = f"error: {e}"
+        if not await _run_all_flows_step(job_id, results, "score consensus"):
+            return
+
+        try:
+            bg = BackgroundTasks()
+            results["score"]["rl"] = await score_rl_signals(bg)
+            await bg()  # run any degradation-triggered retrains synchronously, same call
+        except Exception as e:
+            results["score"]["rl"] = f"error: {e}"
+        if not await _run_all_flows_step(job_id, results, "score rl"):
+            return
+
+        try:
+            results["ml_train"] = await train_ml_model()
+        except Exception as e:
+            results["ml_train"] = f"error: {e}"
+        if not await _run_all_flows_step(job_id, results, "ml_train"):
+            return
+
+        await run_all_flows_jobs_collection.update_one(
+            {"job_id": job_id, "status": "running"},
+            {"$set": {"status": "done", "finished_at": datetime.utcnow(), "results": results, "current_step": None}},
+        )
+    except Exception as e:
+        # Something escaped every individual try/except above -- still resolve the job
+        # instead of leaving it "running" forever with no explanation.
+        results["fatal_error"] = str(e)
+        await run_all_flows_jobs_collection.update_one(
+            {"job_id": job_id, "status": "running"},
+            {"$set": {"status": "done", "finished_at": datetime.utcnow(), "results": results, "current_step": None}},
+        )
 
 
 @app.post("/ops/run-all-flows")
 async def run_all_flows(background_tasks: BackgroundTasks):
     """
-    Manually replicates everything .github/workflows/keep-fresh.yml does on a normal cron
-    firing -- ingest every interval, generate signals (regular + consensus + RL) across every
-    pair/interval, score all three, retrain the ML classifier -- as a background job, since
-    the full sequence can take well over a minute (see _run_all_flows_job's own docstring).
-    Returns job_id immediately; poll GET /ops/run-all-flows/{job_id} for status/results.
+    Manually replicates a full catch-up cycle -- ingest every interval, retrain every RL
+    policy, generate signals (regular + consensus + RL) across every pair/interval, score
+    all three, retrain the ML classifier -- as a background job, since the full sequence can
+    take well over a minute (see _run_all_flows_job's own docstring). Returns job_id
+    immediately; poll GET /ops/run-all-flows/{job_id} for status/results.
 
-    Deliberately excludes RL TRAINING (POST /rl/train-all): that's the heavy, once-daily part
-    of the cron (many epsilon-greedy episodes per pair/interval, ~15-20 min total across 20
-    combos) and isn't what a stale-cron gap actually needs caught up -- a policy doesn't need
-    to be as fresh as the candles it reads (see rl_engine.py's own DEFAULT_EPISODES comment).
-    Trigger POST /rl/train-all separately if training itself has also gone stale.
+    Includes RL training across all 20 pair/interval combos (the same work POST
+    /rl/train-all does, ~20-30 min alone) -- by explicit user request that "Sync now" mean
+    everything, not ingest-and-signals with training left as a separate manual step. This
+    makes the whole job noticeably longer than keep-fresh.yml's own per-cycle work (which
+    only trains once daily); current_step/completed_steps/total_steps exist specifically so
+    that length is visible progress, not an indistinguishable-from-stuck wait.
 
     For when the GitHub Actions cron has gone quiet for a while (its own scheduler isn't
     always reliable under load -- confirmed live 2026-08-27, a ~5hr gap with zero runs despite
@@ -1819,5 +1902,29 @@ async def get_run_all_flows_job(job_id: str):
     doc = await run_all_flows_jobs_collection.find_one({"job_id": job_id})
     if doc is None:
         raise HTTPException(status_code=404, detail=f"No run-all-flows job found with job_id={job_id}")
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+
+@app.post("/ops/run-all-flows/{job_id}/cancel")
+async def cancel_run_all_flows_job(job_id: str):
+    """
+    Immediately marks a running "Sync now" job cancelled -- not just a request the job picks
+    up between checkpoints. Same reasoning as POST /rl/train-all/{job_id}/cancel: a step that
+    hangs outright (rather than just running long) means the background task's own coroutine
+    never comes back around to check a flag, so this updates the job document directly. If
+    the stuck step eventually finishes on its own after this, its leftover write is a no-op
+    -- see _run_all_flows_step's status="running" write guard.
+    """
+    doc = await run_all_flows_jobs_collection.find_one({"job_id": job_id})
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"No run-all-flows job found with job_id={job_id}")
+    if doc["status"] != "running":
+        raise HTTPException(status_code=400, detail=f"Job {job_id} is already {doc['status']}, nothing to cancel.")
+    await run_all_flows_jobs_collection.update_one(
+        {"job_id": job_id, "status": "running"},
+        {"$set": {"cancel_requested": True, "status": "cancelled", "finished_at": datetime.utcnow()}},
+    )
+    doc = await run_all_flows_jobs_collection.find_one({"job_id": job_id})
     doc["_id"] = str(doc["_id"])
     return doc

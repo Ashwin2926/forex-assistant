@@ -23,6 +23,7 @@ export function SyncNowButton() {
   const [loggedIn] = useState(() => !!getToken());
   const [status, setStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [summary, setSummary] = useState<string | null>(null);
+  const [progress, setProgress] = useState<{ step: string | null; completed: number; total: number } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   if (!loggedIn) return null;
@@ -37,15 +38,21 @@ export function SyncNowButton() {
   async function handleClick() {
     setStatus("running");
     setSummary(null);
+    setProgress(null);
     try {
       const { job_id } = await api.startRunAllFlows();
       pollRef.current = setInterval(async () => {
         try {
           const job = await api.getRunAllFlowsJob(job_id);
-          if (job.status === "done") {
+          if (job.status === "running") {
+            // Real progress now (not just a spinner) -- the job persists this after every
+            // checkpoint, so this tells apart "still working, on step 14/29" from "stuck."
+            setProgress({ step: job.current_step ?? null, completed: job.completed_steps, total: job.total_steps });
+          } else {
             stopPolling();
+            setProgress(null);
             setSummary(summarize(job.results as RunAllFlowsResult));
-            setStatus("done");
+            setStatus(job.status === "done" ? "done" : "error");
           }
         } catch (e) {
           stopPolling();
@@ -67,8 +74,15 @@ export function SyncNowButton() {
         title="Manually runs one full cron cycle (ingest, generate signals, score, retrain ML) right now -- use this when the cron hasn't run in a while instead of waiting on it."
         className="rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
       >
-        {status === "running" ? "Syncing…" : "Sync now"}
+        {status === "running"
+          ? progress && progress.total > 0
+            ? `Syncing… (${progress.completed}/${progress.total})`
+            : "Syncing…"
+          : "Sync now"}
       </button>
+      {status === "running" && progress?.step && (
+        <span className="text-xs text-zinc-400 dark:text-zinc-500">{progress.step}</span>
+      )}
       {summary && (
         <span className={`text-xs ${status === "error" ? "text-rose-600 dark:text-rose-400" : "text-zinc-500 dark:text-zinc-400"}`}>
           {summary}
@@ -79,9 +93,10 @@ export function SyncNowButton() {
 }
 
 function summarize(results: RunAllFlowsResult): string {
+  if (results.fatal_error) return `Crashed: ${results.fatal_error}`;
   const countErrors = (obj: Record<string, unknown>) =>
     Object.values(obj ?? {}).filter((v) => typeof v === "string" && v.startsWith("error:")).length;
   const errors =
-    countErrors(results.signals) + countErrors(results.consensus) + countErrors(results.rl_signals);
+    countErrors(results.rl_training) + countErrors(results.signals) + countErrors(results.consensus) + countErrors(results.rl_signals);
   return errors > 0 ? `Done, ${errors} step(s) had errors -- see /ops/run-all-flows for detail.` : "Done -- all steps ok.";
 }

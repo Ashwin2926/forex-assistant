@@ -327,6 +327,10 @@ export const api = {
   getRunAllFlowsJob(jobId: string) {
     return request<RunAllFlowsJob>(`/ops/run-all-flows/${jobId}`);
   },
+
+  cancelRunAllFlows(jobId: string) {
+    return request<RunAllFlowsJob>(`/ops/run-all-flows/${jobId}/cancel`, { method: "POST" });
+  },
 };
 
 export { ApiError };
