@@ -47,9 +47,16 @@ STRATEGY_NAMES = [fn.__name__.removeprefix("call_") for fn in STRATEGIES]
 #   raw_macd_hist_pct -- macd_hist as % of close, comparable across pairs at very different price scales
 #   raw_bb_width_pct -- Bollinger band width as % of price, a volatility-regime read distinct from atr_pct
 #   raw_volume_ratio -- volume / 20-bar volume SMA, capped to keep an illiquid-bar spike from dominating a gradient step
+#   raw_roc_pct -- 5-bar rate-of-change (indicators.rate_of_change), already a % so no further
+#                  scaling needed unlike macd_hist -- pure momentum magnitude, distinct from
+#                  raw_volume_ratio's confirmation signal and from any single strategy's vote
+#   raw_stoch_k_norm -- stoch_k/100, the oscillator's absolute LEVEL (near-0/near-1 = an
+#                       overbought/oversold extreme) -- distinct from raw_stoch_spread, which
+#                       only captures %K vs %D's relative direction, not where in [0,100] they sit
 RL_RAW_FEATURE_NAMES = [
     "raw_adx_norm", "raw_rsi_centered", "raw_stoch_spread",
     "raw_macd_hist_pct", "raw_bb_width_pct", "raw_volume_ratio",
+    "raw_roc_pct", "raw_stoch_k_norm",
 ]
 RL_MARKET_FEATURE_NAMES = [f"{name}_vote" for name in STRATEGY_NAMES] + ["atr_pct"] + RL_RAW_FEATURE_NAMES
 RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
@@ -225,10 +232,13 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
             min(float(latest["volume"] / latest["volume_sma"]), 5.0)
             if pd.notna(latest["volume_sma"]) and latest["volume_sma"] else 0.0
         )
+        raw_roc_pct = float(latest["roc"]) if pd.notna(latest["roc"]) else 0.0
+        raw_stoch_k_norm = float(latest["stoch_k"] / 100) if pd.notna(latest["stoch_k"]) else 0.0
 
         states.append(votes + [
             atr_pct, raw_adx_norm, raw_rsi_centered, raw_stoch_spread,
             raw_macd_hist_pct, raw_bb_width_pct, raw_volume_ratio,
+            raw_roc_pct, raw_stoch_k_norm,
         ])
     return states
 

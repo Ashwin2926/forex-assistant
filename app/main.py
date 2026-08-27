@@ -3,6 +3,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from datetime import datetime
+import asyncio
 import uuid
 import pandas as pd
 
@@ -1716,7 +1717,19 @@ async def _run_all_flows_job(job_id: str) -> None:
     """
     results: dict = {"ingest": {}, "signals": {}, "consensus": {}, "rl_signals": {}, "score": {}, "ml_train": None}
 
-    for interval in RL_INTERVALS:
+    for i, interval in enumerate(RL_INTERVALS):
+        if i > 0:
+            # A normal scheduled cron tick only ever ingests ONE interval group at a time
+            # (see keep-fresh.yml's per-interval `if` gates) -- this job is the one path that
+            # deliberately ingests every interval in one go ("catch everything up now"), which
+            # is exactly what produced a live 429 from Twelve Data the first time this ran
+            # (5 intervals x 4 pairs = 20 requests fired back-to-back with zero spacing,
+            # landing right after an earlier manual workflow_dispatch had just done the same
+            # thing). This doesn't change the daily credit cost (still 1 credit/pair/interval
+            # either way) -- it only paces out the per-minute REQUEST rate this job itself
+            # generates, unrelated to whatever the normal cron happens to be doing at the
+            # same time.
+            await asyncio.sleep(8)
         try:
             results["ingest"][interval] = await ingest(interval, output_size=5)
         except Exception as e:
