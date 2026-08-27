@@ -29,11 +29,11 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     >
       <body className="min-h-full flex flex-col bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
         <header className="border-b border-zinc-200 dark:border-zinc-800">
-          <div className="mx-auto flex max-w-5xl items-center gap-6 px-6 py-4">
-            <span className="text-sm font-semibold tracking-tight">
+          <div className="mx-auto flex max-w-5xl items-center gap-6 overflow-x-auto px-6 py-4">
+            <span className="shrink-0 whitespace-nowrap text-sm font-semibold tracking-tight">
               Forex Trading Assistant
             </span>
-            <nav className="flex gap-4 text-sm text-zinc-500 dark:text-zinc-400">
+            <nav className="flex shrink-0 gap-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">
               <Link href="/" className="hover:text-zinc-900 dark:hover:text-zinc-100">
                 Signal Feed
               </Link>
@@ -59,8 +59,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                 RL Agent
               </Link>
             </nav>
-            <SyncNowButton />
-            <AuthNav />
+            <div className="ml-auto flex shrink-0 items-center gap-4 whitespace-nowrap">
+              <SyncNowButton />
+              <AuthNav />
+            </div>
           </div>
         </header>
         <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">
