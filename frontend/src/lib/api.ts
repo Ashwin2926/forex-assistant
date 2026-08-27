@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLMemorySummary, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsResult, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLMemorySummary, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -318,10 +318,14 @@ export const api = {
   // Manually replicates one keep-fresh.yml cron cycle (ingest, generate signals, score,
   // retrain ML) -- for when the GitHub Actions cron has gone quiet for a while. Excludes RL
   // training (see POST /rl/train-all separately) -- see the endpoint's own docstring for why.
-  // Takes a while (many sequential ingest/signal/score calls across every pair/interval) --
-  // callers should show a loading state, not assume this resolves quickly.
-  runAllFlows() {
-    return request<RunAllFlowsResult>("/ops/run-all-flows", { method: "POST" });
+  // Runs as a background job (can take well over a minute) -- poll getRunAllFlowsJob for
+  // status/results, same pattern as RL "train all".
+  startRunAllFlows() {
+    return request<{ job_id: string; status: string }>("/ops/run-all-flows", { method: "POST" });
+  },
+
+  getRunAllFlowsJob(jobId: string) {
+    return request<RunAllFlowsJob>(`/ops/run-all-flows/${jobId}`);
   },
 };
 

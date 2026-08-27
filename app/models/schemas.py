@@ -381,6 +381,22 @@ class RLTrainAllJob(BaseModel):
     total: int
     completed: int = 0
     results: list[RLTrainAllCell] = []
+
+
+class RunAllFlowsJob(BaseModel):
+    """
+    Tracks the manual "Sync now" catch-up job (app/main.py's run_all_flows_job background
+    task) the same way RLTrainAllJob tracks "train all" -- persisted in Mongo, not
+    in-process memory, for the same FastAPI-Cloud-can-recycle-the-instance reason. Needed
+    because the full ingest+generate+score+ml_train sequence across every pair/interval can
+    take well over Cloudflare's ~100s proxy timeout, so it can't just be a synchronous
+    request/response the way POST /signals/score alone can.
+    """
+    job_id: str
+    status: Literal["running", "done"]
+    created_at: datetime
+    finished_at: Optional[datetime] = None
+    results: dict = {}
     # Set by POST /rl/train-all/{job_id}/cancel -- checked between combos (not mid-combo; a
     # single train_rl_policy call can't be interrupted partway through without much more
     # complexity, so cancelling stops it from STARTING the next pair/interval, worst case

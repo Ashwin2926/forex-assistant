@@ -20,8 +20,11 @@ from app.core.database import (
     rl_policies_collection,
     rl_signals_collection,
     rl_train_jobs_collection,
+    run_all_flows_jobs_collection,
 )
-from app.models.schemas import LoginRequest, RuleConfig, RLPolicy, RLSignal, RLTrainAllJob, RLTrainAllCell
+from app.models.schemas import (
+    LoginRequest, RuleConfig, RLPolicy, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob,
+)
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, spread_cost_pct
@@ -1663,28 +1666,15 @@ async def list_paper_trade_history(status: str | None = None, limit: int = 100):
     return docs
 
 
-@app.post("/ops/run-all-flows")
-async def run_all_flows():
+async def _run_all_flows_job(job_id: str) -> None:
     """
-    Manually replicates everything .github/workflows/keep-fresh.yml does on a normal cron
-    firing -- ingest every interval, generate signals (regular + consensus + RL) across every
-    pair/interval, score all three, retrain the ML classifier -- in one call, synchronously.
-
-    Deliberately excludes RL TRAINING (POST /rl/train-all): that's the heavy, once-daily part
-    of the cron (many epsilon-greedy episodes per pair/interval, ~15-20 min total across 20
-    combos) and isn't what a stale-cron gap actually needs caught up -- a policy doesn't need
-    to be as fresh as the candles it reads (see rl_engine.py's own DEFAULT_EPISODES comment).
-    Trigger POST /rl/train-all separately if training itself has also gone stale.
-
-    For when the GitHub Actions cron has gone quiet for a while (its own scheduler isn't
-    always reliable under load -- confirmed live 2026-08-27, a ~5hr gap with zero runs despite
-    an active */20 schedule, see CLAUDE.md) and someone wants today's candles/signals caught
-    up right now instead of waiting on it or triggering the workflow on GitHub directly.
-
-    Every step is individually try/excepted so one pair/interval/step failing (a Twelve Data
-    quota hit, "no trained policy yet", etc.) doesn't stop the rest from running -- same
-    tolerance keep-fresh.yml's own `|| true` steps already have. Ingest uses output_size=5
-    (a light top-up, matching the cron's own per-cycle amount) -- not a deep backfill.
+    The actual work behind POST /ops/run-all-flows, run as a background task -- see that
+    endpoint's docstring for what this replicates and why RL training is excluded. Runs as a
+    BackgroundTasks target (started right after the job doc is created and the response
+    already sent) specifically because the full sequence can take well over Cloudflare's
+    ~100s proxy timeout, the same 524 this project already hit with a single /rl/train call
+    -- a synchronous request/response here would just be a bigger version of that same
+    problem, not a fix. Same "persist a job doc, poll it" pattern as run_train_all_job.
     """
     results: dict = {"ingest": {}, "signals": {}, "consensus": {}, "rl_signals": {}, "score": {}, "ml_train": None}
 
@@ -1734,4 +1724,49 @@ async def run_all_flows():
     except Exception as e:
         results["ml_train"] = f"error: {e}"
 
-    return results
+    await run_all_flows_jobs_collection.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "done", "finished_at": datetime.utcnow(), "results": results}},
+    )
+
+
+@app.post("/ops/run-all-flows")
+async def run_all_flows(background_tasks: BackgroundTasks):
+    """
+    Manually replicates everything .github/workflows/keep-fresh.yml does on a normal cron
+    firing -- ingest every interval, generate signals (regular + consensus + RL) across every
+    pair/interval, score all three, retrain the ML classifier -- as a background job, since
+    the full sequence can take well over a minute (see _run_all_flows_job's own docstring).
+    Returns job_id immediately; poll GET /ops/run-all-flows/{job_id} for status/results.
+
+    Deliberately excludes RL TRAINING (POST /rl/train-all): that's the heavy, once-daily part
+    of the cron (many epsilon-greedy episodes per pair/interval, ~15-20 min total across 20
+    combos) and isn't what a stale-cron gap actually needs caught up -- a policy doesn't need
+    to be as fresh as the candles it reads (see rl_engine.py's own DEFAULT_EPISODES comment).
+    Trigger POST /rl/train-all separately if training itself has also gone stale.
+
+    For when the GitHub Actions cron has gone quiet for a while (its own scheduler isn't
+    always reliable under load -- confirmed live 2026-08-27, a ~5hr gap with zero runs despite
+    an active */20 schedule, see CLAUDE.md) and someone wants today's candles/signals caught
+    up right now instead of waiting on it or triggering the workflow on GitHub directly.
+
+    Every step inside the job is individually try/excepted so one pair/interval/step failing
+    (a Twelve Data quota hit, "no trained policy yet", etc.) doesn't stop the rest from
+    running -- same tolerance keep-fresh.yml's own `|| true` steps already have. Ingest uses
+    output_size=5 (a light top-up, matching the cron's own per-cycle amount), not a deep
+    backfill.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    job = RunAllFlowsJob(job_id=job_id, status="running", created_at=datetime.utcnow())
+    await run_all_flows_jobs_collection.insert_one(job.model_dump())
+    background_tasks.add_task(_run_all_flows_job, job_id)
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/ops/run-all-flows/{job_id}")
+async def get_run_all_flows_job(job_id: str):
+    doc = await run_all_flows_jobs_collection.find_one({"job_id": job_id})
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"No run-all-flows job found with job_id={job_id}")
+    doc["_id"] = str(doc["_id"])
+    return doc

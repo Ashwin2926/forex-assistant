@@ -396,11 +396,12 @@ export interface SignalAccuracy {
   directional_hit_rate_pct: number | null;
 }
 
-// Result of POST /ops/run-all-flows -- the manual "catch up now" button, for when the
-// GitHub Actions cron has gone quiet for a while. Loosely typed on purpose: each section's
-// per-key value is either "ok", an "error: ..." string, or (for ingest/score/ml_train) the
-// underlying endpoint's own result shape passed through unchanged -- this button is a manual
-// diagnostic/ops action, not something other UI logic needs to depend on the exact shape of.
+// Results section of a finished RunAllFlowsJob -- the manual "catch up now" job, for when
+// the GitHub Actions cron has gone quiet for a while. Loosely typed on purpose: each
+// section's per-key value is either "ok", an "error: ..." string, or (for ingest/score/
+// ml_train) the underlying endpoint's own result shape passed through unchanged -- this is a
+// manual diagnostic/ops action, not something other UI logic needs to depend on the exact
+// shape of.
 export interface RunAllFlowsResult {
   ingest: Record<string, unknown>;
   signals: Record<string, string>;
@@ -408,6 +409,18 @@ export interface RunAllFlowsResult {
   rl_signals: Record<string, string>;
   score: { signals?: unknown; consensus?: unknown; rl?: unknown };
   ml_train: unknown;
+}
+
+// POST /ops/run-all-flows runs as a background job (the full sequence can take well over a
+// minute -- Cloudflare's proxy has a ~100s timeout, the same 524 this project already hit
+// with a single /rl/train call) -- poll GET /ops/run-all-flows/{job_id} for status/results,
+// same pattern as RLTrainAllJob.
+export interface RunAllFlowsJob {
+  job_id: string;
+  status: "running" | "done";
+  created_at: string;
+  finished_at?: string | null;
+  results: RunAllFlowsResult | Record<string, never>;
 }
 
 export interface CandlePoint {
