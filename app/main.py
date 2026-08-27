@@ -1232,35 +1232,46 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     # vector; empty/none for a brand new pair/interval or one whose history predates the state
     # field, same "surface as absent, not a fabricated number" convention as ml_model's
     # None-when-not-enough-data.
-    memory_candidates = await rl_signals_collection.find({
-        "pair": pair, "interval": interval, "direction": direction,
-        "status": {"$in": list(RESOLVED_STATUSES)},
-    }).to_list(length=None)
-    memory = memory_summary(state, memory_candidates)
+    # TEMP DEBUG (2026-08-27): live /rl/signal calls started 500ing after this block shipped
+    # and the real cause isn't reproducible locally against synthetic data -- wrapped so a
+    # bug here degrades to "no memory this call" (error surfaced in the response) instead of
+    # blocking every live signal, while surfacing the actual exception to fix it for real.
+    memory: dict = {}
+    gated_tier, memory_override = tier, None
+    try:
+        memory_candidates = await rl_signals_collection.find({
+            "pair": pair, "interval": interval, "direction": direction,
+            "status": {"$in": list(RESOLVED_STATUSES)},
+        }).to_list(length=None)
+        memory = memory_summary(state, memory_candidates)
 
-    # This policy's own OVERALL resolved-trade record for this pair/interval (both directions
-    # combined, same directional-hit-rate math as GET /rl/accuracy) -- distinct from the
-    # narrow, same-direction "similar cases" number above. A policy can be genuinely strong
-    # overall while still showing a weak LOCAL neighborhood for one specific setup (a handful
-    # of nearest cases is a small, sometimes-noisy sample) -- surfacing both numbers together,
-    # always, means a good policy's real track record doesn't get silently ignored just
-    # because memory_gate below is scoped to the narrower question. See memory_gate's own
-    # docstring for how the two get reconciled when they disagree.
-    overall_hits = await rl_signals_collection.count_documents(
-        {"pair": pair, "interval": interval, "status": "hit"}
-    )
-    overall_misses = await rl_signals_collection.count_documents(
-        {"pair": pair, "interval": interval, "status": "miss"}
-    )
-    overall_decided = overall_hits + overall_misses
-    memory["policy_hit_rate_pct"] = round(overall_hits / overall_decided * 100, 1) if overall_decided else None
-    memory["policy_decided_trades"] = overall_decided
+        # This policy's own OVERALL resolved-trade record for this pair/interval (both
+        # directions combined, same directional-hit-rate math as GET /rl/accuracy) --
+        # distinct from the narrow, same-direction "similar cases" number above. A policy can
+        # be genuinely strong overall while still showing a weak LOCAL neighborhood for one
+        # specific setup (a handful of nearest cases is a small, sometimes-noisy sample) --
+        # surfacing both numbers together, always, means a good policy's real track record
+        # doesn't get silently ignored just because memory_gate below is scoped to the
+        # narrower question. See memory_gate's own docstring for how the two get reconciled
+        # when they disagree.
+        overall_hits = await rl_signals_collection.count_documents(
+            {"pair": pair, "interval": interval, "status": "hit"}
+        )
+        overall_misses = await rl_signals_collection.count_documents(
+            {"pair": pair, "interval": interval, "status": "miss"}
+        )
+        overall_decided = overall_hits + overall_misses
+        memory["policy_hit_rate_pct"] = round(overall_hits / overall_decided * 100, 1) if overall_decided else None
+        memory["policy_decided_trades"] = overall_decided
 
-    # Act on memory, not just report it: memory_gate can downgrade LARGE->SMALL or override
-    # the whole trade to HOLD when similar past states have a poor track record -- see that
-    # function's own docstring for why this is a layered safety rule on top of the learned
-    # policy, same philosophy as the fixed 1.5:1 target:stop floor.
-    gated_tier, memory_override = memory_gate(memory, tier)
+        # Act on memory, not just report it: memory_gate can downgrade LARGE->SMALL or
+        # override the whole trade to HOLD when similar past states have a poor track record
+        # -- see that function's own docstring for why this is a layered safety rule on top
+        # of the learned policy, same philosophy as the fixed 1.5:1 target:stop floor.
+        gated_tier, memory_override = memory_gate(memory, tier)
+    except Exception as e:
+        import traceback
+        memory = {"error": f"{e!r}", "traceback": traceback.format_exc()}
     if gated_tier == "HOLD":
         if pending is not None:
             await _supersede_pending_rl_signal(pending, current_price)
