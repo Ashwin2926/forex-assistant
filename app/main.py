@@ -1291,8 +1291,17 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
         and pending["direction"] == rl_signal.direction
         and pending["entry_price"] == rl_signal.entry_price
         and pending["target_price"] == rl_signal.target_price
+        and pending["size_tier"] == rl_signal.size_tier
     ):
         # Exact repeat of the still-live signal -- nothing has changed, return it as-is.
+        # size_tier is checked alongside direction/entry/target (added the same day as
+        # memory_gate/warm-started retraining) -- without it, a policy whose size preference
+        # changed since this signal was created (e.g. after a warm-started retrain, or
+        # memory_gate's own downgrade decision changing as more cases accumulate) while
+        # direction/entry/target happened to stay identical (same still-open candle) would
+        # silently keep showing the OLD size_tier next to freshly recomputed q_values that no
+        # longer agree with it -- exactly the confusing "SMALL shown, but BUY_LARGE is now the
+        # top q-value" mismatch this was written to prevent.
         pending["_id"] = str(pending["_id"])
         return {"signal": pending, "q_values": q_values, "memory": memory}
 
