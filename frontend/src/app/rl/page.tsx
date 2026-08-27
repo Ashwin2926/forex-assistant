@@ -216,7 +216,7 @@ export default function RLPage() {
     return { pct: (totalHits / totalTrades) * 100, trades: totalTrades, combosDone: cells.length };
   })();
   const trainingConfidenceTrend = useTrend(trainingConfidence?.pct ?? null);
-  const overallAccuracyTrend = useTrend(overallAccuracy?.total_hit_rate_pct ?? null);
+  const overallAccuracyTrend = useTrend(overallAccuracy?.directional_hit_rate_pct ?? null);
 
   async function handleGenerateAll() {
     setGenerateAllRunning(true);
@@ -306,20 +306,24 @@ export default function RLPage() {
             <p className="mt-1 text-sm text-zinc-400">No resolved live RL signals yet.</p>
           ) : (
             <>
-              <p className={`mt-1 text-2xl font-semibold ${(overallAccuracy.total_hit_rate_pct ?? 0) >= 40 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                {overallAccuracy.total_hit_rate_pct}%
+              <p className={`mt-1 text-2xl font-semibold ${(overallAccuracy.directional_hit_rate_pct ?? 0) >= 40 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                {overallAccuracy.directional_hit_rate_pct ?? "—"}%
                 <TrendArrow trend={overallAccuracyTrend} />
               </p>
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                {overallAccuracy.total_hits}/{overallAccuracy.total_resolved} resolved live trades
-                {" "}(hit/miss/expired, every pair &amp; interval combined)
+                {overallAccuracy.total_hits}/{(overallAccuracy.total_hits + overallAccuracy.total_misses)} decided
+                {" "}(hit vs. miss only, every pair &amp; interval combined)
               </p>
-              {overallAccuracy.total_superseded > 0 && (
-                <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
-                  +{overallAccuracy.total_superseded} superseded (the agent changed its mind
-                  before these resolved — not counted above)
-                </p>
-              )}
+              <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
+                {overallAccuracy.resolution_breakdown_pct.expired}% of all signals expired
+                (timed out — neither hit nor miss) rather than resolved
+                {overallAccuracy.total_superseded > 0 && (
+                  <>; +{overallAccuracy.total_superseded} superseded (agent changed its mind first)</>
+                )}
+              </p>
+              <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
+                blended hit-rate incl. expired as non-wins: {overallAccuracy.total_hit_rate_pct}%
+              </p>
             </>
           )}
         </div>

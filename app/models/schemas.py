@@ -238,6 +238,12 @@ class MLTrainResult(BaseModel):
     test_recall: Optional[float] = None
     feature_coefficients: dict[str, float] = {}
     test_calibration: list[MLCalibrationBucket] = []
+    # True when /ml/train found the resolved-signal count unchanged since the last run and
+    # returned that prior result as-is instead of refitting on identical data (see
+    # /ml/train's own docstring) -- lets a caller (the cron, or a human) tell "retrained on
+    # more data" apart from "nothing new to learn from yet" instead of silently getting a
+    # byte-identical result either way.
+    skipped: bool = False
 
 
 class RLPolicy(BaseModel):

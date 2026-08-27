@@ -328,6 +328,18 @@ export interface RLAccuracy {
   // Signals the agent superseded (changed its mind) before label_outcome ever judged them --
   // not counted toward hit_rate_pct/total_hit_rate_pct, surfaced separately for transparency.
   total_superseded: number;
+  // total_hits / (total_hits + total_misses) -- excludes "expired" (timed out, neither win nor
+  // loss) from the denominator entirely, unlike total_hit_rate_pct. On a fast/unconverged
+  // interval where most signals expire, total_hit_rate_pct collapses toward 0 for reasons
+  // unrelated to directional accuracy; this is the number that actually answers "when the
+  // agent commits to a hit-or-miss outcome, how often is it right."
+  directional_hit_rate_pct: number | null;
+  resolution_breakdown_pct: {
+    hit: number | null;
+    miss: number | null;
+    expired: number | null;
+    superseded: number | null;
+  };
 }
 
 export interface SignalAccuracy {
@@ -345,6 +357,8 @@ export interface SignalAccuracy {
   total_misses: number;
   total_expired: number;
   total_hit_rate_pct: number | null;
+  // see RLAccuracy.directional_hit_rate_pct -- same reasoning, excludes "expired" from the denominator.
+  directional_hit_rate_pct: number | null;
 }
 
 export interface CandlePoint {

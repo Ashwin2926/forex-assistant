@@ -29,7 +29,29 @@ STRATEGY_NAMES = [fn.__name__.removeprefix("call_") for fn in STRATEGIES]
 # The market-only state -- precomputable once per bar, independent of the policy or any
 # balance (see compute_strategy_vote_states). balance_log_ratio is appended separately per
 # decision (full_rl_state) since it changes trade-to-trade and can't be precomputed the same way.
-RL_MARKET_FEATURE_NAMES = [f"{name}_vote" for name in STRATEGY_NAMES] + ["atr_pct"]
+#
+# The 6 raw_* features were added alongside the 7 *_vote features (not instead of -- both are
+# kept) because every vote is already a lossy [0,1] "strength" ratio each strategy computes
+# against its own gating threshold (see strategies.py), collapsing e.g. a raw ADX of 45 and a
+# raw ADX of 90 to whatever fraction of ADX_TREND_THRESHOLD*2.5 they happen to land at, or
+# discarding which of 4 branches a support/resistance call fired from entirely. Since
+# LinearQPolicy is a strictly linear function of the state (see its own docstring), it can
+# only ever combine whatever's actually present in the vector -- it can't reconstruct
+# information a vote already threw away. These give the linear policy direct access to a few
+# of the more informative continuous readings that were being discarded, at whatever scale
+# keeps them roughly comparable to the existing votes/atr_pct (which live in roughly [-1, 1]
+# and [0, small %] respectively):
+#   raw_adx_norm    -- adx/100, continuous trend strength (votes only ever gate it at >20)
+#   raw_rsi_centered -- (rsi-50)/50, signed distance from neutral (votes only gate <30/>70)
+#   raw_stoch_spread -- (stoch_k-stoch_d)/100, momentum direction+magnitude in one number
+#   raw_macd_hist_pct -- macd_hist as % of close, comparable across pairs at very different price scales
+#   raw_bb_width_pct -- Bollinger band width as % of price, a volatility-regime read distinct from atr_pct
+#   raw_volume_ratio -- volume / 20-bar volume SMA, capped to keep an illiquid-bar spike from dominating a gradient step
+RL_RAW_FEATURE_NAMES = [
+    "raw_adx_norm", "raw_rsi_centered", "raw_stoch_spread",
+    "raw_macd_hist_pct", "raw_bb_width_pct", "raw_volume_ratio",
+]
+RL_MARKET_FEATURE_NAMES = [f"{name}_vote" for name in STRATEGY_NAMES] + ["atr_pct"] + RL_RAW_FEATURE_NAMES
 RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
 
 # Fixed, not sourced from RuleConfig/SWING_PAIR_OVERRIDES -- some of those (e.g. swing's
@@ -38,8 +60,27 @@ RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
 # guaranteed by construction here, not left for the agent to discover through reward alone.
 # Sizing (RISK_FRACTION_BY_TIER) is additive on top of this -- it changes how much capital is
 # committed to the trade, never this ratio.
-RL_TARGET_ATR_MULT = 1.5
-RL_STOP_ATR_MULT = 1.0
+#
+# Per-profile, not one global pair -- every 5min/15min policy trained against the fixed
+# 1.5/1.0 has come back negative-expectancy on every pair (see GET /rl/policies), and this
+# was never independently swept for intraday the way swing's rule-based target/stop was
+# (signal_engine.PROFILE_DEFAULTS). Both profiles start at the same 1.5/1.0 values below --
+# this is a structural change (makes per-profile tuning possible), not a claim that intraday
+# needs different numbers yet. Any future intraday-specific value must keep the same >=1.5:1
+# target:stop ratio the comment above requires -- e.g. halving both to 1.0/0.667 preserves
+# the ratio while changing how much price movement is needed to resolve within
+# max_lookforward candles; changing the ratio itself would reopen the "risks more than it
+# targets" problem this constant was written to prevent.
+RL_ATR_MULTS_BY_PROFILE: dict[str, tuple[float, float]] = {
+    "swing": (1.5, 1.0),
+    "intraday": (1.5, 1.0),
+}
+
+
+def rl_atr_mults(profile: str) -> tuple[float, float]:
+    """(target_atr_mult, stop_atr_mult) for this RL profile -- see RL_ATR_MULTS_BY_PROFILE."""
+    return RL_ATR_MULTS_BY_PROFILE[profile]
+
 
 # How many rows of tail context each bar's strategy evaluation gets -- comfortably covers
 # find_swing_levels' own 20-bar lookback (patterns.py) plus a buffer, without passing the
@@ -81,9 +122,9 @@ MIN_WARMUP_BARS = 30  # covers find_swing_levels/stochastic/ADX's own warmup nee
 # solved exactly this mismatch for the regular signal engine (intraday: EMA 9/21 + session
 # filter, cross-pair backtest-validated, see signal_engine.PROFILE_DEFAULTS), RL just never
 # adopted it. Same interval grouping the cron already uses for the regular engine/consensus.
-# Doesn't touch RL_TARGET_ATR_MULT/RL_STOP_ATR_MULT -- those stay fixed regardless of profile,
-# this only changes which EMA/RSI/MACD periods and session gating the 7 strategies compute
-# their votes with.
+# target/stop are separately profile-aware via RL_ATR_MULTS_BY_PROFILE/rl_atr_mults above --
+# this constant only decides which EMA/RSI/MACD periods and session gating the 7 strategies
+# compute their votes with.
 INTRADAY_INTERVALS = {"5min", "15min"}
 
 
@@ -151,7 +192,35 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
             votes.append(strength if call.direction == "BUY" else -strength)
         latest = indicator_df.iloc[i]
         atr_pct = float(latest["atr"] / latest["close"] * 100) if pd.notna(latest["atr"]) and latest["close"] else 0.0
-        states.append(votes + [atr_pct])
+
+        raw_adx_norm = float(latest["adx"] / 100) if pd.notna(latest["adx"]) else 0.0
+        raw_rsi_centered = float((latest["rsi"] - 50) / 50) if pd.notna(latest["rsi"]) else 0.0
+        raw_stoch_spread = (
+            float((latest["stoch_k"] - latest["stoch_d"]) / 100)
+            if pd.notna(latest["stoch_k"]) and pd.notna(latest["stoch_d"]) else 0.0
+        )
+        raw_macd_hist_pct = (
+            float(latest["macd_hist"] / latest["close"] * 100)
+            if pd.notna(latest["macd_hist"]) and latest["close"] else 0.0
+        )
+        raw_bb_width_pct = (
+            float((latest["bb_upper"] - latest["bb_lower"]) / latest["bb_middle"] * 100)
+            if pd.notna(latest["bb_upper"]) and pd.notna(latest["bb_lower"])
+            and pd.notna(latest["bb_middle"]) and latest["bb_middle"] else 0.0
+        )
+        # Capped at 5x -- an illiquid/off-hours bar's volume can spike far past its 20-bar
+        # average (thin liquidity, not a real momentum signal), and an uncapped ratio would
+        # otherwise dominate that bar's TD-error gradient across every feature via Adagrad's
+        # shared per-step scaling.
+        raw_volume_ratio = (
+            min(float(latest["volume"] / latest["volume_sma"]), 5.0)
+            if pd.notna(latest["volume_sma"]) and latest["volume_sma"] else 0.0
+        )
+
+        states.append(votes + [
+            atr_pct, raw_adx_norm, raw_rsi_centered, raw_stoch_spread,
+            raw_macd_hist_pct, raw_bb_width_pct, raw_volume_ratio,
+        ])
     return states
 
 
@@ -217,6 +286,7 @@ class LinearQPolicy:
 
 def _take_action_sized(
     df: pd.DataFrame, indicator_df: pd.DataFrame, i: int, action: str, pair: str, max_lookforward: int, balance: float,
+    target_atr_mult: float, stop_atr_mult: float,
 ) -> tuple[float, int, float]:
     """
     Executes one sized action at bar i, returns (reward, bars_to_advance, new_balance). HOLD
@@ -239,7 +309,7 @@ def _take_action_sized(
 
     entry_price = float(df.loc[i, "close"])
     atr_val = float(indicator_df.loc[i, "atr"])
-    target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT)
+    target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, target_atr_mult, stop_atr_mult)
     units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
 
     future_candles = df.iloc[i + 1: i + 1 + max_lookforward]
@@ -296,6 +366,8 @@ def train_rl_policy(
     if starting_balance <= 0:
         raise ValueError("starting_balance must be positive.")
 
+    target_atr_mult, stop_atr_mult = rl_atr_mults(rl_config_profile(interval))
+
     df = df.reset_index(drop=True)
     indicator_df = add_all_indicators(df, config)
     market_states = compute_strategy_vote_states(indicator_df, config)
@@ -328,7 +400,9 @@ def train_rl_policy(
         while i <= train_last:
             state = full_rl_state(market_states[i], balance, starting_balance)
             action = policy.epsilon_greedy(state, epsilon)
-            reward, advance, balance = _take_action_sized(df, indicator_df, i, action, pair, max_lookforward, balance)
+            reward, advance, balance = _take_action_sized(
+                df, indicator_df, i, action, pair, max_lookforward, balance, target_atr_mult, stop_atr_mult,
+            )
             next_i = i + advance
             ruined = balance < MIN_VIABLE_BALANCE
             next_state = full_rl_state(market_states[next_i], balance, starting_balance) if (next_i <= train_last and not ruined) else None
@@ -366,7 +440,7 @@ def train_rl_policy(
         risk_fraction = RISK_FRACTION_BY_TIER[tier]
         entry_price = float(df.loc[i, "close"])
         atr_val = float(indicator_df.loc[i, "atr"])
-        target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT)
+        target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, target_atr_mult, stop_atr_mult)
         units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
         future_candles = df.iloc[i + 1: i + 1 + max_lookforward]
         status, outcome_price, outcome_ts, candles_to_outcome = label_outcome(
@@ -419,8 +493,8 @@ def train_rl_policy(
         profile="rl",
         created_at=datetime.utcnow(),
         rule_config=config,
-        target_atr_mult=RL_TARGET_ATR_MULT,
-        stop_atr_mult=RL_STOP_ATR_MULT,
+        target_atr_mult=target_atr_mult,
+        stop_atr_mult=stop_atr_mult,
         max_lookforward=max_lookforward,
         candles_evaluated=test_last - test_start + 1,
         total_signals=directional_signals + hold_count,
@@ -462,12 +536,27 @@ def choose_action(policy: RLPolicy, state: list[float]) -> tuple[str, dict[str, 
     match the current ACTIONS set -- a policy trained before an action-space change (like
     HOLD/BUY/SELL -> the 5 sizing actions) is stale, not usable as-is, and a raw KeyError from
     a mismatched lookup would be a confusing way to find that out.
+
+    Same reasoning applies to the state feature schema: a policy trained before
+    RL_FEATURE_NAMES grew (e.g. the raw_* features added alongside the vote features) has
+    fewer weights per action than `state` now has entries. Without this check, q_values'
+    zip(self.weights[a], state) would silently stop at the shorter length instead of raising,
+    quietly ignoring every feature past the old policy's count and producing a meaningless
+    but not-obviously-wrong Q-value -- a policy.feature_names length check turns that into the
+    same clean "retrain it" 400 the action-set check already gives.
     """
     if set(policy.weights.keys()) != set(ACTIONS):
         raise ValueError(
             f"RL policy {policy.policy_id} for {policy.pair}/{policy.interval} was trained "
             f"against a different action set (stale after an RL update) -- retrain via "
             f"POST /rl/train/{policy.interval}?pair={policy.pair} first."
+        )
+    if len(policy.feature_names) != len(state):
+        raise ValueError(
+            f"RL policy {policy.policy_id} for {policy.pair}/{policy.interval} was trained "
+            f"against a different state feature set ({len(policy.feature_names)} features, "
+            f"current code produces {len(state)}) -- stale after a feature-set change, "
+            f"retrain via POST /rl/train/{policy.interval}?pair={policy.pair} first."
         )
     q_policy = LinearQPolicy(len(policy.feature_names))
     q_policy.weights = policy.weights

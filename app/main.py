@@ -32,7 +32,7 @@ from app.services.ml_features import extract_features
 from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.rl_engine import (
     train_rl_policy, choose_action, compute_strategy_vote_states, rl_config_profile, full_rl_state,
-    position_size_units, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
+    position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
     RISK_FRACTION_BY_TIER, DEFAULT_EPISODES,
 )
 from app.services.deriv_client import deriv_session, DerivAuthError
@@ -232,6 +232,7 @@ async def signal_accuracy(pair: str | None = None, profile: str | None = None, l
     total_misses = await signals_collection.count_documents({**query, "status": "miss"})
     total_expired = await signals_collection.count_documents({**query, "status": "expired"})
     total_resolved = total_hits + total_misses + total_expired
+    total_decided = total_hits + total_misses
 
     return {
         "pair": pair,
@@ -245,7 +246,12 @@ async def signal_accuracy(pair: str | None = None, profile: str | None = None, l
         "total_hits": total_hits,
         "total_misses": total_misses,
         "total_expired": total_expired,
+        # see RLSignal accuracy's directional_hit_rate_pct docstring -- same reasoning: this
+        # divides by decided (hit+miss) trades only, so an interval with a lot of "expired"
+        # timeouts doesn't drag the headline number toward 0 for reasons unrelated to whether
+        # the model is directionally right when it actually resolves.
         "total_hit_rate_pct": round(total_hits / total_resolved * 100, 1) if total_resolved else None,
+        "directional_hit_rate_pct": round(total_hits / total_decided * 100, 1) if total_decided else None,
     }
 
 
@@ -710,7 +716,7 @@ async def get_backtest_run_signals(run_id: str, status: str | None = None, limit
 
 
 @app.post("/ml/train")
-async def train_ml_model(train_frac: float = 0.7):
+async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     """
     Trains the supervised hit/miss classifier (app/services/ml_model.py, LogisticRegression --
     NOT reinforcement learning) on every resolved live signal across all pairs/profiles. One
@@ -718,11 +724,29 @@ async def train_ml_model(train_frac: float = 0.7):
     leave too few examples per model to mean anything. Chronological train/test split, not
     random (see train_hit_classifier's own docstring) -- the same lookahead-bias discipline
     already applied to run_backtest's eval_start_index.
+
+    keep-fresh.yml's cron calls this every 20 minutes unconditionally, but a signal takes
+    100min-5hr to even resolve (max_lookforward candles) -- most firings have zero new
+    resolved signals to learn from, and refitting the same rows just reproduces the same
+    model byte-for-byte, making "is this improving" impossible to answer honestly. So: if the
+    resolved count matches the most recent stored run's train+test sample count, skip the fit
+    and return that prior result (with skipped=True) instead of pretending a no-op retrain
+    is progress. Pass force=True to always refit regardless (e.g. after a feature-set change,
+    when the row count is unchanged but what gets extracted from those rows isn't).
     """
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
     query = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    resolved_count = await signals_collection.count_documents(query)
+
+    if not force:
+        last_run = await ml_runs_collection.find_one(sort=[("created_at", -1)])
+        if last_run is not None and last_run["train_samples"] + last_run["test_samples"] == resolved_count:
+            last_run["_id"] = str(last_run["_id"])
+            last_run["skipped"] = True
+            return last_run
+
     signals = await signals_collection.find(query).to_list(length=None)
 
     try:
@@ -1160,8 +1184,9 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     latest = df.iloc[-1]
     entry_price = current_price
     atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+    target_atr_mult, stop_atr_mult = rl_atr_mults(rl_config_profile(interval))
     target_price, stop_price = compute_atr_target_stop(
-        entry_price, atr_val, direction, RL_TARGET_ATR_MULT, RL_STOP_ATR_MULT,
+        entry_price, atr_val, direction, target_atr_mult, stop_atr_mult,
     )
     units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
 
@@ -1237,6 +1262,8 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
     total_superseded = await rl_signals_collection.count_documents(
         {**{k: v for k, v in query.items() if k != "status"}, "status": "superseded"}
     )
+    total_decided = total_hits + total_misses
+    total_all = total_resolved + total_superseded
 
     return {
         "pair": pair,
@@ -1250,8 +1277,21 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
         "total_hits": total_hits,
         "total_misses": total_misses,
         "total_expired": total_expired,
+        # total_hit_rate_pct divides by every resolved signal INCLUDING expired (a non-event,
+        # neither win nor loss) -- kept for backward compat, but it collapses toward 0 whenever
+        # expired dominates (e.g. a fast/unconverged policy on 5min/15min), making it look like
+        # "not learning anything" when the real story is "rarely decides." directional_hit_rate_pct
+        # below is the number that actually answers "when this agent commits to hit-or-miss, how
+        # often is it right."
         "total_hit_rate_pct": round(total_hits / total_resolved * 100, 1) if total_resolved else None,
         "total_superseded": total_superseded,
+        "directional_hit_rate_pct": round(total_hits / total_decided * 100, 1) if total_decided else None,
+        "resolution_breakdown_pct": {
+            "hit": round(total_hits / total_all * 100, 1) if total_all else None,
+            "miss": round(total_misses / total_all * 100, 1) if total_all else None,
+            "expired": round(total_expired / total_all * 100, 1) if total_all else None,
+            "superseded": round(total_superseded / total_all * 100, 1) if total_all else None,
+        },
     }
 
 

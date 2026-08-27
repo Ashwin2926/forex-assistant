@@ -67,7 +67,10 @@ def train_hit_classifier(signals: list[dict], train_frac: float = 0.7) -> MLTrai
     X_train, y_train = _to_xy(train_signals)
     X_test, y_test = _to_xy(test_signals)
 
-    model = LogisticRegression(max_iter=1000)
+    # class_weight="balanced" -- hit/miss/expired outcomes aren't evenly split (expired folds
+    # into the same 0 class as miss, see _to_xy's docstring), so the majority class would
+    # otherwise dominate the loss and bias predict_proba toward it regardless of features.
+    model = LogisticRegression(max_iter=1000, class_weight="balanced")
     model.fit(X_train, y_train)
 
     train_accuracy = accuracy_score(y_train, model.predict(X_train))
@@ -111,7 +114,10 @@ def predict_hit_probability(resolved_signals: list[dict], new_features: dict[str
         return None
 
     X, y = _to_xy(resolved_signals)
-    model = LogisticRegression(max_iter=1000)
+    # class_weight="balanced" -- hit/miss/expired outcomes aren't evenly split (expired folds
+    # into the same 0 class as miss, see _to_xy's docstring), so the majority class would
+    # otherwise dominate the loss and bias predict_proba toward it regardless of features.
+    model = LogisticRegression(max_iter=1000, class_weight="balanced")
     model.fit(X, y)
 
     new_X = [[new_features[name] for name in FEATURE_NAMES]]
