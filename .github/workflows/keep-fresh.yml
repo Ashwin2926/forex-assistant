@@ -159,13 +159,22 @@ jobs:
       # training run. Paper-trade execution was removed entirely (Deriv isn't available in
       # every region) -- RL signals are sized (lot size) and traded manually instead, see the
       # RL page.
+      # -f dropped (replaced with a plain -s + `|| true` per call) here specifically after a
+      # live failure: one transient 500 on a single pair/interval (confirmed non-reproducible
+      # -- the exact same call succeeded immediately on retry) aborted this whole step under
+      # `-f`, which cascaded into skipping every downstream RL step (generate + score) for the
+      # entire cron cycle since GitHub Actions stops a job on a failed step by default. 20
+      # sequential ~60-90s CPU-heavy training calls is exactly the kind of sustained load
+      # where one transient hiccup is expected occasionally -- it shouldn't take the rest of
+      # the day's RL pipeline down with it. Same reasoning as the "Generate RL signals" steps
+      # below, which already use this pattern for a different reason (expected 400s).
       - name: Train RL policy (all intervals)
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           for interval in 5min 15min 1h 4h 1day; do
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-                "$API_BASE/rl/train/$interval?pair=${pair/\//%2F}"
+              curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/rl/train/$interval?pair=${pair/\//%2F}" -o /dev/null || true
             done
           done
       # -f is deliberately dropped (replaced with a plain -s + `|| true` per call) on these
