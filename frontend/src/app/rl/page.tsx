@@ -223,6 +223,28 @@ export default function RLPage() {
   const trainingConfidenceTrend = useTrend(trainingConfidence?.pct ?? null);
   const overallAccuracyTrend = useTrend(overallAccuracy?.directional_hit_rate_pct ?? null);
 
+  const [scoringRL, setScoringRL] = useState(false);
+  const [scoreResult, setScoreResult] = useState<string | null>(null);
+
+  async function handleScoreRL() {
+    setScoringRL(true);
+    setScoreResult(null);
+    try {
+      const result = await api.scoreRLSignals();
+      setScoreResult(
+        `${result.hit} hit, ${result.miss} miss, ${result.expired} expired, ${result.still_pending} still pending`
+        + (result.skipped_no_data > 0 ? `, ${result.skipped_no_data} skipped (no data yet)` : ""),
+      );
+      // Scoring can flip pending signals to resolved and can trigger a degradation-driven
+      // retrain in the background -- both change what's already on screen.
+      await Promise.all([loadRecentSignals(), loadOverallAccuracy(), loadPolicies()]);
+    } catch (e) {
+      setScoreResult(e instanceof ApiError ? e.message : "Scoring failed.");
+    } finally {
+      setScoringRL(false);
+    }
+  }
+
   async function handleGenerateAll() {
     setGenerateAllRunning(true);
     setGenerateAllResults([]);
@@ -607,7 +629,20 @@ export default function RLPage() {
       </section>
 
       <section>
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Recent RL signals</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Recent RL signals</h2>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleScoreRL}
+              disabled={scoringRL}
+              title="Checks every pending RL signal against candles that have arrived since it fired, resolving hit/miss/expired where enough real data now exists -- doesn't generate or train anything, just resolves outcomes."
+              className="rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            >
+              {scoringRL ? "Scoring…" : "Score now"}
+            </button>
+            {scoreResult && <span className="text-xs text-zinc-500 dark:text-zinc-400">{scoreResult}</span>}
+          </div>
+        </div>
         {recentLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
         {!recentLoading && recentSignals.length === 0 && (
           <p className="mt-4 text-sm text-zinc-500">No RL signals yet.</p>
