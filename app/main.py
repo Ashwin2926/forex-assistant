@@ -43,7 +43,10 @@ from app.services.case_memory import (
 )
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
-from app.services.outcome_scoring import score_pending_signals, score_pending_consensus_signals, score_pending_rl_signals
+from app.services.outcome_scoring import (
+    score_pending_signals, score_pending_consensus_signals, score_pending_rl_signals,
+    resolve_rl_signal_real_outcome,
+)
 
 settings = get_settings()
 app = FastAPI(title="Forex Trading Assistant")
@@ -1131,7 +1134,20 @@ async def _supersede_pending_rl_signal(pending: dict, current_price: float) -> N
     intervals) superseded the large majority of its own signals well before label_outcome
     ever got a chance to judge them, making the agent look far less accurate than its actual
     resolved (hit/miss/genuinely-expired) trades show.
+
+    Checks for a REAL outcome first (outcome_scoring.resolve_rl_signal_real_outcome): if
+    target or stop was already genuinely touched by the real candles that arrived since this
+    signal fired -- entirely possible between one /rl/signal call and the next, especially
+    when called back-to-back -- that real hit/miss/expired gets recorded instead. Only when
+    price genuinely hasn't decided it yet does this fall back to "superseded" -- the agent
+    changing its mind is only a reason to close out a trade that's still genuinely open, not
+    a license to overwrite a real result with a non-outcome.
     """
+    real_outcome, _ = await resolve_rl_signal_real_outcome(pending)
+    if real_outcome is not None:
+        await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": real_outcome})
+        return
+
     pct_move = ((current_price - pending["entry_price"]) / pending["entry_price"]) * 100
     if pending["direction"] == "SELL":
         pct_move = -pct_move

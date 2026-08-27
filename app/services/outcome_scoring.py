@@ -174,6 +174,62 @@ async def score_pending_consensus_signals(max_lookforward: Optional[int] = None)
     return tally
 
 
+async def resolve_rl_signal_real_outcome(
+    doc: dict, max_lookforward: Optional[int] = None,
+) -> tuple[Optional[dict], bool]:
+    """
+    Checks ONE pending RLSignal against real candles that have arrived since it fired, using
+    the exact same label_outcome logic score_pending_rl_signals uses in its own batch walk
+    below. Returns (update_fields, had_any_future_candles):
+      - update_fields is the {"status", "outcome_price", "outcome_timestamp",
+        "outcome_pct_move", "candles_to_outcome"} dict to $set if the trade genuinely
+        resolved (hit/miss/expired) against real price action, or None if it's still
+        genuinely undecided.
+      - had_any_future_candles distinguishes "no data at all yet" from "some candles exist
+        but the window isn't exhausted and neither level has been touched" -- both leave
+        update_fields None, but score_pending_rl_signals' tally needs to tell them apart
+        (skipped_no_data vs still_pending).
+
+    Shared by score_pending_rl_signals (the batch cron path) and main.py's
+    _supersede_pending_rl_signal -- so a signal about to be marked "superseded" because a
+    newer decision disagreed with it gets checked against what ACTUALLY happened in the
+    candles since it fired first, instead of unconditionally overwriting a real hit/miss with
+    "superseded" just because the agent's live view moved on before anyone checked.
+    """
+    window = _live_max_lookforward(doc["interval"], max_lookforward)
+    future_cursor = (
+        candles_collection.find({
+            "pair": doc["pair"], "interval": doc["interval"],
+            "timestamp": {"$gt": doc["timestamp"]},
+        })
+        .sort("timestamp", 1)
+        .limit(window)
+    )
+    future_docs = await future_cursor.to_list(length=window)
+    if not future_docs:
+        return None, False
+
+    future_df = pd.DataFrame(future_docs)
+    status, outcome_price, outcome_timestamp, candles_to_outcome = label_outcome(
+        future_df, doc["direction"], doc["target_price"], doc["stop_price"], window,
+    )
+    if status == "pending":
+        return None, True
+
+    pct_move = ((outcome_price - doc["entry_price"]) / doc["entry_price"]) * 100
+    if doc["direction"] == "SELL":
+        pct_move = -pct_move
+    pct_move -= spread_cost_pct(doc["pair"], doc["entry_price"])  # every real trade pays this, win or lose
+
+    return {
+        "status": status,
+        "outcome_price": round(float(outcome_price), 5),
+        "outcome_timestamp": outcome_timestamp,
+        "outcome_pct_move": round(pct_move, 5),
+        "candles_to_outcome": candles_to_outcome,
+    }, True
+
+
 async def score_pending_rl_signals(max_lookforward: Optional[int] = None) -> dict:
     """
     Same closing-the-loop job as score_pending_consensus_signals, for rl_signals_collection.
@@ -191,45 +247,12 @@ async def score_pending_rl_signals(max_lookforward: Optional[int] = None) -> dic
     tally = {"hit": 0, "miss": 0, "expired": 0, "still_pending": 0, "skipped_no_data": 0}
 
     for doc in pending:
-        window = _live_max_lookforward(doc["interval"], max_lookforward)
-        future_cursor = (
-            candles_collection.find({
-                "pair": doc["pair"],
-                "interval": doc["interval"],
-                "timestamp": {"$gt": doc["timestamp"]},
-            })
-            .sort("timestamp", 1)
-            .limit(window)
-        )
-        future_docs = await future_cursor.to_list(length=window)
-        if not future_docs:
-            tally["skipped_no_data"] += 1
+        update, had_data = await resolve_rl_signal_real_outcome(doc, max_lookforward)
+        if update is None:
+            tally["skipped_no_data" if not had_data else "still_pending"] += 1
             continue
 
-        future_df = pd.DataFrame(future_docs)
-        status, outcome_price, outcome_timestamp, candles_to_outcome = label_outcome(
-            future_df, doc["direction"], doc["target_price"], doc["stop_price"], window,
-        )
-
-        if status == "pending":
-            tally["still_pending"] += 1
-            continue
-
-        pct_move = ((outcome_price - doc["entry_price"]) / doc["entry_price"]) * 100
-        if doc["direction"] == "SELL":
-            pct_move = -pct_move
-        pct_move -= spread_cost_pct(doc["pair"], doc["entry_price"])  # every real trade pays this, win or lose
-
-        await rl_signals_collection.update_one(
-            {"_id": doc["_id"]},
-            {"$set": {
-                "status": status,
-                "outcome_price": round(float(outcome_price), 5),
-                "outcome_timestamp": outcome_timestamp,
-                "outcome_pct_move": round(pct_move, 5),
-                "candles_to_outcome": candles_to_outcome,
-            }},
-        )
-        tally[status] += 1
+        await rl_signals_collection.update_one({"_id": doc["_id"]}, {"$set": update})
+        tally[update["status"]] += 1
 
     return tally
