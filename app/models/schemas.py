@@ -364,6 +364,7 @@ class RLTrainAllCell(BaseModel):
     pair: str
     interval: str
     ok: bool
+    skipped: bool = False
     error: Optional[str] = None
     policy_id: Optional[str] = None
     hit_rate_pct: Optional[float] = None
