@@ -1556,7 +1556,71 @@ async def rl_learning_curve(days: int = 30):
             ),
             "policies_trained": train["count"] if train else 0,
         })
-    return {"days": days, "points": points}
+
+    verdict = {
+        # pool's second element must already be on the SAME 0-100 percentage scale as the
+        # training case below (which sums hit_rate_pct values directly) -- hits*100 here, not
+        # bare hits, so first_pos/first_n in _half_split_verdict comes out as a percentage in
+        # both cases instead of a 0-1 fraction for live and a 0-100 percentage for training.
+        "live": _half_split_verdict(
+            sorted(live_by_day.items()),
+            pool=lambda bucket: (bucket["hits"] + bucket["misses"], bucket["hits"] * 100),
+            min_n=MIN_TRADES_PER_VERDICT_HALF, improve_delta=5.0,
+        ),
+        "training": _half_split_verdict(
+            sorted(train_by_day.items()),
+            pool=lambda bucket: (len(bucket["hit_rates"]), sum(bucket["hit_rates"])),
+            min_n=MIN_POLICIES_PER_VERDICT_HALF, improve_delta=2.0,
+        ),
+    }
+    return {"days": days, "points": points, "verdict": verdict}
+
+
+# Minimum pooled sample size each half of the verdict comparison needs before _half_split_verdict
+# will call it "improving"/"declining" rather than "not_enough_data" -- live trades are inherently
+# scarce (a handful/day across all 20 pair/intervals combined) so a single noisy day (or even a
+# handful) swinging the number is exactly the failure mode this guards against; a real verdict needs
+# real volume behind both halves of the comparison. Training runs are far more plentiful (up to 20
+# per retrain cycle), so that threshold is set higher in absolute terms but is still cheap to clear.
+MIN_TRADES_PER_VERDICT_HALF = 15
+MIN_POLICIES_PER_VERDICT_HALF = 20
+
+
+def _half_split_verdict(
+    day_buckets: list[tuple[str, dict]], pool, min_n: int, improve_delta: float,
+) -> dict:
+    """
+    Splits chronologically-sorted (date, bucket) pairs into an earlier and a later half, pools
+    each half's raw counts (not an average of daily percentages -- averaging percentages would
+    let a 1-trade day and an 18-trade day sway the result equally, which is exactly why the live
+    number looks noisy day-to-day even while the underlying policies are genuinely improving) via
+    the caller-supplied `pool(bucket) -> (n, positive_count)`, and reports whether the rate moved
+    by at least `improve_delta` percentage points between halves. Returns "not_enough_data"
+    instead of a real verdict if either half falls short of `min_n` pooled samples -- a confident-
+    sounding "declining" built on 3 trades would be actively misleading, not just imprecise.
+    """
+    if not day_buckets:
+        return {
+            "status": "not_enough_data", "first_half_rate_pct": None, "second_half_rate_pct": None,
+            "first_half_n": 0, "second_half_n": 0,
+        }
+    mid = len(day_buckets) // 2
+    first_n, first_pos = (lambda ns: (sum(n for n, _ in ns), sum(p for _, p in ns)))(
+        [pool(b) for _, b in day_buckets[:mid]]
+    )
+    second_n, second_pos = (lambda ns: (sum(n for n, _ in ns), sum(p for _, p in ns)))(
+        [pool(b) for _, b in day_buckets[mid:]]
+    )
+    first_rate = round(first_pos / first_n, 1) if first_n else None
+    second_rate = round(second_pos / second_n, 1) if second_n else None
+    status = "not_enough_data"
+    if first_n >= min_n and second_n >= min_n and first_rate is not None and second_rate is not None:
+        delta = second_rate - first_rate
+        status = "improving" if delta >= improve_delta else "declining" if delta <= -improve_delta else "flat"
+    return {
+        "status": status, "first_half_rate_pct": first_rate, "second_half_rate_pct": second_rate,
+        "first_half_n": first_n, "second_half_n": second_n,
+    }
 
 
 # How far live directional accuracy is allowed to fall below what the currently active

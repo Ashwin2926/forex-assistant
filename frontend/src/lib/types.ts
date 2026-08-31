@@ -391,9 +391,23 @@ export interface RLLearningCurvePoint {
   policies_trained: number;
 }
 
+// A plain verdict, not a chart to interpret -- compares the earlier half of the window
+// against the later half, pooling raw counts within each half (not averaging daily
+// percentages, which would let a 1-trade day sway the result as much as an 18-trade day).
+// "not_enough_data" when either half falls short of the pooled-sample minimum -- a
+// confident-sounding verdict built on a handful of trades would be actively misleading.
+export interface RLLearningVerdict {
+  status: "improving" | "declining" | "flat" | "not_enough_data";
+  first_half_rate_pct: number | null;
+  second_half_rate_pct: number | null;
+  first_half_n: number;
+  second_half_n: number;
+}
+
 export interface RLLearningCurve {
   days: number;
   points: RLLearningCurvePoint[];
+  verdict: { live: RLLearningVerdict; training: RLLearningVerdict };
 }
 
 export interface SignalAccuracy {

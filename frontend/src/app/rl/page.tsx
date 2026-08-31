@@ -1,9 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLLearningCurve, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
 // How often to poll GET /rl/train-all/{job_id} while a batch run is in progress -- the job
@@ -49,6 +48,36 @@ function TrendArrow({ trend }: { trend: Trend }) {
     <span className="ml-1 align-middle text-base text-emerald-600 dark:text-emerald-400" title="Up since the last update">▲</span>
   ) : (
     <span className="ml-1 align-middle text-base text-rose-600 dark:text-rose-400" title="Down since the last update">▼</span>
+  );
+}
+
+const VERDICT_LABEL: Record<RLLearningVerdict["status"], string> = {
+  improving: "Improving",
+  declining: "Declining",
+  flat: "Holding steady",
+  not_enough_data: "Not enough data yet",
+};
+const VERDICT_COLOR: Record<RLLearningVerdict["status"], string> = {
+  improving: "text-emerald-600 dark:text-emerald-400",
+  declining: "text-rose-600 dark:text-rose-400",
+  flat: "text-zinc-500 dark:text-zinc-400",
+  not_enough_data: "text-zinc-400 dark:text-zinc-500",
+};
+
+function VerdictCard({ title, verdict, sampleUnit, minN }: { title: string; verdict: RLLearningVerdict; sampleUnit: string; minN: number }) {
+  return (
+    <div className="min-w-[220px] flex-1 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">{title}</p>
+      <p className={`mt-1 text-xl font-semibold ${VERDICT_COLOR[verdict.status]}`}>{VERDICT_LABEL[verdict.status]}</p>
+      {verdict.first_half_rate_pct != null && verdict.second_half_rate_pct != null ? (
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          {verdict.first_half_rate_pct}% → {verdict.second_half_rate_pct}%{" "}
+          (earlier {verdict.first_half_n} {sampleUnit} vs later {verdict.second_half_n})
+        </p>
+      ) : (
+        <p className="mt-1 text-xs text-zinc-400">Needs at least {minN} {sampleUnit} in each half of the window.</p>
+      )}
+    </div>
   );
 }
 
@@ -430,37 +459,17 @@ export default function RLPage() {
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Is it getting smarter?</h2>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Two independent day-by-day trends, both across every pair &amp; interval combined:
-          real resolved live trades (grouped by the day each one actually resolved), and
-          that day&apos;s training runs&apos; own test-slice evaluation (retraining is
-          warm-started, so a rising line here reflects accumulated learning, not independent
-          from-scratch runs). A single snapshot number can&apos;t answer whether this is
-          trending better — this can.
+          Compares the earlier half of the last 30 days against the later half, pooling real
+          counts within each half rather than averaging daily percentages — a 1-trade day and
+          an 18-trade day used to sway the number equally, which is exactly why the daily rate
+          looked noisy even while the underlying policies were genuinely improving.
         </p>
-        {!learningCurve || learningCurve.points.length < 2 ? (
-          <p className="mt-4 text-sm text-zinc-400">
-            Not enough days with data yet — check back once trades have resolved and training
-            has run across at least two different days.
-          </p>
+        {!learningCurve ? (
+          <p className="mt-4 text-sm text-zinc-400">Loading…</p>
         ) : (
-          <div className="mt-4 h-64 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={learningCurve.points}>
-                <CartesianGrid strokeDasharray="3 3" className="stroke-zinc-200 dark:stroke-zinc-800" />
-                <XAxis dataKey="date" tick={{ fontSize: 11 }} />
-                <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} unit="%" />
-                <Tooltip />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Line
-                  type="monotone" dataKey="live_directional_hit_rate_pct" stroke="#10b981" strokeWidth={2}
-                  dot={{ r: 3 }} name="Live hit rate %" connectNulls
-                />
-                <Line
-                  type="monotone" dataKey="avg_training_hit_rate_pct" stroke="#6366f1" strokeWidth={2}
-                  dot={{ r: 3 }} name="Training hit rate %" connectNulls
-                />
-              </LineChart>
-            </ResponsiveContainer>
+          <div className="mt-4 flex flex-wrap gap-3">
+            <VerdictCard title="Live trading" verdict={learningCurve.verdict.live} sampleUnit="trades" minN={15} />
+            <VerdictCard title="Training quality" verdict={learningCurve.verdict.training} sampleUnit="policy runs" minN={20} />
           </div>
         )}
       </section>
