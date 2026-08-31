@@ -186,10 +186,6 @@ export interface RLTrainAllCell {
   pair: string;
   interval: string;
   ok: boolean;
-  // True when this combo was skipped (not trained, not an error) because it's lost its last
-  // several training runs in a row -- see app/main.py's _should_skip_training. `error` still
-  // carries the human-readable reason in this case.
-  skipped?: boolean;
   error?: string | null;
   policy_id?: string | null;
   hit_rate_pct?: number | null;

@@ -199,10 +199,7 @@ export const api = {
     interval: string,
     opts: { episodes?: number; train_frac?: number; max_lookforward?: number; starting_balance?: number } = {},
   ) {
-    // force=true always -- this is the RL page's single, explicit "Train this one pair/
-    // interval" action, so it should never be silently skipped by the same-losing-streak
-    // check the automated/batch loops (cron, Train all, Sync now) respect by default.
-    const qs = new URLSearchParams({ pair, force: "true" });
+    const qs = new URLSearchParams({ pair });
     if (opts.episodes !== undefined) qs.set("episodes", String(opts.episodes));
     if (opts.train_frac !== undefined) qs.set("train_frac", String(opts.train_frac));
     if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));

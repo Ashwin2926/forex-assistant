@@ -926,7 +926,6 @@ async def train_rl(
     interval: str, pair: str, episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
     starting_balance: float = DEFAULT_STARTING_BALANCE, reset: bool = False,
     target_atr_mult: float | None = None, stop_atr_mult: float | None = None, persist: bool = True,
-    force: bool = False,
 ):
     """
     Trains a linear Q-policy (app/services/rl_engine.py) for this pair/interval via
@@ -966,17 +965,7 @@ async def train_rl(
     NOT what you want here) -- a policy trained under an override, if persisted, would become
     the live policy for this pair/interval while live inference still sizes trades from the
     profile's STORED default, not whatever override this call used.
-
-    force: skips the SKIP_AFTER_CONSECUTIVE_LOSSES check (see _should_skip_training) that
-    automated/batch training loops respect by default -- the RL page's own single "Train"
-    button always sends force=true, so explicitly choosing to retrain one specific pair/
-    interval here always runs it regardless of recent history. The cron's per-combo curl
-    loop and POST /rl/train-all both call this WITHOUT force, so they respect the skip.
     """
-    if not force:
-        skip, reason = await _should_skip_training(pair, interval)
-        if skip:
-            return {"skipped": True, "reason": reason}
     try:
         policy, eval_run = await _run_rl_training(
             pair, interval, episodes, train_frac, max_lookforward, starting_balance, reset=reset,
@@ -1012,23 +1001,19 @@ async def run_train_all_job(job_id: str, episodes: int, train_frac: float, start
             job_doc = await rl_train_jobs_collection.find_one({"job_id": job_id}, {"status": 1})
             if not job_doc or job_doc.get("status") != "running":
                 return  # already cancelled (cooperatively or forced) -- stop here
-            skip, skip_reason = await _should_skip_training(pair, interval)
-            if skip:
-                cell = RLTrainAllCell(pair=pair, interval=interval, ok=True, skipped=True, error=skip_reason)
-            else:
-                try:
-                    policy, eval_run = await _run_rl_training(
-                        pair, interval, episodes, train_frac, max_lookforward=20, starting_balance=starting_balance,
-                    )
-                    cell = RLTrainAllCell(
-                        pair=pair, interval=interval, ok=True, policy_id=policy.policy_id,
-                        hit_rate_pct=eval_run.hit_rate_pct, expectancy_pct=eval_run.expectancy_pct,
-                        directional_signals=eval_run.directional_signals, hold_signals=eval_run.hold_signals,
-                        starting_balance=eval_run.starting_balance, ending_balance=eval_run.ending_balance,
-                        total_return_pct=eval_run.total_return_pct,
-                    )
-                except Exception as e:
-                    cell = RLTrainAllCell(pair=pair, interval=interval, ok=False, error=str(e))
+            try:
+                policy, eval_run = await _run_rl_training(
+                    pair, interval, episodes, train_frac, max_lookforward=20, starting_balance=starting_balance,
+                )
+                cell = RLTrainAllCell(
+                    pair=pair, interval=interval, ok=True, policy_id=policy.policy_id,
+                    hit_rate_pct=eval_run.hit_rate_pct, expectancy_pct=eval_run.expectancy_pct,
+                    directional_signals=eval_run.directional_signals, hold_signals=eval_run.hold_signals,
+                    starting_balance=eval_run.starting_balance, ending_balance=eval_run.ending_balance,
+                    total_return_pct=eval_run.total_return_pct,
+                )
+            except Exception as e:
+                cell = RLTrainAllCell(pair=pair, interval=interval, ok=False, error=str(e))
             await rl_train_jobs_collection.update_one(
                 {"job_id": job_id, "status": "running"},
                 {"$push": {"results": cell.model_dump()}, "$inc": {"completed": 1}},
@@ -1676,50 +1661,6 @@ HIGH_SUPERSEDE_FRACTION = 0.4
 HIGH_EXPIRED_FRACTION = 0.8
 LIVE_VS_TRAINED_GAP_PCT = 15.0  # same margin DEGRADATION_MARGIN_PCT below uses for auto-retrain
 
-# How many consecutive training runs a pair/interval must lose (same STRONG_LOSS_RETURN_PCT
-# threshold as GET /rl/insights and create_rl_signal's live-exclusion gate) before automated/
-# batch training loops stop bothering to retrain it -- the cron's per-combo loop, POST
-# /rl/train-all, and POST /ops/run-all-flows's training phase all check this via
-# _should_skip_training. Costs nothing on the live-trading side (a skipped combo is already
-# excluded from live signals regardless, same threshold), and directly reduces both wasted
-# Twelve Data quota/compute and the surface area for the kind of multi-minute training hang
-# this project has hit twice now on long batch runs -- fewer combos trained per batch means
-# fewer chances for one to hang. Does NOT apply to a manual single-pair/interval POST
-# /rl/train call (force=True by default from the RL page's own "Train" button) -- a human
-# explicitly choosing to retrain one specific combo can always do so.
-SKIP_AFTER_CONSECUTIVE_LOSSES = 3
-# Even a combo on a losing streak gets one real automated retry per week -- without this,
-# skipping is permanent: automated training would never touch it again, so the "last 3 runs"
-# window would freeze forever on the same 3 losses and there'd be no way to ever find out it
-# had improved short of the user manually clicking Train themselves. This closes that gap
-# while still giving up the other 6 days/week of quota-and-hang-risk savings the skip exists
-# for. If the periodic retry wins, the losing streak breaks naturally (the last 3 runs are no
-# longer all losses) and normal training resumes; if it loses again, it goes back to skip for
-# another week.
-SKIP_RECHECK_INTERVAL_DAYS = 7
-
-
-async def _should_skip_training(pair: str, interval: str) -> tuple[bool, Optional[str]]:
-    runs = await backtest_runs_collection.find(
-        {"pair": pair, "interval": interval, "profile": "rl", "total_return_pct": {"$ne": None}}
-    ).sort("created_at", -1).limit(SKIP_AFTER_CONSECUTIVE_LOSSES).to_list(length=SKIP_AFTER_CONSECUTIVE_LOSSES)
-    if len(runs) < SKIP_AFTER_CONSECUTIVE_LOSSES:
-        return False, None  # not enough history yet -- give it the full set of chances first
-    if not all(r["total_return_pct"] <= STRONG_LOSS_RETURN_PCT for r in runs):
-        return False, None
-    most_recent = runs[0]["created_at"]
-    recheck_due = most_recent + timedelta(days=SKIP_RECHECK_INTERVAL_DAYS)
-    if datetime.utcnow() >= recheck_due:
-        return False, None  # periodic retry is due -- let this one through for real
-    worst = min(r["total_return_pct"] for r in runs)
-    return True, (
-        f"Skipped: last {SKIP_AFTER_CONSECUTIVE_LOSSES} training runs all showed a losing "
-        f"edge (worst {worst:.0f}% return). Already excluded from live signals regardless. "
-        f"Automatically retried once every {SKIP_RECHECK_INTERVAL_DAYS} days (next due "
-        f"{recheck_due.strftime('%Y-%m-%d')}) -- or retrain manually now (the RL page's "
-        f"single Train button always forces a real run) if you want to check sooner."
-    )
-
 
 def _finding(severity: str, title: str, detail: str, pair: str | None = None, interval: str | None = None) -> dict:
     """Constructs through RLInsightFinding (not a bare dict literal) so a typo in `severity`
@@ -2135,20 +2076,16 @@ async def _run_all_flows_job(job_id: str) -> None:
         for interval in RL_INTERVALS:
             for pair in settings.pairs_list:
                 key = f"{pair}/{interval}"
-                skip, skip_reason = await _should_skip_training(pair, interval)
-                if skip:
-                    results["rl_training"][key] = f"skipped: {skip_reason}"
-                else:
-                    try:
-                        policy, eval_run = await _run_rl_training(
-                            pair, interval, DEFAULT_EPISODES, 0.7, max_lookforward=20, starting_balance=DEFAULT_STARTING_BALANCE,
-                        )
-                        results["rl_training"][key] = {
-                            "policy_id": policy.policy_id, "hit_rate_pct": eval_run.hit_rate_pct,
-                            "total_return_pct": eval_run.total_return_pct,
-                        }
-                    except Exception as e:
-                        results["rl_training"][key] = f"error: {e}"
+                try:
+                    policy, eval_run = await _run_rl_training(
+                        pair, interval, DEFAULT_EPISODES, 0.7, max_lookforward=20, starting_balance=DEFAULT_STARTING_BALANCE,
+                    )
+                    results["rl_training"][key] = {
+                        "policy_id": policy.policy_id, "hit_rate_pct": eval_run.hit_rate_pct,
+                        "total_return_pct": eval_run.total_return_pct,
+                    }
+                except Exception as e:
+                    results["rl_training"][key] = f"error: {e}"
                 if not await _run_all_flows_step(job_id, results, f"train {key}"):
                     return
 

@@ -687,14 +687,8 @@ export default function RLPage() {
                       <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
                         <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
                         <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
-                        {!cell.ok || cell.skipped ? (
-                          <td
-                            className={`px-3 py-1.5 ${cell.skipped ? "text-amber-600 dark:text-amber-400" : "text-zinc-400"}`}
-                            colSpan={5}
-                            title={cell.skipped ? (cell.error ?? undefined) : undefined}
-                          >
-                            {cell.skipped ? "Skipped (persistent losing streak) — hover for retry date" : cell.error}
-                          </td>
+                        {!cell.ok ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>{cell.error}</td>
                         ) : (
                           <>
                             <td className="px-3 py-1.5">{cell.hit_rate_pct != null ? `${cell.hit_rate_pct}%` : "—"}</td>
