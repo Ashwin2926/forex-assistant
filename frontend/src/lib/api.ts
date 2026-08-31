@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLMemorySummary, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLLearningCurve, RLMemorySummary, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -265,6 +265,11 @@ export const api = {
     if (params.limit) qs.set("limit", String(params.limit));
     const query = qs.toString();
     return request<RLAccuracy>(`/rl/accuracy${query ? `?${query}` : ""}`);
+  },
+
+  getRLLearningCurve(days?: number) {
+    const qs = days !== undefined ? `?days=${days}` : "";
+    return request<RLLearningCurve>(`/rl/learning-curve${qs}`);
   },
 
   listRLSignals(params: { pair?: string; limit?: number } = {}) {

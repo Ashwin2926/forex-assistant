@@ -377,6 +377,25 @@ export interface RLAccuracy {
   };
 }
 
+// One day's point on the "is the agent getting smarter" trend -- GET /rl/learning-curve.
+// Two independent series: live_directional_hit_rate_pct (real resolved trades, grouped by
+// the day they resolved) and avg_training_hit_rate_pct/avg_training_return_pct (that day's
+// training runs' own test-slice evaluation, averaged across whichever pair/intervals got
+// (re)trained). Either can be null for a day with no data in that series.
+export interface RLLearningCurvePoint {
+  date: string;
+  live_directional_hit_rate_pct: number | null;
+  live_decided_trades: number;
+  avg_training_hit_rate_pct: number | null;
+  avg_training_return_pct: number | null;
+  policies_trained: number;
+}
+
+export interface RLLearningCurve {
+  days: number;
+  points: RLLearningCurvePoint[];
+}
+
 export interface SignalAccuracy {
   pair: string | null;
   profile: Profile | null;

@@ -2,7 +2,7 @@ from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import uuid
 import pandas as pd
@@ -1492,6 +1492,71 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
             "superseded": round(total_superseded / total_all * 100, 1) if total_all else None,
         },
     }
+
+
+@app.get("/rl/learning-curve")
+async def rl_learning_curve(days: int = 30):
+    """
+    Day-by-day trend of both halves of "is the agent getting smarter" -- a single snapshot
+    (GET /rl/accuracy) can't answer that, only whether today looks better or worse than the
+    last poll. Two independent series, both derived from data already stored (no new
+    collection):
+
+    - live_directional_hit_rate_pct: every resolved (hit/miss, expired excluded -- same
+      reasoning as directional_hit_rate_pct above) live RLSignal, grouped by the calendar day
+      its outcome actually resolved (outcome_timestamp), not when it was generated -- this is
+      "how good were the agent's real decisions that got proven right or wrong on this day,"
+      across every pair/interval combined.
+    - avg_training_hit_rate_pct / avg_training_return_pct: every RL training run
+      (BacktestRun, profile="rl"), grouped by the day it was trained, averaged across
+      whichever pair/interval combos got (re)trained that day -- "how good did the agent's
+      own test-slice evaluation look on the policies produced this day." Retraining is
+      warm-started (see train_rl_policy's warm_start param) so a rising trend here reflects
+      real accumulated learning, not independent from-scratch runs.
+
+    Aggregated in Python, not a Mongo pipeline -- data volume here (signals/training runs
+    over `days` days) is small enough that this is simpler to read and maintain, consistent
+    with how GET /rl/accuracy above already prefers plain queries over aggregation.
+    """
+    since = datetime.utcnow() - timedelta(days=days)
+
+    live_cursor = rl_signals_collection.find({
+        "source": "live", "status": {"$in": ["hit", "miss"]}, "outcome_timestamp": {"$gte": since},
+    })
+    live_by_day: dict[str, dict] = {}
+    async for d in live_cursor:
+        day = d["outcome_timestamp"].strftime("%Y-%m-%d")
+        bucket = live_by_day.setdefault(day, {"hits": 0, "misses": 0})
+        bucket["hits" if d["status"] == "hit" else "misses"] += 1
+
+    train_cursor = backtest_runs_collection.find({
+        "profile": "rl", "created_at": {"$gte": since}, "hit_rate_pct": {"$ne": None},
+    })
+    train_by_day: dict[str, dict] = {}
+    async for d in train_cursor:
+        day = d["created_at"].strftime("%Y-%m-%d")
+        bucket = train_by_day.setdefault(day, {"hit_rates": [], "returns": [], "count": 0})
+        bucket["hit_rates"].append(d["hit_rate_pct"])
+        if d.get("total_return_pct") is not None:
+            bucket["returns"].append(d["total_return_pct"])
+        bucket["count"] += 1
+
+    points = []
+    for day in sorted(set(live_by_day) | set(train_by_day)):
+        live = live_by_day.get(day, {"hits": 0, "misses": 0})
+        decided = live["hits"] + live["misses"]
+        train = train_by_day.get(day)
+        points.append({
+            "date": day,
+            "live_directional_hit_rate_pct": round(live["hits"] / decided * 100, 1) if decided else None,
+            "live_decided_trades": decided,
+            "avg_training_hit_rate_pct": round(sum(train["hit_rates"]) / len(train["hit_rates"]), 1) if train else None,
+            "avg_training_return_pct": (
+                round(sum(train["returns"]) / len(train["returns"]), 1) if train and train["returns"] else None
+            ),
+            "policies_trained": train["count"] if train else 0,
+        })
+    return {"days": days, "points": points}
 
 
 # How far live directional accuracy is allowed to fall below what the currently active

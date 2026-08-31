@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLLearningCurve, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
 // How often to poll GET /rl/train-all/{job_id} while a batch run is in progress -- the job
@@ -70,6 +71,7 @@ export default function RLPage() {
   const [recentLoading, setRecentLoading] = useState(true);
 
   const [overallAccuracy, setOverallAccuracy] = useState<RLAccuracy | null>(null);
+  const [learningCurve, setLearningCurve] = useState<RLLearningCurve | null>(null);
 
   const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
   const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
@@ -84,6 +86,10 @@ export default function RLPage() {
   const [generateAllProgress, setGenerateAllProgress] = useState(0);
   const [generateAllRunning, setGenerateAllRunning] = useState(false);
   const [expandedQValues, setExpandedQValues] = useState<string | null>(null);
+
+  const [expandedContribution, setExpandedContribution] = useState<string | null>(null);
+  const [contributionCache, setContributionCache] = useState<Record<string, { feature: string; contribution: number }[]>>({});
+  const [contributionLoading, setContributionLoading] = useState<string | null>(null);
 
   async function loadPolicies() {
     setPoliciesLoading(true);
@@ -115,6 +121,14 @@ export default function RLPage() {
     }
   }
 
+  async function loadLearningCurve() {
+    try {
+      setLearningCurve(await api.getRLLearningCurve(30));
+    } catch {
+      // non-critical section
+    }
+  }
+
   // Trains sequentially server-side now (see app/main.py's run_train_all_job) -- this just
   // polls GET /rl/train-all/{job_id} until status flips to "done". Recurses via setTimeout
   // rather than setInterval so a slow poll response can't overlap the next one.
@@ -139,6 +153,7 @@ export default function RLPage() {
     loadPolicies();
     loadRecentSignals();
     loadOverallAccuracy();
+    loadLearningCurve();
     // Rehydrate an in-progress "Train all" job on load/reload -- the job itself lives
     // server-side now, so a reload should resume watching it, not lose track of it.
     api.getLatestTrainAllRLJob().then((job) => {
@@ -223,6 +238,18 @@ export default function RLPage() {
   const trainingConfidenceTrend = useTrend(trainingConfidence?.pct ?? null);
   const overallAccuracyTrend = useTrend(overallAccuracy?.directional_hit_rate_pct ?? null);
 
+  // Today's "Generate all" trades, ranked low-to-high confidence -- the least-confident ones
+  // (what you asked to see) sort to the top. Confidence is the same per-trade softmax already
+  // shown inline in the Generate-all grid; this just reorders that same data around it.
+  const confidenceRanked = generateAllResults
+    .filter((c): c is GenerateAllCell & { signal: RLSignal } => !!c.signal)
+    .map((c) => ({
+      cell: c,
+      confidence: actionConfidence(c.qValues, c.signal.size_tier ? `${c.signal.direction}_${c.signal.size_tier}` : c.signal.direction),
+    }))
+    .filter((r): r is { cell: GenerateAllCell & { signal: RLSignal }; confidence: number } => r.confidence != null)
+    .sort((a, b) => a.confidence - b.confidence);
+
   const [scoringRL, setScoringRL] = useState(false);
   const [scoreResult, setScoreResult] = useState<string | null>(null);
 
@@ -237,7 +264,7 @@ export default function RLPage() {
       );
       // Scoring can flip pending signals to resolved and can trigger a degradation-driven
       // retrain in the background -- both change what's already on screen.
-      await Promise.all([loadRecentSignals(), loadOverallAccuracy(), loadPolicies()]);
+      await Promise.all([loadRecentSignals(), loadOverallAccuracy(), loadPolicies(), loadLearningCurve()]);
     } catch (e) {
       setScoreResult(e instanceof ApiError ? e.message : "Scoring failed.");
     } finally {
@@ -266,6 +293,47 @@ export default function RLPage() {
     }
     setGenerateAllRunning(false);
     await loadRecentSignals();
+  }
+
+  // Per-feature contribution to the chosen action's Q-value: weight[chosen_action][i] *
+  // state[i] -- decomposes "why did the agent favor this action" into which of the 7
+  // strategy votes (plus the raw indicator/balance features) actually drove it, ranked by
+  // magnitude. Fetches that pair/interval's own recent policies (not the possibly-incomplete
+  // global `policies` list) and matches on the signal's own policy_id -- falls back to the
+  // most recent one for that pair/interval if the exact policy has since aged out.
+  async function handleShowContribution(cell: GenerateAllCell) {
+    const key = `${cell.pair}-${cell.interval}`;
+    if (expandedContribution === key) {
+      setExpandedContribution(null);
+      return;
+    }
+    setExpandedContribution(key);
+    if (contributionCache[key] || !cell.signal) return; // already cached (or nothing to compute)
+    const signal = cell.signal;
+    setContributionLoading(key);
+    try {
+      const candidates = await api.listRLPolicies({ pair: cell.pair, interval: cell.interval, limit: 5 });
+      const policy = candidates.find((p) => p.policy_id === signal.policy_id) ?? candidates[0];
+      const state = signal.state;
+      if (!policy || !state || state.length === 0) {
+        setContributionCache((prev) => ({ ...prev, [key]: [] }));
+        return;
+      }
+      const chosenAction = signal.size_tier ? `${signal.direction}_${signal.size_tier}` : signal.direction;
+      const weights = policy.weights[chosenAction];
+      if (!weights) {
+        setContributionCache((prev) => ({ ...prev, [key]: [] }));
+        return;
+      }
+      const contributions = policy.feature_names
+        .map((feature, i) => ({ feature, contribution: (weights[i] ?? 0) * (state[i] ?? 0) }))
+        .sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution));
+      setContributionCache((prev) => ({ ...prev, [key]: contributions }));
+    } catch {
+      setContributionCache((prev) => ({ ...prev, [key]: [] }));
+    } finally {
+      setContributionLoading(null);
+    }
   }
 
   async function handleShowTrades(policy: RLPolicy) {
@@ -357,6 +425,44 @@ export default function RLPage() {
             </>
           )}
         </div>
+      </section>
+
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Is it getting smarter?</h2>
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          Two independent day-by-day trends, both across every pair &amp; interval combined:
+          real resolved live trades (grouped by the day each one actually resolved), and
+          that day&apos;s training runs&apos; own test-slice evaluation (retraining is
+          warm-started, so a rising line here reflects accumulated learning, not independent
+          from-scratch runs). A single snapshot number can&apos;t answer whether this is
+          trending better — this can.
+        </p>
+        {!learningCurve || learningCurve.points.length < 2 ? (
+          <p className="mt-4 text-sm text-zinc-400">
+            Not enough days with data yet — check back once trades have resolved and training
+            has run across at least two different days.
+          </p>
+        ) : (
+          <div className="mt-4 h-64 w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={learningCurve.points}>
+                <CartesianGrid strokeDasharray="3 3" className="stroke-zinc-200 dark:stroke-zinc-800" />
+                <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} unit="%" />
+                <Tooltip />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Line
+                  type="monotone" dataKey="live_directional_hit_rate_pct" stroke="#10b981" strokeWidth={2}
+                  dot={{ r: 3 }} name="Live hit rate %" connectNulls
+                />
+                <Line
+                  type="monotone" dataKey="avg_training_hit_rate_pct" stroke="#6366f1" strokeWidth={2}
+                  dot={{ r: 3 }} name="Training hit rate %" connectNulls
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
@@ -626,6 +732,89 @@ export default function RLPage() {
             </div>
           )}
         </div>
+      </section>
+
+      <section>
+        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Confidence ranking</h2>
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          Today&apos;s generated trades, least confident first — expand a row to see which
+          strategy votes (and raw indicator readings) pushed the decision most, ranked by how
+          much each one actually moved the chosen action&apos;s score.
+        </p>
+        {generateAllResults.length === 0 ? (
+          <p className="mt-4 text-sm text-zinc-400">Run &quot;Generate all&quot; above to populate this.</p>
+        ) : confidenceRanked.length === 0 ? (
+          <p className="mt-4 text-sm text-zinc-400">No directional trades in the latest &quot;Generate all&quot; run — all HOLD.</p>
+        ) : (
+          <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                <tr>
+                  <th className="px-3 py-1.5">Pair</th>
+                  <th className="px-3 py-1.5">Interval</th>
+                  <th className="px-3 py-1.5">Direction</th>
+                  <th className="px-3 py-1.5">Size</th>
+                  <th className="px-3 py-1.5">Confidence</th>
+                  <th className="px-3 py-1.5"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {confidenceRanked.map(({ cell, confidence }) => {
+                  const key = `${cell.pair}-${cell.interval}`;
+                  const open = expandedContribution === key;
+                  const contributions = contributionCache[key];
+                  return (
+                    <>
+                      <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
+                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
+                        <td className={`px-3 py-1.5 font-semibold ${cell.signal.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                          {cell.signal.direction}
+                        </td>
+                        <td className={`px-3 py-1.5 font-mono ${cell.signal.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>
+                          {cell.signal.size_tier ?? "—"}
+                        </td>
+                        <td className={`px-3 py-1.5 font-mono font-semibold ${confidence >= 60 ? "text-emerald-600 dark:text-emerald-400" : confidence >= 40 ? "text-amber-600 dark:text-amber-400" : "text-rose-600 dark:text-rose-400"}`}>
+                          {confidence.toFixed(0)}%
+                        </td>
+                        <td className="px-3 py-1.5">
+                          <button
+                            onClick={() => handleShowContribution(cell)}
+                            className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
+                          >
+                            {open ? "Hide" : "Show"} strategies
+                          </button>
+                        </td>
+                      </tr>
+                      {open && (
+                        <tr key={`${key}-contrib`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
+                          <td colSpan={6} className="px-3 py-2">
+                            {contributionLoading === key && <p className="text-xs text-zinc-500">Loading…</p>}
+                            {contributions && contributions.length === 0 && (
+                              <p className="text-xs text-zinc-500">No policy/state data available for this trade.</p>
+                            )}
+                            {contributions && contributions.length > 0 && (
+                              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs font-mono">
+                                {contributions.map(({ feature, contribution }) => (
+                                  <span key={feature}>
+                                    {feature}:{" "}
+                                    <span className={contribution >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}>
+                                      {contribution >= 0 ? "+" : ""}{contribution.toFixed(4)}
+                                    </span>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       <section>
