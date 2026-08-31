@@ -691,8 +691,9 @@ export default function RLPage() {
                           <td
                             className={`px-3 py-1.5 ${cell.skipped ? "text-amber-600 dark:text-amber-400" : "text-zinc-400"}`}
                             colSpan={5}
+                            title={cell.skipped ? (cell.error ?? undefined) : undefined}
                           >
-                            {cell.skipped ? "Skipped (persistent losing streak)" : cell.error}
+                            {cell.skipped ? "Skipped (persistent losing streak) — hover for retry date" : cell.error}
                           </td>
                         ) : (
                           <>

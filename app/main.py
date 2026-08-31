@@ -1688,6 +1688,15 @@ LIVE_VS_TRAINED_GAP_PCT = 15.0  # same margin DEGRADATION_MARGIN_PCT below uses 
 # /rl/train call (force=True by default from the RL page's own "Train" button) -- a human
 # explicitly choosing to retrain one specific combo can always do so.
 SKIP_AFTER_CONSECUTIVE_LOSSES = 3
+# Even a combo on a losing streak gets one real automated retry per week -- without this,
+# skipping is permanent: automated training would never touch it again, so the "last 3 runs"
+# window would freeze forever on the same 3 losses and there'd be no way to ever find out it
+# had improved short of the user manually clicking Train themselves. This closes that gap
+# while still giving up the other 6 days/week of quota-and-hang-risk savings the skip exists
+# for. If the periodic retry wins, the losing streak breaks naturally (the last 3 runs are no
+# longer all losses) and normal training resumes; if it loses again, it goes back to skip for
+# another week.
+SKIP_RECHECK_INTERVAL_DAYS = 7
 
 
 async def _should_skip_training(pair: str, interval: str) -> tuple[bool, Optional[str]]:
@@ -1696,15 +1705,20 @@ async def _should_skip_training(pair: str, interval: str) -> tuple[bool, Optiona
     ).sort("created_at", -1).limit(SKIP_AFTER_CONSECUTIVE_LOSSES).to_list(length=SKIP_AFTER_CONSECUTIVE_LOSSES)
     if len(runs) < SKIP_AFTER_CONSECUTIVE_LOSSES:
         return False, None  # not enough history yet -- give it the full set of chances first
-    if all(r["total_return_pct"] <= STRONG_LOSS_RETURN_PCT for r in runs):
-        worst = min(r["total_return_pct"] for r in runs)
-        return True, (
-            f"Skipped: last {SKIP_AFTER_CONSECUTIVE_LOSSES} training runs all showed a losing "
-            f"edge (worst {worst:.0f}% return). Already excluded from live signals regardless "
-            f"-- retrain manually (the RL page's single Train button always forces a real run) "
-            f"if you want to give it another shot."
-        )
-    return False, None
+    if not all(r["total_return_pct"] <= STRONG_LOSS_RETURN_PCT for r in runs):
+        return False, None
+    most_recent = runs[0]["created_at"]
+    recheck_due = most_recent + timedelta(days=SKIP_RECHECK_INTERVAL_DAYS)
+    if datetime.utcnow() >= recheck_due:
+        return False, None  # periodic retry is due -- let this one through for real
+    worst = min(r["total_return_pct"] for r in runs)
+    return True, (
+        f"Skipped: last {SKIP_AFTER_CONSECUTIVE_LOSSES} training runs all showed a losing "
+        f"edge (worst {worst:.0f}% return). Already excluded from live signals regardless. "
+        f"Automatically retried once every {SKIP_RECHECK_INTERVAL_DAYS} days (next due "
+        f"{recheck_due.strftime('%Y-%m-%d')}) -- or retrain manually now (the RL page's "
+        f"single Train button always forces a real run) if you want to check sooner."
+    )
 
 
 def _finding(severity: str, title: str, detail: str, pair: str | None = None, interval: str | None = None) -> dict:
