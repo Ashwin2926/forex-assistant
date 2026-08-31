@@ -24,7 +24,7 @@ from app.core.database import (
     run_all_flows_jobs_collection,
 )
 from app.models.schemas import (
-    LoginRequest, RuleConfig, RLPolicy, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob,
+    LoginRequest, RuleConfig, RLPolicy, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
 )
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
@@ -1621,6 +1621,143 @@ def _half_split_verdict(
         "status": status, "first_half_rate_pct": first_rate, "second_half_rate_pct": second_rate,
         "first_half_n": first_n, "second_half_n": second_n,
     }
+
+
+# Thresholds for GET /rl/insights below -- starting guesses, not independently tuned, same
+# caveat as every other unvalidated constant in this project. MIN_SAMPLE_FOR_INSIGHT gates
+# every per-pair/interval finding (not just the live-resolution ones) so a combo with only a
+# handful of live signals doesn't generate a confident-sounding finding off noise.
+MIN_SAMPLE_FOR_INSIGHT = 15
+STRONG_LOSS_RETURN_PCT = -30.0
+STRONG_WIN_RETURN_PCT = 30.0
+STRONG_WIN_MIN_HIT_RATE_PCT = 40.0
+HIGH_SUPERSEDE_FRACTION = 0.4
+HIGH_EXPIRED_FRACTION = 0.8
+LIVE_VS_TRAINED_GAP_PCT = 15.0  # same margin DEGRADATION_MARGIN_PCT below uses for auto-retrain
+
+
+def _finding(severity: str, title: str, detail: str, pair: str | None = None, interval: str | None = None) -> dict:
+    """Constructs through RLInsightFinding (not a bare dict literal) so a typo in `severity`
+    or a missing field fails loudly here instead of silently reaching the frontend."""
+    return RLInsightFinding(severity=severity, pair=pair, interval=interval, title=title, detail=detail).model_dump()
+
+
+@app.get("/rl/insights")
+async def rl_insights():
+    """
+    Deterministic, explainable "what to improve" findings -- not an LLM call, a fixed set of
+    rules scanning data this project already collects: every pair/interval's latest trained
+    policy and its own backtest eval, that pair/interval's live resolution breakdown
+    (hit/miss/expired/superseded), and the overall learning-curve verdict (see
+    _half_split_verdict above, reused directly so this doesn't duplicate that logic or drift
+    out of sync with it). Same "explainable, not black-box" ethos as the rule engine's
+    SignalReason and the ML classifier's feature_coefficients -- every finding here traces
+    back to a specific number, not a model's opaque judgment call.
+
+    Findings are sorted critical-first, then warning, then good -- what needs attention
+    surfaces at the top.
+    """
+    findings: list[dict] = []
+
+    for pair in settings.pairs_list:
+        for interval in RL_INTERVALS:
+            label = f"{pair} {interval}"
+
+            policy_doc = await rl_policies_collection.find_one(
+                {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
+            )
+            if policy_doc is not None:
+                eval_run = await backtest_runs_collection.find_one({"run_id": policy_doc.get("eval_run_id")})
+                hit_rate = eval_run.get("hit_rate_pct") if eval_run else None
+                total_return = eval_run.get("total_return_pct") if eval_run else None
+
+                if total_return is not None and total_return <= STRONG_LOSS_RETURN_PCT:
+                    findings.append(_finding(
+                        "critical", f"{label}: training shows a losing edge",
+                        f"Latest retrain's test-slice walk lost {abs(total_return):.0f}% of a "
+                        f"simulated $50 start (hit rate {hit_rate}%). Consider excluding this "
+                        f"pair/interval from live signals, or capping it to the SMALL size "
+                        f"tier, until this turns around.",
+                        pair=pair, interval=interval,
+                    ))
+                elif total_return is not None and total_return >= STRONG_WIN_RETURN_PCT and (hit_rate or 0) >= STRONG_WIN_MIN_HIT_RATE_PCT:
+                    findings.append(_finding(
+                        "good", f"{label}: strongest performer",
+                        f"Latest retrain grew a simulated $50 start by {total_return:.0f}% at a "
+                        f"{hit_rate}% hit rate -- your most reliable edge right now.",
+                        pair=pair, interval=interval,
+                    ))
+            else:
+                hit_rate = None
+
+            query = {"pair": pair, "interval": interval, "source": "live"}
+            hits = await rl_signals_collection.count_documents({**query, "status": "hit"})
+            misses = await rl_signals_collection.count_documents({**query, "status": "miss"})
+            expired = await rl_signals_collection.count_documents({**query, "status": "expired"})
+            superseded = await rl_signals_collection.count_documents({**query, "status": "superseded"})
+            decided = hits + misses
+            total_all = decided + expired + superseded
+
+            if total_all >= MIN_SAMPLE_FOR_INSIGHT:
+                if superseded / total_all >= HIGH_SUPERSEDE_FRACTION:
+                    findings.append(_finding(
+                        "warning", f"{label}: policy keeps changing its mind",
+                        f"{round(superseded / total_all * 100)}% of signals were superseded "
+                        f"before ever resolving -- the agent rarely lets a decision play out. "
+                        f"Often means it hasn't converged yet; more training episodes may help.",
+                        pair=pair, interval=interval,
+                    ))
+                if expired / total_all >= HIGH_EXPIRED_FRACTION:
+                    findings.append(_finding(
+                        "warning", f"{label}: signals rarely reach a real outcome",
+                        f"{round(expired / total_all * 100)}% of resolved signals timed out "
+                        f"without hitting target or stop. On fast intervals this is often the "
+                        f"fixed spread cost eating most of the typical move -- worth revisiting "
+                        f"target/stop sizing for this interval specifically.",
+                        pair=pair, interval=interval,
+                    ))
+
+            if decided >= MIN_SAMPLE_FOR_INSIGHT and hit_rate is not None:
+                live_rate = round(hits / decided * 100, 1)
+                if hit_rate - live_rate >= LIVE_VS_TRAINED_GAP_PCT:
+                    findings.append(_finding(
+                        "warning", f"{label}: live results lagging the training claim",
+                        f"Trained policy's own backtest claimed {hit_rate}% hit rate; live is "
+                        f"running {live_rate}% over {decided} resolved trades so far. This "
+                        f"already auto-triggers a background retrain -- flagged here so it's "
+                        f"visible, not silent.",
+                        pair=pair, interval=interval,
+                    ))
+
+    learning = await rl_learning_curve(days=30)
+    live_v, train_v = learning["verdict"]["live"], learning["verdict"]["training"]
+    if train_v["status"] in ("improving", "declining"):
+        findings.append(_finding(
+            "good" if train_v["status"] == "improving" else "critical",
+            f"Overall training quality is {train_v['status']}",
+            f"{train_v['first_half_rate_pct']}% -> {train_v['second_half_rate_pct']}% hit rate "
+            f"across the earlier vs later half of the last 30 days ({train_v['first_half_n']} vs "
+            f"{train_v['second_half_n']} pooled policy runs).",
+        ))
+    if live_v["status"] in ("improving", "declining"):
+        findings.append(_finding(
+            "good" if live_v["status"] == "improving" else "warning",
+            f"Overall live trading is {live_v['status']}",
+            f"{live_v['first_half_rate_pct']}% -> {live_v['second_half_rate_pct']}% hit rate "
+            f"across the earlier vs later half of the last 30 days ({live_v['first_half_n']} vs "
+            f"{live_v['second_half_n']} decided trades).",
+        ))
+
+    if not findings:
+        findings.append(_finding(
+            "warning", "Not enough data for real findings yet",
+            "Keep training and letting live signals resolve -- most findings need at least "
+            f"{MIN_SAMPLE_FOR_INSIGHT} resolved/decided signals per pair/interval.",
+        ))
+
+    order = {"critical": 0, "warning": 1, "good": 2}
+    findings.sort(key=lambda f: order[f["severity"]])
+    return {"generated_at": datetime.utcnow(), "findings": findings}
 
 
 # How far live directional accuracy is allowed to fall below what the currently active

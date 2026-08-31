@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { StatusBadge } from "@/components/Badges";
 
 // How often to poll GET /rl/train-all/{job_id} while a batch run is in progress -- the job
@@ -101,6 +101,7 @@ export default function RLPage() {
 
   const [overallAccuracy, setOverallAccuracy] = useState<RLAccuracy | null>(null);
   const [learningCurve, setLearningCurve] = useState<RLLearningCurve | null>(null);
+  const [insights, setInsights] = useState<RLInsights | null>(null);
 
   const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
   const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
@@ -158,6 +159,14 @@ export default function RLPage() {
     }
   }
 
+  async function loadInsights() {
+    try {
+      setInsights(await api.getRLInsights());
+    } catch {
+      // non-critical section
+    }
+  }
+
   // Trains sequentially server-side now (see app/main.py's run_train_all_job) -- this just
   // polls GET /rl/train-all/{job_id} until status flips to "done". Recurses via setTimeout
   // rather than setInterval so a slow poll response can't overlap the next one.
@@ -183,6 +192,7 @@ export default function RLPage() {
     loadRecentSignals();
     loadOverallAccuracy();
     loadLearningCurve();
+    loadInsights();
     // Rehydrate an in-progress "Train all" job on load/reload -- the job itself lives
     // server-side now, so a reload should resume watching it, not lose track of it.
     api.getLatestTrainAllRLJob().then((job) => {
@@ -293,7 +303,7 @@ export default function RLPage() {
       );
       // Scoring can flip pending signals to resolved and can trigger a degradation-driven
       // retrain in the background -- both change what's already on screen.
-      await Promise.all([loadRecentSignals(), loadOverallAccuracy(), loadPolicies(), loadLearningCurve()]);
+      await Promise.all([loadRecentSignals(), loadOverallAccuracy(), loadPolicies(), loadLearningCurve(), loadInsights()]);
     } catch (e) {
       setScoreResult(e instanceof ApiError ? e.message : "Scoring failed.");
     } finally {
@@ -470,6 +480,56 @@ export default function RLPage() {
           <div className="mt-4 flex flex-wrap gap-3">
             <VerdictCard title="Live trading" verdict={learningCurve.verdict.live} sampleUnit="trades" minN={15} />
             <VerdictCard title="Training quality" verdict={learningCurve.verdict.training} sampleUnit="policy runs" minN={20} />
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">What to improve</h2>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+              Deterministic findings from data already collected here — no AI judgment call,
+              every line traces back to a specific number. Critical first.
+            </p>
+          </div>
+          <button
+            onClick={loadInsights}
+            className="shrink-0 rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          >
+            Refresh
+          </button>
+        </div>
+        {!insights ? (
+          <p className="mt-4 text-sm text-zinc-400">Loading…</p>
+        ) : (
+          <div className="mt-4 flex flex-col gap-2">
+            {insights.findings.map((f, i) => {
+              const style = {
+                critical: "border-rose-200 bg-rose-50 dark:border-rose-900 dark:bg-rose-950",
+                warning: "border-amber-200 bg-amber-50 dark:border-amber-900 dark:bg-amber-950",
+                good: "border-emerald-200 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950",
+              }[f.severity];
+              const badge = {
+                critical: "text-rose-700 dark:text-rose-300",
+                warning: "text-amber-700 dark:text-amber-300",
+                good: "text-emerald-700 dark:text-emerald-300",
+              }[f.severity];
+              return (
+                <div key={i} className={`rounded-md border p-3 ${style}`}>
+                  <p className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
+                    <span className={`mr-2 text-xs font-semibold uppercase ${badge}`}>{f.severity}</span>
+                    {f.title}
+                    {f.pair && f.interval && (
+                      <span className="ml-2 font-mono text-xs font-normal text-zinc-500 dark:text-zinc-400">
+                        {f.pair} · {f.interval}
+                      </span>
+                    )}
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">{f.detail}</p>
+                </div>
+              );
+            })}
           </div>
         )}
       </section>

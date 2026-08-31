@@ -343,6 +343,21 @@ class RLSignal(BaseModel):
     source: Literal["live", "backtest"] = "live"
 
 
+class RLInsightFinding(BaseModel):
+    """
+    One deterministic, explainable "what to improve" finding from GET /rl/insights --
+    synthesized from data this project already collects (trained-policy backtest evals, live
+    resolution breakdowns, the learning-curve verdict), not an LLM call. Same "explainable,
+    not black-box" ethos as SignalReason/feature_coefficients elsewhere in this project.
+    pair/interval are None for a system-wide finding (e.g. the overall learning verdict).
+    """
+    severity: Literal["good", "warning", "critical"]
+    pair: Optional[str] = None
+    interval: Optional[str] = None
+    title: str
+    detail: str
+
+
 class RLTrainAllCell(BaseModel):
     """One pair/interval's outcome within an RLTrainAllJob -- mirrors what the single
     POST /rl/train endpoint returns, flattened for the progress table."""

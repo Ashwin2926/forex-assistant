@@ -410,6 +410,22 @@ export interface RLLearningCurve {
   verdict: { live: RLLearningVerdict; training: RLLearningVerdict };
 }
 
+// GET /rl/insights -- deterministic, explainable "what to improve" findings synthesized from
+// data already collected elsewhere (no LLM call). pair/interval are null for a system-wide
+// finding (e.g. the overall learning-curve verdict, reused directly from RLLearningCurve).
+export interface RLInsightFinding {
+  severity: "good" | "warning" | "critical";
+  pair: string | null;
+  interval: string | null;
+  title: string;
+  detail: string;
+}
+
+export interface RLInsights {
+  generated_at: string;
+  findings: RLInsightFinding[];
+}
+
 export interface SignalAccuracy {
   pair: string | null;
   profile: Profile | null;
