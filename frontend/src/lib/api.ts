@@ -252,6 +252,10 @@ export const api = {
     return request<{
       signal: RLSignal | null; q_values: Record<string, number>;
       memory?: RLMemorySummary; memory_override?: string | null;
+      // Present when this pair/interval's latest training run showed a clear losing edge --
+      // live signals are withheld (not just downsized like memory_override) until a retrain
+      // clears it. Training itself is unaffected; this re-checks fresh on every call.
+      excluded_reason?: string | null;
     }>(
       `/rl/signal/${interval}?${qs.toString()}`,
       { method: "POST" },

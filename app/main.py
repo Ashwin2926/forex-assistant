@@ -1255,6 +1255,32 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
         raise HTTPException(status_code=400, detail=str(e))
     current_price = float(df.iloc[-1]["close"])
 
+    # Live-exclusion gate: a policy whose latest training-time backtest showed a clear losing
+    # edge (same STRONG_LOSS_RETURN_PCT threshold GET /rl/insights already flags as
+    # "critical") doesn't get to trade live, even though it keeps training normally in the
+    # background (the once-daily cron retrain and _check_and_retrain_degraded_policies's
+    # degradation-triggered retrain are both untouched by this). Self-correcting, not a
+    # manual toggle someone has to remember to flip back -- this re-checks the LATEST
+    # policy's own eval fresh on every call, so the next retrain that clears the threshold
+    # re-enables live signals automatically.
+    eval_run = await backtest_runs_collection.find_one({"run_id": policy.eval_run_id})
+    excluded_return = eval_run.get("total_return_pct") if eval_run else None
+    if excluded_return is not None and excluded_return <= STRONG_LOSS_RETURN_PCT:
+        pending = await rl_signals_collection.find_one(
+            {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
+        )
+        if pending is not None:
+            await _supersede_pending_rl_signal(pending, current_price)
+        return {
+            "signal": None, "q_values": q_values,
+            "excluded_reason": (
+                f"Latest training run lost {abs(excluded_return):.0f}% of a simulated $50 "
+                f"start (hit rate {eval_run.get('hit_rate_pct')}%) -- excluded from live "
+                f"signals until a retrain clears this. Training continues normally in the "
+                f"background; this re-checks fresh every call, so it re-enables automatically."
+            ),
+        }
+
     pending = await rl_signals_collection.find_one(
         {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
     )

@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
-import Link from "next/link";
 import { AuthGuard } from "@/components/AuthGuard";
 import { AuthNav } from "@/components/AuthNav";
+import { SideNav } from "@/components/SideNav";
 import { SyncNowButton } from "@/components/SyncNowButton";
 import "./globals.css";
 
@@ -27,56 +27,37 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-        <header className="border-b border-zinc-200 dark:border-zinc-800">
-          <div className="mx-auto flex max-w-5xl items-center gap-6 overflow-x-auto px-6 py-4">
-            <span className="shrink-0 whitespace-nowrap text-sm font-semibold tracking-tight">
+      <body className="flex min-h-full bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+        {/* Side nav replaces the old top nav (which had grown to 8 links and was wrapping
+            onto multiple broken lines on narrower viewports) -- fixed-width column, its own
+            scroll for the link list so a future 9th/10th page doesn't push the footer
+            controls off screen. */}
+        <aside className="flex w-56 shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-800">
+          <div className="px-4 py-4">
+            <span className="whitespace-nowrap text-sm font-semibold tracking-tight">
               Forex Trading Assistant
             </span>
-            <nav className="flex shrink-0 gap-4 whitespace-nowrap text-sm text-zinc-500 dark:text-zinc-400">
-              <Link href="/" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                Signal Feed
-              </Link>
-              <Link href="/trading-signals" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                Trading Signals
-              </Link>
-              <Link href="/chart" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                Chart
-              </Link>
-              <Link href="/backtest" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                Backtesting
-              </Link>
-              <Link href="/consensus" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                Consensus
-              </Link>
-              <Link href="/paper-trade" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                Paper Trading
-              </Link>
-              <Link href="/ml" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                ML
-              </Link>
-              <Link href="/rl" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                RL Agent
-              </Link>
-            </nav>
-            <div className="ml-auto flex shrink-0 items-center gap-4 whitespace-nowrap">
-              <SyncNowButton />
-              <AuthNav />
-            </div>
           </div>
-        </header>
-        <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">
-          <AuthGuard>{children}</AuthGuard>
-        </main>
-        <footer className="border-t border-zinc-200 px-6 py-3 text-xs text-zinc-400 dark:border-zinc-800 dark:text-zinc-600">
-          <div className="mx-auto max-w-5xl">
+          <div className="flex-1 overflow-y-auto px-2">
+            <SideNav />
+          </div>
+          <div className="flex flex-col gap-3 border-t border-zinc-200 px-3 py-4 dark:border-zinc-800">
+            <SyncNowButton />
+            <AuthNav />
+          </div>
+        </aside>
+        <div className="flex min-h-full flex-1 flex-col">
+          <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">
+            <AuthGuard>{children}</AuthGuard>
+          </main>
+          <footer className="border-t border-zinc-200 px-6 py-3 text-xs text-zinc-400 dark:border-zinc-800 dark:text-zinc-600">
             {/* NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA is auto-injected by Vercel at build time
                 (requires "Automatically expose System Environment Variables" in project
                 settings) -- lets a deploy be confirmed as picking up the latest push
                 without needing a throwaway commit each time. */}
             Build {process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? "dev"}
-          </div>
-        </footer>
+          </footer>
+        </div>
       </body>
     </html>
   );

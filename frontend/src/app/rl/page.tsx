@@ -20,6 +20,9 @@ interface GenerateAllCell {
   // a downsize-only override instead lives on signal.memory_override, since a trade still
   // happened. See app/services/case_memory.py's memory_gate.
   memoryOverride?: string | null;
+  // Set when this pair/interval's latest training run showed a clear losing edge -- live
+  // signals withheld until a retrain clears it (see app/main.py's create_rl_signal).
+  excludedReason?: string | null;
   error?: string;
 }
 
@@ -323,6 +326,7 @@ export default function RLPage() {
         results.push({
           pair: p, interval: i, signal: result.signal, qValues: result.q_values,
           memory: result.memory ?? null, memoryOverride: result.memory_override ?? null,
+          excludedReason: result.excluded_reason ?? null,
         });
       } catch (e) {
         results.push({ pair: p, interval: i, signal: null, qValues: null, error: e instanceof ApiError ? e.message : "Failed" });
@@ -742,8 +746,12 @@ export default function RLPage() {
                           ) : (
                             <>
                               {!s ? (
-                                <td className="px-3 py-1.5 text-zinc-400" colSpan={6} title={cell.memoryOverride ?? undefined}>
-                                  {cell.memoryOverride ? "HOLD (memory override)" : "HOLD"}
+                                <td
+                                  className={`px-3 py-1.5 ${cell.excludedReason ? "text-amber-600 dark:text-amber-400" : "text-zinc-400"}`}
+                                  colSpan={6}
+                                  title={cell.excludedReason ?? cell.memoryOverride ?? undefined}
+                                >
+                                  {cell.excludedReason ? "Excluded (losing edge)" : cell.memoryOverride ? "HOLD (memory override)" : "HOLD"}
                                 </td>
                               ) : (
                                 <>
