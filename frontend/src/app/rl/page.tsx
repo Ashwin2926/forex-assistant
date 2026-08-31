@@ -568,6 +568,7 @@ export default function RLPage() {
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
         <SectionToggle open={trainOpen} onToggle={() => setTrainOpen((o) => !o)} title="Train a policy" />
         {trainOpen && (
+        <>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Pair">
             <select value={pair} onChange={(e) => setPair(e.target.value)} className="select">
@@ -717,6 +718,7 @@ export default function RLPage() {
             </div>
           )}
         </div>
+        </>
         )}
       </section>
 
@@ -739,6 +741,7 @@ export default function RLPage() {
           )}
         </div>
         {generateOpen && (
+        <>
         <div className="mt-3">
           <Field label="Your current balance ($)">
             <input
@@ -848,6 +851,7 @@ export default function RLPage() {
             </div>
           )}
         </div>
+        </>
         )}
       </section>
 
