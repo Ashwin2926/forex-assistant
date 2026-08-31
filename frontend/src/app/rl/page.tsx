@@ -54,6 +54,18 @@ function TrendArrow({ trend }: { trend: Trend }) {
   );
 }
 
+// Clickable chevron+title for a collapsible section header -- the body content stays wherever
+// it already lives in each section (varies too much section-to-section to share, some have a
+// subtitle, some have header-right buttons); this just standardizes the toggle control itself.
+function SectionToggle({ open, onToggle, title }: { open: boolean; onToggle: () => void; title: string }) {
+  return (
+    <button onClick={onToggle} className="flex items-center gap-2 text-left">
+      <span className={`inline-block text-xs text-zinc-400 transition-transform ${open ? "rotate-90" : ""}`}>▶</span>
+      <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">{title}</h2>
+    </button>
+  );
+}
+
 const VERDICT_LABEL: Record<RLLearningVerdict["status"], string> = {
   improving: "Improving",
   declining: "Declining",
@@ -105,6 +117,17 @@ export default function RLPage() {
   const [overallAccuracy, setOverallAccuracy] = useState<RLAccuracy | null>(null);
   const [learningCurve, setLearningCurve] = useState<RLLearningCurve | null>(null);
   const [insights, setInsights] = useState<RLInsights | null>(null);
+
+  // Section collapse state -- the page grew to 9 sections and got too long to scan at a
+  // glance. The "how is it doing" summary sections (confidence/accuracy, the verdict cards,
+  // What to improve) stay expanded by default; the action/detail sections (train, generate,
+  // and the tables fed by them) start collapsed and open on demand.
+  const [insightsOpen, setInsightsOpen] = useState(true);
+  const [trainOpen, setTrainOpen] = useState(false);
+  const [generateOpen, setGenerateOpen] = useState(false);
+  const [confidenceRankingOpen, setConfidenceRankingOpen] = useState(false);
+  const [recentSignalsOpen, setRecentSignalsOpen] = useState(false);
+  const [trainingHistoryOpen, setTrainingHistoryOpen] = useState(false);
 
   const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
   const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
@@ -491,20 +514,24 @@ export default function RLPage() {
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">What to improve</h2>
-            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-              Deterministic findings from data already collected here — no AI judgment call,
-              every line traces back to a specific number. Critical first.
-            </p>
+            <SectionToggle open={insightsOpen} onToggle={() => setInsightsOpen((o) => !o)} title="What to improve" />
+            {insightsOpen && (
+              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                Deterministic findings from data already collected here — no AI judgment call,
+                every line traces back to a specific number. Critical first.
+              </p>
+            )}
           </div>
-          <button
-            onClick={loadInsights}
-            className="shrink-0 rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-          >
-            Refresh
-          </button>
+          {insightsOpen && (
+            <button
+              onClick={loadInsights}
+              className="shrink-0 rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            >
+              Refresh
+            </button>
+          )}
         </div>
-        {!insights ? (
+        {insightsOpen && (!insights ? (
           <p className="mt-4 text-sm text-zinc-400">Loading…</p>
         ) : (
           <div className="mt-4 flex flex-col gap-2">
@@ -535,11 +562,12 @@ export default function RLPage() {
               );
             })}
           </div>
-        )}
+        ))}
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Train a policy</h2>
+        <SectionToggle open={trainOpen} onToggle={() => setTrainOpen((o) => !o)} title="Train a policy" />
+        {trainOpen && (
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Pair">
             <select value={pair} onChange={(e) => setPair(e.target.value)} className="select">
@@ -689,22 +717,28 @@ export default function RLPage() {
             </div>
           )}
         </div>
+        )}
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Generate signals</h2>
-            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-              Loads each pair/interval&apos;s latest trained policy and picks its greedy
-              action on the current candle, sized against the balance below — all 4 pairs
-              &times; 5 intervals at once. Only BUY/SELL get stored; a HOLD row shows as HOLD.
-            </p>
+            <SectionToggle open={generateOpen} onToggle={() => setGenerateOpen((o) => !o)} title="Generate signals" />
+            {generateOpen && (
+              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                Loads each pair/interval&apos;s latest trained policy and picks its greedy
+                action on the current candle, sized against the balance below — all 4 pairs
+                &times; 5 intervals at once. Only BUY/SELL get stored; a HOLD row shows as HOLD.
+              </p>
+            )}
           </div>
-          <button onClick={handleGenerateAll} disabled={generateAllRunning} className="btn-primary shrink-0">
-            {generateAllRunning ? `Generating ${generateAllProgress}/20…` : "Generate all"}
-          </button>
+          {generateOpen && (
+            <button onClick={handleGenerateAll} disabled={generateAllRunning} className="btn-primary shrink-0">
+              {generateAllRunning ? `Generating ${generateAllProgress}/20…` : "Generate all"}
+            </button>
+          )}
         </div>
+        {generateOpen && (
         <div className="mt-3">
           <Field label="Your current balance ($)">
             <input
@@ -814,16 +848,19 @@ export default function RLPage() {
             </div>
           )}
         </div>
+        )}
       </section>
 
       <section>
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Confidence ranking</h2>
+        <SectionToggle open={confidenceRankingOpen} onToggle={() => setConfidenceRankingOpen((o) => !o)} title="Confidence ranking" />
+        {confidenceRankingOpen && (
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Today&apos;s generated trades, least confident first — expand a row to see which
           strategy votes (and raw indicator readings) pushed the decision most, ranked by how
           much each one actually moved the chosen action&apos;s score.
         </p>
-        {generateAllResults.length === 0 ? (
+        )}
+        {confidenceRankingOpen && (generateAllResults.length === 0 ? (
           <p className="mt-4 text-sm text-zinc-400">Run &quot;Generate all&quot; above to populate this.</p>
         ) : confidenceRanked.length === 0 ? (
           <p className="mt-4 text-sm text-zinc-400">No directional trades in the latest &quot;Generate all&quot; run — all HOLD.</p>
@@ -896,29 +933,31 @@ export default function RLPage() {
               </tbody>
             </table>
           </div>
-        )}
+        ))}
       </section>
 
       <section>
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Recent RL signals</h2>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleScoreRL}
-              disabled={scoringRL}
-              title="Checks every pending RL signal against candles that have arrived since it fired, resolving hit/miss/expired where enough real data now exists -- doesn't generate or train anything, just resolves outcomes."
-              className="rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-            >
-              {scoringRL ? "Scoring…" : "Score now"}
-            </button>
-            {scoreResult && <span className="text-xs text-zinc-500 dark:text-zinc-400">{scoreResult}</span>}
-          </div>
+          <SectionToggle open={recentSignalsOpen} onToggle={() => setRecentSignalsOpen((o) => !o)} title="Recent RL signals" />
+          {recentSignalsOpen && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleScoreRL}
+                disabled={scoringRL}
+                title="Checks every pending RL signal against candles that have arrived since it fired, resolving hit/miss/expired where enough real data now exists -- doesn't generate or train anything, just resolves outcomes."
+                className="rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                {scoringRL ? "Scoring…" : "Score now"}
+              </button>
+              {scoreResult && <span className="text-xs text-zinc-500 dark:text-zinc-400">{scoreResult}</span>}
+            </div>
+          )}
         </div>
-        {recentLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
-        {!recentLoading && recentSignals.length === 0 && (
+        {recentSignalsOpen && recentLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
+        {recentSignalsOpen && !recentLoading && recentSignals.length === 0 && (
           <p className="mt-4 text-sm text-zinc-500">No RL signals yet.</p>
         )}
-        {recentSignals.length > 0 && (
+        {recentSignalsOpen && recentSignals.length > 0 && (
           <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
             <table className="w-full text-left text-sm">
               <thead className="bg-zinc-50 text-xs uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
@@ -964,16 +1003,18 @@ export default function RLPage() {
       </section>
 
       <section>
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Training history</h2>
-        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Read down a given pair/interval&apos;s rows over successive trainings to see whether
-          hit rate/expectancy is actually improving, not just whichever number is newest.
-        </p>
-        {policiesLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
-        {!policiesLoading && policies.length === 0 && (
+        <SectionToggle open={trainingHistoryOpen} onToggle={() => setTrainingHistoryOpen((o) => !o)} title="Training history" />
+        {trainingHistoryOpen && (
+          <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+            Read down a given pair/interval&apos;s rows over successive trainings to see whether
+            hit rate/expectancy is actually improving, not just whichever number is newest.
+          </p>
+        )}
+        {trainingHistoryOpen && policiesLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
+        {trainingHistoryOpen && !policiesLoading && policies.length === 0 && (
           <p className="mt-4 text-sm text-zinc-500">No trained policies yet — train one above.</p>
         )}
-        {policies.length > 0 && (
+        {trainingHistoryOpen && policies.length > 0 && (
           <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
             <table className="w-full text-left text-sm">
               <thead className="bg-zinc-50 text-xs uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
