@@ -28,7 +28,7 @@ from app.models.schemas import (
 )
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
-from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, spread_cost_pct
+from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for
 from app.services.backtester import run_backtest, run_consensus_backtest
 from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus
@@ -46,7 +46,7 @@ from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import (
     score_pending_signals, score_pending_consensus_signals, score_pending_rl_signals,
-    resolve_rl_signal_real_outcome,
+    resolve_rl_signal_real_outcome, LIVE_MAX_LOOKFORWARD_BY_INTERVAL,
 )
 
 settings = get_settings()
@@ -1139,54 +1139,6 @@ async def list_rl_policies(pair: str | None = None, interval: str | None = None,
     return docs
 
 
-async def _supersede_pending_rl_signal(pending: dict, current_price: float) -> None:
-    """
-    Marks a pending RL signal "superseded" because the policy's live view has moved on (a
-    newer decision at the same pair/interval disagrees with it), rather than leaving it to
-    resolve naturally against label_outcome's live window (see
-    outcome_scoring.LIVE_MAX_LOOKFORWARD_BY_INTERVAL -- several days at most intervals).
-    This project treats "pending" as "still the agent's current live view" for RL signals
-    specifically, since they're meant to be traded manually and soon -- a stale one hanging
-    around for most of a day isn't a real trade opportunity anymore. The record is UPDATED,
-    never deleted -- same "keep history, don't erase it" convention as every other status
-    transition in this project.
-
-    Deliberately a status distinct from "expired" (see RLSignal.status's docstring) -- this
-    was originally folded into "expired" and it quietly wrecked GET /rl/accuracy: a policy
-    that changes its mind often (most likely on the faster, less-converged 5min/15min
-    intervals) superseded the large majority of its own signals well before label_outcome
-    ever got a chance to judge them, making the agent look far less accurate than its actual
-    resolved (hit/miss/genuinely-expired) trades show.
-
-    Checks for a REAL outcome first (outcome_scoring.resolve_rl_signal_real_outcome): if
-    target or stop was already genuinely touched by the real candles that arrived since this
-    signal fired -- entirely possible between one /rl/signal call and the next, especially
-    when called back-to-back -- that real hit/miss/expired gets recorded instead. Only when
-    price genuinely hasn't decided it yet does this fall back to "superseded" -- the agent
-    changing its mind is only a reason to close out a trade that's still genuinely open, not
-    a license to overwrite a real result with a non-outcome.
-    """
-    real_outcome, _ = await resolve_rl_signal_real_outcome(pending)
-    if real_outcome is not None:
-        await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": real_outcome})
-        return
-
-    pct_move = ((current_price - pending["entry_price"]) / pending["entry_price"]) * 100
-    if pending["direction"] == "SELL":
-        pct_move = -pct_move
-    pct_move -= spread_cost_pct(pending["pair"], pending["entry_price"])
-    await rl_signals_collection.update_one(
-        {"_id": pending["_id"]},
-        {"$set": {
-            "status": "superseded",
-            "outcome_price": round(current_price, 5),
-            "outcome_timestamp": datetime.utcnow(),
-            "outcome_pct_move": round(pct_move, 5),
-            "candles_to_outcome": None,  # superseded, not resolved by walking forward N candles
-        }},
-    )
-
-
 @app.post("/rl/signal/{interval}")
 async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_STARTING_BALANCE):
     """
@@ -1208,21 +1160,36 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     point is making "have we been here before" inspectable, not silently overriding the
     policy's decision with a separate heuristic.
 
-    If a different decision now disagrees with whatever RL signal is still "pending" for this
-    pair/interval (new direction, new action is HOLD, or price has moved enough that the
-    entry itself changed), that old pending signal is marked "superseded" immediately (see
-    _supersede_pending_rl_signal) instead of being left to resolve on its own hours later --
-    "pending" should mean "still the agent's current live view," not "might still resolve
-    eventually." An exact repeat of the still-pending signal (same direction/entry/target) is
-    left alone and returned as-is (same de-dupe idea create_consensus_signal already uses,
-    intentionally not re-sizing an already-shown pending signal just because `balance`
-    happened to differ on this call), so re-running this before the underlying candle has
-    advanced doesn't spuriously expire-then-recreate it.
+    Single-position-at-a-time, same discipline train_rl_policy's _take_action_sized already
+    uses during training (it only decides again once a simulated trade has resolved, advancing
+    by candles_to_outcome). If a pending RL signal already exists for this pair/interval, this
+    endpoint does NOT re-decide -- it first checks whether that signal has genuinely resolved
+    against real candles (resolve_rl_signal_real_outcome); if so, that real outcome is recorded
+    and a fresh decision proceeds below as normal, and if not, the still-open pending signal is
+    simply returned as-is, without recomputing state or q_values. This used to instead
+    re-evaluate on every call and mark the old signal "superseded" the moment a new decision
+    disagreed with it (including trivial cases like entry_price ticking a fraction on a moving
+    price) -- that meant live inference was re-deciding far more often than the policy was ever
+    trained to, which is what actually drove the high supersede rate GET /rl/accuracy showed,
+    not policy quality. Waiting for genuine resolution instead keeps live behavior consistent
+    with training and gives every signal a real chance to become a hit/miss/expired data point.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
     if balance <= 0:
         raise HTTPException(status_code=400, detail="balance must be positive.")
+
+    pending = await rl_signals_collection.find_one(
+        {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
+    )
+    if pending is not None:
+        real_outcome, _ = await resolve_rl_signal_real_outcome(pending)
+        if real_outcome is not None:
+            await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": real_outcome})
+        else:
+            # Still genuinely open -- don't re-decide, just hand back the live view as-is.
+            pending["_id"] = str(pending["_id"])
+            return {"signal": pending, "q_values": pending.get("q_values"), "memory": None}
 
     policy_doc = await rl_policies_collection.find_one(
         {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
@@ -1266,11 +1233,8 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     eval_run = await backtest_runs_collection.find_one({"run_id": policy.eval_run_id})
     excluded_return = eval_run.get("total_return_pct") if eval_run else None
     if excluded_return is not None and excluded_return <= STRONG_LOSS_RETURN_PCT:
-        pending = await rl_signals_collection.find_one(
-            {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
-        )
-        if pending is not None:
-            await _supersede_pending_rl_signal(pending, current_price)
+        # No pending signal to retire here -- if one existed, it was already resolved or
+        # returned as still-open above, before this policy was even loaded.
         return {
             "signal": None, "q_values": q_values,
             "excluded_reason": (
@@ -1281,13 +1245,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
             ),
         }
 
-    pending = await rl_signals_collection.find_one(
-        {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
-    )
-
     if action == "HOLD":
-        if pending is not None:
-            await _supersede_pending_rl_signal(pending, current_price)
         return {"signal": None, "q_values": q_values}
 
     direction, tier = action.split("_")
@@ -1330,8 +1288,6 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     # policy, same philosophy as the fixed 1.5:1 target:stop floor.
     gated_tier, memory_override = memory_gate(memory, tier)
     if gated_tier == "HOLD":
-        if pending is not None:
-            await _supersede_pending_rl_signal(pending, current_price)
         return {"signal": None, "q_values": q_values, "memory": memory, "memory_override": memory_override}
     tier = gated_tier
     risk_fraction = RISK_FRACTION_BY_TIER[tier]
@@ -1354,30 +1310,10 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
         position_size_units=round(units, 2), state=state, memory_override=memory_override,
     )
 
-    if (
-        pending is not None
-        and pending["direction"] == rl_signal.direction
-        and pending["entry_price"] == rl_signal.entry_price
-        and pending["target_price"] == rl_signal.target_price
-        and pending["size_tier"] == rl_signal.size_tier
-    ):
-        # Exact repeat of the still-live signal -- nothing has changed, return it as-is.
-        # size_tier is checked alongside direction/entry/target (added the same day as
-        # memory_gate/warm-started retraining) -- without it, a policy whose size preference
-        # changed since this signal was created (e.g. after a warm-started retrain, or
-        # memory_gate's own downgrade decision changing as more cases accumulate) while
-        # direction/entry/target happened to stay identical (same still-open candle) would
-        # silently keep showing the OLD size_tier next to freshly recomputed q_values that no
-        # longer agree with it -- exactly the confusing "SMALL shown, but BUY_LARGE is now the
-        # top q-value" mismatch this was written to prevent.
-        pending["_id"] = str(pending["_id"])
-        return {"signal": pending, "q_values": q_values, "memory": memory}
-
-    if pending is not None:
-        # The agent's view has moved on (different direction or entry) -- the old signal is
-        # no longer what the agent would trade right now.
-        await _supersede_pending_rl_signal(pending, current_price)
-
+    # No de-dupe-against-pending check needed here -- by this point any pending signal for
+    # this pair/interval was either already returned as-is (still open, above) or already
+    # resolved and cleared (the block at the top of this function). There is nothing left to
+    # compare against or supersede.
     await rl_signals_collection.insert_one(rl_signal.model_dump())
     return {"signal": rl_signal, "q_values": q_values, "memory": memory}
 
@@ -1518,6 +1454,63 @@ async def rl_accuracy(pair: str | None = None, interval: str | None = None, limi
             "superseded": round(total_superseded / total_all * 100, 1) if total_all else None,
         },
     }
+
+
+@app.get("/rl/resolution-stats")
+async def rl_resolution_stats(pair: str | None = None):
+    """
+    Diagnostic for the high `expired` fraction GET /rl/accuracy shows: per interval, the
+    candles_to_outcome distribution among signals that genuinely resolved (hit/miss),
+    compared against that interval's own LIVE_MAX_LOOKFORWARD_BY_INTERVAL window ceiling
+    (outcome_scoring.py).
+
+    Answers "is expired a window problem or an ATR-band problem":
+    - Resolved trades clustering near the window ceiling (median/p90 close to it) -> the
+      window itself is the binding constraint, widen LIVE_MAX_LOOKFORWARD_BY_INTERVAL.
+    - Resolved trades resolving well under the ceiling, but expired_fraction_pct still high
+      -> price is chopping inside a target/stop band it never reaches within the window --
+      RL_ATR_MULTS_BY_PROFILE's multiples are the actual lever, not the window.
+
+    Best read after create_rl_signal's supersede-churn fix has had a day or so of live cron
+    cycles to build up genuinely-resolved (not superseded) history -- older history is
+    dominated by supersede noise and won't give a clean answer.
+
+    source="live" only, same scope as GET /rl/accuracy.
+    """
+    def _pctile(sorted_vals: list[int], p: float) -> Optional[int]:
+        if not sorted_vals:
+            return None
+        idx = min(len(sorted_vals) - 1, int(round(p * (len(sorted_vals) - 1))))
+        return sorted_vals[idx]
+
+    by_interval: dict[str, dict] = {}
+    for interval, window in LIVE_MAX_LOOKFORWARD_BY_INTERVAL.items():
+        base_query: dict = {"source": "live", "interval": interval}
+        if pair:
+            base_query["pair"] = pair
+
+        resolved_docs = await rl_signals_collection.find(
+            {**base_query, "status": {"$in": ["hit", "miss"]}}, {"candles_to_outcome": 1},
+        ).to_list(length=None)
+        values = sorted(d["candles_to_outcome"] for d in resolved_docs if d.get("candles_to_outcome") is not None)
+
+        expired_count = await rl_signals_collection.count_documents({**base_query, "status": "expired"})
+        resolved_count = len(values)
+        total = resolved_count + expired_count
+
+        by_interval[interval] = {
+            "window_candles": window,
+            "resolved_hit_miss": resolved_count,
+            "expired": expired_count,
+            "expired_fraction_pct": round(expired_count / total * 100, 1) if total else None,
+            "candles_to_outcome": {
+                "min": values[0] if values else None,
+                "median": _pctile(values, 0.5),
+                "p90": _pctile(values, 0.9),
+                "max": values[-1] if values else None,
+            },
+        }
+    return {"pair": pair, "by_interval": by_interval}
 
 
 @app.get("/rl/learning-curve")
