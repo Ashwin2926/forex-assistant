@@ -4,6 +4,44 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-01
+
+**Fixed the real driver of the RL supersede/expired mess, then ran a per-interval ATR sweep
+that surfaced a training-determinism gap.**
+
+Investigated why `GET /rl/accuracy` showed only ~13% of RL signals ever reaching a clean
+hit/miss (57.7% expired, 29.3% superseded):
+
+- **Supersede churn was a live-inference bug, not a policy-quality problem.**
+  `create_rl_signal` recomputed `entry_price` from the current live price on every cron call
+  and required an exact match against the pending signal to avoid retiring it — since price
+  ticks constantly, that match almost never held, so nearly every call superseded the still-
+  open signal and inserted a new one, even when direction hadn't changed. This directly
+  violated the single-position-at-a-time discipline the policy was actually *trained* under
+  (`_take_action_sized` only decides again once a trade resolves). Fixed: the endpoint now
+  waits for a pending signal to genuinely resolve (`resolve_rl_signal_real_outcome`) before
+  making a new decision. `_supersede_pending_rl_signal` became dead code and was removed.
+- Added `GET /rl/resolution-stats` (candles-to-outcome distribution vs. each interval's
+  `LIVE_MAX_LOOKFORWARD_BY_INTERVAL` ceiling) to check whether the separate high-expired rate
+  was a window problem or an ATR-band problem before touching either.
+- **ATR multiplier sweep** (5 intervals x 4 pairs x 5 target:stop grid points, `persist=false`
+  so live policies stayed untouched): found the effect is genuinely pair/interval-specific,
+  not a uniform "widen everything." 4h showed a real, reproducible improvement for AUD/USD
+  and EUR/USD; 1day showed the opposite for EUR/USD and GBP/USD (this project's two strongest
+  policies — widening made both worse). `RL_ATR_MULTS_BY_PROFILE` (2 buckets) became
+  `RL_ATR_MULTS_BY_INTERVAL` (5 buckets), only 4h's value actually changed (target=3.75,
+  stop=2.5).
+- **Discovered `LinearQPolicy.epsilon_greedy` has no seeded RNG anywhere in `rl_engine.py`** —
+  identical data and identical ATR values can converge to meaningfully different policies
+  purely from exploration-path luck. Caught this because GBP/USD 4h's real persisted retrain
+  (-39%) contradicted the sweep's single reading for that exact config (+59%). Replaying it
+  5x at the new value and 3x at the old value showed both clustering around a similarly bad
+  ~-40% — no stable edge either way for that combo. Added `RL_ATR_MULT_PAIR_OVERRIDES` to
+  keep GBP/USD 4h at the original 1.5/1.0 rather than forcing it onto a default that didn't
+  actually help. Net result: critical "losing edge" findings in `GET /rl/insights` dropped
+  from 12 to 9, with none of the 5 already-strong policies (EUR/USD 1day/5min, GBP/USD
+  1day/5min, USD/JPY 1h) touched.
+
 ## 2026-08-27 (cont.)
 
 **Bug: every live `/rl/signal` call where the policy actually chose to trade was 500ing.**
