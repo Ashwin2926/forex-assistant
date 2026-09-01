@@ -15,7 +15,7 @@ DEFAULT_MAX_LOOKFORWARD = 20
 # different real-world duration at 5min vs 1day (20 candles is ~100min at 5min but ~20 days
 # at 1day). Starting guesses, not independently validated against live outcomes yet -- same
 # caveat as every other unvalidated constant in this project (PROXIMITY_ATR_MULT,
-# RL_ATR_MULTS_BY_PROFILE, etc.); revisit once enough live resolutions at these windows exist
+# RL_ATR_MULTS_BY_INTERVAL, etc.); revisit once enough live resolutions at these windows exist
 # to check hit/miss/expired mix against.
 LIVE_MAX_LOOKFORWARD_BY_INTERVAL: dict[str, int] = {
     "5min": 200,   # ~16.7 hours

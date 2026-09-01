@@ -904,7 +904,7 @@ async def _run_rl_training(
     if not persist:
         # Dry run -- e.g. sweeping target_atr_mult_override/stop_atr_mult_override candidates.
         # Must NOT touch rl_policies_collection: create_rl_signal always loads the most
-        # recently persisted policy and combines its weights with rl_atr_mults(profile) (the
+        # recently persisted policy and combines its weights with rl_atr_mults(interval) (the
         # STORED default) at inference time, with no memory of what override a training run
         # used. Persisting a policy trained under a different target/stop than what live
         # inference will actually size trades with would leave the live system silently
@@ -954,17 +954,17 @@ async def train_rl(
     start -- see train_rl_policy's docstring) rather than retraining from zero weights every
     call, so repeated training actually builds on prior runs instead of just re-fitting the
     same growing candle history from scratch each time. Pass reset=true to force a fresh
-    zero-initialized run instead (e.g. after deliberately changing RL_ATR_MULTS_BY_PROFILE or
+    zero-initialized run instead (e.g. after deliberately changing RL_ATR_MULTS_BY_INTERVAL or
     another training-behavior constant, where continuing from the old policy's weights isn't
     desired even though the feature schema itself hasn't changed).
 
-    target_atr_mult/stop_atr_mult: override this profile's RL_ATR_MULTS_BY_PROFILE entry for
+    target_atr_mult/stop_atr_mult: override this interval's RL_ATR_MULTS_BY_INTERVAL entry for
     THIS call only -- for sweeping candidate values without a code change + redeploy per
     candidate. Must pass persist=false alongside these (or leave persist at its default and
     accept the training-behavior mismatch described in _run_rl_training's own docstring is
     NOT what you want here) -- a policy trained under an override, if persisted, would become
     the live policy for this pair/interval while live inference still sizes trades from the
-    profile's STORED default, not whatever override this call used.
+    interval's STORED default, not whatever override this call used.
     """
     try:
         policy, eval_run = await _run_rl_training(
@@ -1295,7 +1295,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     latest = df.iloc[-1]
     entry_price = current_price
     atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
-    target_atr_mult, stop_atr_mult = rl_atr_mults(rl_config_profile(interval))
+    target_atr_mult, stop_atr_mult = rl_atr_mults(interval)
     target_price, stop_price = compute_atr_target_stop(
         entry_price, atr_val, direction, target_atr_mult, stop_atr_mult,
     )
@@ -1469,7 +1469,7 @@ async def rl_resolution_stats(pair: str | None = None):
       window itself is the binding constraint, widen LIVE_MAX_LOOKFORWARD_BY_INTERVAL.
     - Resolved trades resolving well under the ceiling, but expired_fraction_pct still high
       -> price is chopping inside a target/stop band it never reaches within the window --
-      RL_ATR_MULTS_BY_PROFILE's multiples are the actual lever, not the window.
+      RL_ATR_MULTS_BY_INTERVAL's multiples are the actual lever, not the window.
 
     Best read after create_rl_signal's supersede-churn fix has had a day or so of live cron
     cycles to build up genuinely-resolved (not superseded) history -- older history is

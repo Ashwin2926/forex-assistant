@@ -68,25 +68,40 @@ RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
 # Sizing (RISK_FRACTION_BY_TIER) is additive on top of this -- it changes how much capital is
 # committed to the trade, never this ratio.
 #
-# Per-profile, not one global pair -- every 5min/15min policy trained against the fixed
-# 1.5/1.0 has come back negative-expectancy on every pair (see GET /rl/policies), and this
-# was never independently swept for intraday the way swing's rule-based target/stop was
-# (signal_engine.PROFILE_DEFAULTS). Both profiles start at the same 1.5/1.0 values below --
-# this is a structural change (makes per-profile tuning possible), not a claim that intraday
-# needs different numbers yet. Any future intraday-specific value must keep the same >=1.5:1
-# target:stop ratio the comment above requires -- e.g. halving both to 1.0/0.667 preserves
-# the ratio while changing how much price movement is needed to resolve within
-# max_lookforward candles; changing the ratio itself would reopen the "risks more than it
-# targets" problem this constant was written to prevent.
-RL_ATR_MULTS_BY_PROFILE: dict[str, tuple[float, float]] = {
-    "swing": (1.5, 1.0),
-    "intraday": (1.5, 1.0),
+# Per-interval (not per-profile) since a walk-forward-style sweep (5 intervals x 4 pairs x 5
+# target:stop grid points, each preserving the >=1.5:1 ratio, persist=false so live policies
+# were untouched) showed the right value genuinely differs by holding period, and picking one
+# shared number per profile was masking that. Findings from that sweep, kept here since they're
+# the reason only 4h differs from the original flat 1.5/1.0 default:
+#   - 4h: widening consistently and often monotonically improved 3 of 4 pairs (GBP/USD
+#     -12%->+59%, EUR/USD -85%->+10%, AUD/USD -71%->+26% as stop widened toward 2.5-3.0) --
+#     genuine, stable, cross-pair signal. USD/JPY 4h prefers staying tight, but 3-of-4 agreeing
+#     outweighs the one holdout.
+#   - 1day: the OPPOSITE finding for EUR/USD and GBP/USD (this project's two strongest
+#     policies, +224%/+307% at the tight setting) -- widening made both monotonically WORSE
+#     (down to -7%/-1% by 3.75). AUD/USD and USD/JPY (1day's weak pairs) showed mild,
+#     inconsistent improvement -- nowhere near enough to justify hurting the two pairs that
+#     already work. Left unchanged.
+#   - 5min/15min/1h: no stable, cross-pair plateau at any grid point -- results were noisy,
+#     single-point spikes rather than neighboring-value agreement (the walk-forward
+#     methodology's own warning sign for curve-fitting rather than real edge). EUR/USD 5min
+#     (this project's other flagship performer) also preferred staying tight. Left unchanged.
+# Any future change here must keep the same >=1.5:1 target:stop ratio the comment above
+# requires -- e.g. halving both to 1.0/0.667 preserves the ratio while changing how much price
+# movement is needed to resolve within max_lookforward candles; changing the ratio itself would
+# reopen the "risks more than it targets" problem this constant was written to prevent.
+RL_ATR_MULTS_BY_INTERVAL: dict[str, tuple[float, float]] = {
+    "5min": (1.5, 1.0),
+    "15min": (1.5, 1.0),
+    "1h": (1.5, 1.0),
+    "4h": (3.75, 2.5),
+    "1day": (1.5, 1.0),
 }
 
 
-def rl_atr_mults(profile: str) -> tuple[float, float]:
-    """(target_atr_mult, stop_atr_mult) for this RL profile -- see RL_ATR_MULTS_BY_PROFILE."""
-    return RL_ATR_MULTS_BY_PROFILE[profile]
+def rl_atr_mults(interval: str) -> tuple[float, float]:
+    """(target_atr_mult, stop_atr_mult) for this interval -- see RL_ATR_MULTS_BY_INTERVAL."""
+    return RL_ATR_MULTS_BY_INTERVAL[interval]
 
 
 # How many rows of tail context each bar's strategy evaluation gets -- comfortably covers
@@ -138,7 +153,7 @@ MIN_WARMUP_BARS = 30  # covers find_swing_levels/stochastic/ADX's own warmup nee
 # solved exactly this mismatch for the regular signal engine (intraday: EMA 9/21 + session
 # filter, cross-pair backtest-validated, see signal_engine.PROFILE_DEFAULTS), RL just never
 # adopted it. Same interval grouping the cron already uses for the regular engine/consensus.
-# target/stop are separately profile-aware via RL_ATR_MULTS_BY_PROFILE/rl_atr_mults above --
+# target/stop are separately interval-aware via RL_ATR_MULTS_BY_INTERVAL/rl_atr_mults above --
 # this constant only decides which EMA/RSI/MACD periods and session gating the 7 strategies
 # compute their votes with.
 INTRADAY_INTERVALS = {"5min", "15min"}
@@ -410,9 +425,9 @@ def train_rl_policy(
     there's no rule-by-rule breakdown for a learned policy the way there is for the rule
     engine.
 
-    target_atr_mult_override/stop_atr_mult_override: for sweeping candidate values against a
-    profile (see RL_ATR_MULTS_BY_PROFILE's own comment) without needing a code change +
-    redeploy per candidate. Omit both to use the profile's own RL_ATR_MULTS_BY_PROFILE entry
+    target_atr_mult_override/stop_atr_mult_override: for sweeping candidate values against an
+    interval (see RL_ATR_MULTS_BY_INTERVAL's own comment) without needing a code change +
+    redeploy per candidate. Omit both to use the interval's own RL_ATR_MULTS_BY_INTERVAL entry
     as before; the caller is responsible for keeping the >=1.5:1 target:stop ratio that
     constant's comment requires if it overrides these -- this function doesn't enforce it,
     the same way it doesn't validate any other RuleConfig-driven parameter.
@@ -425,7 +440,7 @@ def train_rl_policy(
     if target_atr_mult_override is not None and stop_atr_mult_override is not None:
         target_atr_mult, stop_atr_mult = target_atr_mult_override, stop_atr_mult_override
     else:
-        target_atr_mult, stop_atr_mult = rl_atr_mults(rl_config_profile(interval))
+        target_atr_mult, stop_atr_mult = rl_atr_mults(interval)
 
     df = df.reset_index(drop=True)
     indicator_df = add_all_indicators(df, config)
