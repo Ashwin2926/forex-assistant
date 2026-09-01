@@ -71,25 +71,43 @@ RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
 # Per-interval (not per-profile) since a walk-forward-style sweep (5 intervals x 4 pairs x 5
 # target:stop grid points, each preserving the >=1.5:1 ratio, persist=false so live policies
 # were untouched) showed the right value genuinely differs by holding period, and picking one
-# shared number per profile was masking that. Findings from that sweep, kept here since they're
-# the reason only 4h differs from the original flat 1.5/1.0 default:
-#   - 4h: widening consistently and often monotonically improved 3 of 4 pairs (GBP/USD
-#     -12%->+59%, EUR/USD -85%->+10%, AUD/USD -71%->+26% as stop widened toward 2.5-3.0) --
-#     genuine, stable, cross-pair signal. USD/JPY 4h prefers staying tight, but 3-of-4 agreeing
-#     outweighs the one holdout.
-#   - 1day: the OPPOSITE finding for EUR/USD and GBP/USD (this project's two strongest
-#     policies, +224%/+307% at the tight setting) -- widening made both monotonically WORSE
-#     (down to -7%/-1% by 3.75). AUD/USD and USD/JPY (1day's weak pairs) showed mild,
-#     inconsistent improvement -- nowhere near enough to justify hurting the two pairs that
-#     already work. Left unchanged.
-#   - 5min/15min/1h: no stable, cross-pair plateau at any grid point -- results were noisy,
-#     single-point spikes rather than neighboring-value agreement (the walk-forward
-#     methodology's own warning sign for curve-fitting rather than real edge). EUR/USD 5min
-#     (this project's other flagship performer) also preferred staying tight. Left unchanged.
+# shared number per profile was masking that.
+#
+# IMPORTANT CAVEAT discovered while acting on that sweep: LinearQPolicy.epsilon_greedy draws
+# from Python's global `random` with no seed anywhere in this module, so two training runs
+# with IDENTICAL data and IDENTICAL target/stop values can converge to meaningfully different
+# policies purely from exploration-path luck -- the sweep only ran each grid point once, so
+# some of what looked like a real per-value effect was actually just run-to-run noise. Confirmed
+# by replaying GBP/USD 4h five times at target=3.75/stop=2.5 (sweep's single reading: +59%;
+# four replays: -27% to -48%) and twice more at the original 1.5/1.0 (sweep's single reading:
+# -12%; two replays: -44%, -62%) -- both settings cluster around a similarly bad ~-40%, meaning
+# GBP/USD 4h just doesn't have a stable edge either way with this training method, not that one
+# ATR value beats the other. Findings that DID hold up (checked against the real, persisted
+# retrain, not just the single-run sweep) are the reason 4h differs from the flat 1.5/1.0
+# default below:
+#   - AUD/USD 4h: -71% (old live baseline) -> +20% (real retrain) -- genuine, large
+#     improvement, consistent in direction with the sweep's prediction.
+#   - EUR/USD 4h: -34% (old live baseline) -> -29% (real retrain) -- smaller than the sweep
+#     predicted, but a real, directionally-consistent improvement over both the old live
+#     baseline and a matched fresh 1.5/1.0 run (-85%).
+#   - USD/JPY 4h: worse under the wider band in both the sweep and the real retrain --
+#     correctly identified as this interval's holdout, left out of the widen.
+#   - GBP/USD 4h: no stable edge under either setting (see caveat above) -- kept at the
+#     original 1.5/1.0 via RL_ATR_MULT_PAIR_OVERRIDES rather than folded into the 4h default.
+#   - 1day: EUR/USD and GBP/USD (this project's two strongest policies, +224%/+307% at the
+#     tight setting) got monotonically WORSE as the stop widened in the sweep. AUD/USD and
+#     USD/JPY (1day's weak pairs) showed mild, inconsistent improvement -- not enough to
+#     justify hurting the two pairs that already work. Left unchanged.
+#   - 5min/15min/1h: no stable, cross-pair plateau at any grid point in the sweep -- noisy,
+#     single-point spikes rather than neighboring-value agreement, and after the variance
+#     discovery above, single-run sweep spikes specifically aren't trustworthy evidence of a
+#     real effect. Left unchanged.
 # Any future change here must keep the same >=1.5:1 target:stop ratio the comment above
 # requires -- e.g. halving both to 1.0/0.667 preserves the ratio while changing how much price
 # movement is needed to resolve within max_lookforward candles; changing the ratio itself would
-# reopen the "risks more than it targets" problem this constant was written to prevent.
+# reopen the "risks more than it targets" problem this constant was written to prevent. Given
+# the training-variance caveat above, any future retune should replay each candidate a few
+# times before trusting a single-run reading, not just take the first result at face value.
 RL_ATR_MULTS_BY_INTERVAL: dict[str, tuple[float, float]] = {
     "5min": (1.5, 1.0),
     "15min": (1.5, 1.0),
@@ -98,9 +116,23 @@ RL_ATR_MULTS_BY_INTERVAL: dict[str, tuple[float, float]] = {
     "1day": (1.5, 1.0),
 }
 
+# Pair-specific exceptions to the interval default above -- GBP/USD 4h specifically, since it
+# showed no stable edge under either 1.5/1.0 or 4h's new 3.75/2.5 (see the caveat above), kept
+# at the original value it was already using rather than forced onto a default that didn't
+# actually help it.
+RL_ATR_MULT_PAIR_OVERRIDES: dict[tuple[str, str], tuple[float, float]] = {
+    ("4h", "GBP/USD"): (1.5, 1.0),
+}
 
-def rl_atr_mults(interval: str) -> tuple[float, float]:
-    """(target_atr_mult, stop_atr_mult) for this interval -- see RL_ATR_MULTS_BY_INTERVAL."""
+
+def rl_atr_mults(interval: str, pair: str) -> tuple[float, float]:
+    """
+    (target_atr_mult, stop_atr_mult) for this interval/pair -- see RL_ATR_MULTS_BY_INTERVAL,
+    and RL_ATR_MULT_PAIR_OVERRIDES for the handful of pair-specific exceptions to it.
+    """
+    override = RL_ATR_MULT_PAIR_OVERRIDES.get((interval, pair))
+    if override is not None:
+        return override
     return RL_ATR_MULTS_BY_INTERVAL[interval]
 
 
@@ -440,7 +472,7 @@ def train_rl_policy(
     if target_atr_mult_override is not None and stop_atr_mult_override is not None:
         target_atr_mult, stop_atr_mult = target_atr_mult_override, stop_atr_mult_override
     else:
-        target_atr_mult, stop_atr_mult = rl_atr_mults(interval)
+        target_atr_mult, stop_atr_mult = rl_atr_mults(interval, pair)
 
     df = df.reset_index(drop=True)
     indicator_df = add_all_indicators(df, config)

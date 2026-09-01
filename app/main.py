@@ -904,7 +904,7 @@ async def _run_rl_training(
     if not persist:
         # Dry run -- e.g. sweeping target_atr_mult_override/stop_atr_mult_override candidates.
         # Must NOT touch rl_policies_collection: create_rl_signal always loads the most
-        # recently persisted policy and combines its weights with rl_atr_mults(interval) (the
+        # recently persisted policy and combines its weights with rl_atr_mults(interval, pair) (the
         # STORED default) at inference time, with no memory of what override a training run
         # used. Persisting a policy trained under a different target/stop than what live
         # inference will actually size trades with would leave the live system silently
@@ -1295,7 +1295,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     latest = df.iloc[-1]
     entry_price = current_price
     atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
-    target_atr_mult, stop_atr_mult = rl_atr_mults(interval)
+    target_atr_mult, stop_atr_mult = rl_atr_mults(interval, pair)
     target_price, stop_price = compute_atr_target_stop(
         entry_price, atr_val, direction, target_atr_mult, stop_atr_mult,
     )
