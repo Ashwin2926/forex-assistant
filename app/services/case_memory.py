@@ -13,9 +13,10 @@ vector it was decided from (see main.py's create_rl_signal). Once that signal re
 outcome) pair this module can compare a brand new state against.
 
 Deliberately NOT a similarity search library (no faiss/annoy/sklearn KDTree dependency) --
-the candidate pool for one pair/interval is at most a few hundred to a few thousand resolved
-signals, small enough that a plain O(n) distance scan is instant and keeps this dependency-
-free and easy to read line by line.
+even pooled across every pair/interval (see main.py's create_rl_signal, which queries all
+resolved RLSignals matching direction rather than scoping to one pair/interval), the candidate
+pool is at most a few thousand resolved signals, small enough that a plain O(n) distance scan
+is instant and keeps this dependency-free and easy to read line by line.
 """
 import math
 from typing import Optional

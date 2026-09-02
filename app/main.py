@@ -1251,15 +1251,24 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     direction, tier = action.split("_")
 
     # "Have we seen a state like this before, and how did it actually turn out" -- see
-    # case_memory.py. Filtered to the SAME direction the policy just chose (not the whole
-    # pair/interval): the question memory needs to answer is specifically "how have BUY (or
-    # SELL) decisions that looked like this one actually gone," not a blend of both directions.
+    # case_memory.py. Pooled across EVERY pair/interval, not just this one, the same way ML's
+    # classifier pools across all pairs/profiles into one shared model instead of siloing each
+    # one into its own small sample -- state features are already scale-comparable by
+    # construction (votes in [-1,1], raw_* features normalized similarly, see
+    # rl_engine.RL_MARKET_FEATURE_NAMES's own comment) specifically so a state from one
+    # pair/interval means roughly the same thing as a state from another, making this pooling
+    # sound rather than apples-to-oranges. Each of the 20 pair/interval policies is otherwise
+    # starved for its own history; this is the one place a thin policy gets to borrow from
+    # what every OTHER pair/interval has collectively learned about similar-looking setups.
+    # Still filtered to the SAME direction the policy just chose (not both directions blended)
+    # -- the question memory needs to answer is specifically "how have BUY (or SELL) decisions
+    # that looked like this one actually gone," regardless of which pair/interval they fired on.
     # Computed against every resolved (never superseded) past RLSignal with a stored state
-    # vector; empty/none for a brand new pair/interval or one whose history predates the state
+    # vector; empty/none for a brand new state shape or one whose history predates the state
     # field, same "surface as absent, not a fabricated number" convention as ml_model's
     # None-when-not-enough-data.
     memory_candidates = await rl_signals_collection.find({
-        "pair": pair, "interval": interval, "direction": direction,
+        "direction": direction,
         "status": {"$in": list(RESOLVED_STATUSES)},
     }).to_list(length=None)
     memory = memory_summary(state, memory_candidates)
