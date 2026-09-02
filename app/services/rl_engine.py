@@ -329,6 +329,17 @@ def compute_ml_scores(
     placeholder for every bar -- every other state feature is always a real number, and 0.5
     is the honest "no information" value for a probability, not a fabricated confident one.
 
+    Bars before max(config.ema_slow, MIN_WARMUP_BARS)'s warmup threshold also get the neutral
+    placeholder rather than a real apply_rules call: unlike compute_strategy_vote_states'
+    STRATEGIES (which guard their own NaN indicator reads, see e.g. atr_pct's `if pd.notna`
+    checks there), apply_rules was only ever written to run on an already-warmed-up bar --
+    every existing caller (generate_signal, live inference) checks a warmup floor first. Bars
+    this early have NaN EMA/RSI/ADX/etc. values, which would otherwise flow through as NaN
+    features straight into LogisticRegression.predict_proba and crash it (scikit-learn doesn't
+    accept NaN input). train_rl_policy's own episode/eval loops never visit these bars as
+    decision points anyway (they start from that same min_warmup), so this isn't losing any
+    real information -- these bars were always going to be placeholder-only.
+
     Computed once per training run and reused across every episode -- deterministic given a
     bar's window and the frozen model, same "compute once, don't redo per episode" discipline
     as compute_strategy_vote_states. `model` is a snapshot fit by the caller (train_rl_policy)
@@ -339,11 +350,12 @@ def compute_ml_scores(
     if model is None:
         return [(0.5, 0.5)] * n
 
+    min_warmup = max(config.ema_slow, MIN_WARMUP_BARS)
     scores: list[tuple[float, float]] = []
     for i in range(n):
-        if i < 1:
-            # No prev row yet -- same warmup-row treatment compute_strategy_vote_states gives
-            # its own row 0 (most rules need a prev bar for a cross/comparison check).
+        if i < max(1, min_warmup):
+            # No prev row yet, or indicators not warmed up -- see this function's own
+            # docstring for why both cases get the same neutral placeholder.
             scores.append((0.5, 0.5))
             continue
         latest = indicator_df.iloc[i]
