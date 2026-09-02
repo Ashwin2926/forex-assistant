@@ -102,13 +102,18 @@ def train_hit_classifier(signals: list[dict], train_frac: float = 0.7) -> MLTrai
     )
 
 
-def predict_hit_probability(resolved_signals: list[dict], new_features: dict[str, float]) -> Optional[float]:
+def fit_hit_classifier(resolved_signals: list[dict]) -> Optional[LogisticRegression]:
     """
-    Trains fresh on every resolved signal, no train/test split -- unlike train_hit_classifier
-    (whose entire job is honestly reporting out-of-sample accuracy), this is a best-effort
-    probability for one new, real signal, so using all available data matters more than
-    holding out a test set. Returns None when there isn't enough data to bother -- surfaced
-    to the caller as "not enough data yet," not a fabricated number.
+    Fits on ALL given signals, no train/test split -- unlike train_hit_classifier (whose
+    entire job is honestly reporting out-of-sample accuracy), a caller wanting a fitted model
+    to score new signals against wants all available data used, not a held-out test set.
+    Returns None below the same MIN_TRAIN_SIGNALS+MIN_TEST_SIGNALS floor train_hit_classifier
+    uses -- "not enough data yet" surfaced as an absent model, not a model fit on noise.
+
+    Factored out of predict_hit_probability (which now just calls this once and predicts)
+    so a caller that needs to score MANY inputs against the same fit -- e.g. rl_engine.py's
+    compute_ml_scores, scoring every bar of a training walk -- can fit once and reuse the
+    model, instead of paying LogisticRegression.fit's cost again per input.
     """
     if len(resolved_signals) < MIN_TRAIN_SIGNALS + MIN_TEST_SIGNALS:
         return None
@@ -119,6 +124,18 @@ def predict_hit_probability(resolved_signals: list[dict], new_features: dict[str
     # otherwise dominate the loss and bias predict_proba toward it regardless of features.
     model = LogisticRegression(max_iter=1000, class_weight="balanced")
     model.fit(X, y)
+    return model
+
+
+def predict_hit_probability(resolved_signals: list[dict], new_features: dict[str, float]) -> Optional[float]:
+    """
+    Best-effort probability for one new, real signal -- see fit_hit_classifier's docstring for
+    why this doesn't hold out a test set. Returns None when there isn't enough data to bother
+    -- surfaced to the caller as "not enough data yet," not a fabricated number.
+    """
+    model = fit_hit_classifier(resolved_signals)
+    if model is None:
+        return None
 
     new_X = [[new_features[name] for name in FEATURE_NAMES]]
     probability_of_hit = model.predict_proba(new_X)[0][1]

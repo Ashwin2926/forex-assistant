@@ -28,11 +28,11 @@ from app.models.schemas import (
 )
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
-from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for
+from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, apply_rules
 from app.services.backtester import run_backtest, run_consensus_backtest
 from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus
-from app.services.ml_features import extract_features
+from app.services.ml_features import extract_features, signal_like_features
 from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.rl_engine import (
     train_rl_policy, choose_action, compute_strategy_vote_states, rl_config_profile, full_rl_state,
@@ -837,14 +837,44 @@ async def predict_signal(interval: str, profile: str, pair: str):
     return response
 
 
-def _rl_state_from_candles(docs: list[dict], config: RuleConfig) -> tuple[list[float], pd.DataFrame]:
-    """Shared by /rl/train and /rl/signal -- builds the indicator dataframe and the current
-    (latest-bar) state vector the same way compute_strategy_vote_states does internally,
-    without recomputing every prior bar's state just to read the last one."""
+def _rl_state_from_candles(
+    docs: list[dict], config: RuleConfig, pair: str, interval: str, profile: str, resolved_signals: list[dict],
+) -> tuple[list[float], pd.DataFrame]:
+    """
+    Builds the indicator dataframe and the current (latest-bar) market state vector the same
+    way compute_strategy_vote_states does internally, without recomputing every prior bar's
+    state just to read the last one -- then appends the two live ml_hit_probability_buy/sell
+    features (see rl_engine.RL_MARKET_FEATURE_NAMES) so the returned vector is ready to pass
+    straight into full_rl_state, same shape train_rl_policy's market_states entries have.
+
+    Unlike train_rl_policy's frozen-snapshot fit (see that function's ml_reference_signals
+    docstring), this is genuinely live -- fits on every currently-resolved signal fresh, no
+    lookahead concern, exactly what GET /ml/predict already does for the same reason.
+    resolved_signals is fetched by the caller (async) rather than here, since this function is
+    plain sync.
+    """
     df = pd.DataFrame(docs)
     indicator_df = add_all_indicators(df, config)
     states = compute_strategy_vote_states(indicator_df, config)
-    return states[-1], df
+
+    latest = indicator_df.iloc[-1]
+    prev = indicator_df.iloc[-2]
+    reasons, _bullish_votes, _bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(
+        latest, prev, config,
+    )
+    buy_features = signal_like_features(
+        reasons, rule_votes, rule_strengths, total_rules, profile, "BUY", pair, interval,
+    )
+    sell_features = signal_like_features(
+        reasons, rule_votes, rule_strengths, total_rules, profile, "SELL", pair, interval,
+    )
+    buy_score = predict_hit_probability(resolved_signals, buy_features)
+    sell_score = predict_hit_probability(resolved_signals, sell_features)
+    market_state = states[-1] + [
+        buy_score if buy_score is not None else 0.5,
+        sell_score if sell_score is not None else 0.5,
+    ]
+    return market_state, df
 
 
 RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
@@ -894,11 +924,22 @@ async def _run_rl_training(
         if prior_doc is not None:
             warm_start = RLPolicy(**{k: v for k, v in prior_doc.items() if k != "_id"})
 
+    # Fetched here (async, before the threadpool call) rather than inside train_rl_policy
+    # itself -- that function is sync/CPU-bound and runs via run_in_threadpool, which can't
+    # make its own motor (async) DB calls. Every currently-resolved rule-based signal, same
+    # query /ml/predict already uses -- train_rl_policy filters this down to only the subset
+    # resolved before ITS OWN train/test split boundary once it knows where that falls (see
+    # its own docstring on ml_reference_signals for why that filtering can't happen here).
+    ml_reference_signals = await signals_collection.find(
+        {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    ).to_list(length=None)
+
     df = pd.DataFrame(docs)
     policy, eval_run, trade_signals = await run_in_threadpool(
         train_rl_policy, df, pair, interval, config, episodes=episodes, train_frac=train_frac,
         max_lookforward=max_lookforward, starting_balance=starting_balance, warm_start=warm_start,
         target_atr_mult_override=target_atr_mult_override, stop_atr_mult_override=stop_atr_mult_override,
+        ml_reference_signals=ml_reference_signals,
     )
 
     if not persist:
@@ -1214,7 +1255,12 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
                     f"Run /ingest/{interval} first."
         )
 
-    market_state, df = _rl_state_from_candles(docs, config)
+    resolved_signals = await signals_collection.find(
+        {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    ).to_list(length=None)
+    market_state, df = _rl_state_from_candles(
+        docs, config, pair, interval, rl_config_profile(interval), resolved_signals,
+    )
     state = full_rl_state(market_state, balance, policy.starting_balance)
     try:
         action, q_values = choose_action(policy, state)

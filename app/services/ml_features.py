@@ -1,3 +1,5 @@
+from app.models.schemas import SignalReason
+
 # Maps each rule name that can appear in a Signal's `reasons` to one canonical feature name.
 # Three different RSI rule names (rsi_oversold/rsi_overbought/rsi_neutral -- only one ever
 # fires per signal, see signal_engine.apply_rules) collapse to the same "rsi" feature, since
@@ -69,3 +71,55 @@ def extract_features(signal: dict) -> dict[str, float]:
         features[interval_feature] = 1.0
 
     return features
+
+
+def direction_confidence(
+    direction: str, gate_ok: bool, rule_votes: dict[str, str], rule_strengths: dict[str, float], total_rules: int,
+) -> float:
+    """
+    Same rule-agreement-strength formula signal_engine.decide() uses for whichever direction
+    the vote count actually won, generalized to a CALLER-CHOSEN direction instead. Needed
+    because rl_engine.compute_ml_scores scores what a BUY *and* a SELL would each look like
+    at every bar (RL hasn't committed to a direction yet when this runs, unlike a real
+    generated Signal which only ever reports confidence for the direction it settled on).
+    Mirrors decide()'s "gate fails -> zero confidence, regardless of direction" rule exactly,
+    and its "confidence" formula (sum of agreeing rules' strengths / total_rules, capped at
+    1.0) for the requested direction specifically rather than whichever direction won the
+    vote count.
+    """
+    if not gate_ok or total_rules == 0:
+        return 0.0
+    agreeing_strength = sum(
+        rule_strengths.get(rule, 1.0) for rule, voted in rule_votes.items() if voted == direction
+    )
+    return round(min(agreeing_strength / total_rules, 1.0) * 100, 1)
+
+
+def signal_like_features(
+    reasons: list[SignalReason], rule_votes: dict[str, str], rule_strengths: dict[str, float], total_rules: int,
+    profile: str, direction: str, pair: str, interval: str,
+) -> dict[str, float]:
+    """
+    Builds the same dict shape extract_features() expects (a stored Signal document), from
+    apply_rules()'s raw return values directly instead of a full persisted Signal -- for
+    callers scoring a hypothetical BUY/SELL at a bar that was never actually turned into a
+    real Signal (see rl_engine.compute_ml_scores: calling signal_engine.generate_signal per
+    training bar would recompute every indicator from scratch on every call, prohibitively
+    expensive inside a loop that already visits hundreds of bars x hundreds of episodes --
+    apply_rules alone is cheap, pure row arithmetic against an already-computed indicator_df).
+
+    direction: "BUY" or "SELL", the hypothetical this call is scoring -- NOT necessarily
+    whatever direction the vote count would have picked (see direction_confidence).
+    """
+    volatility_ok = next((r.passed for r in reasons if r.rule == "volatility_filter"), True)
+    session_ok = next((r.passed for r in reasons if r.rule == "session_filter"), True)
+    confidence = direction_confidence(direction, volatility_ok and session_ok, rule_votes, rule_strengths, total_rules)
+    signal_like = {
+        "reasons": [r.model_dump() for r in reasons],
+        "confidence": confidence,
+        "profile": profile,
+        "direction": direction,
+        "pair": pair,
+        "interval": interval,
+    }
+    return extract_features(signal_like)
