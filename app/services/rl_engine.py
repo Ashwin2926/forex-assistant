@@ -345,19 +345,25 @@ def compute_ml_scores(
     as compute_strategy_vote_states. `model` is a snapshot fit by the caller (train_rl_policy)
     on only signals resolved before this run's own train/test split boundary -- computing that
     boundary is train_rl_policy's job (it already knows split_idx), not this function's.
+
+    predict_proba is called ONCE on a batched matrix of every warmed-up bar's features (twice
+    total -- once for BUY, once for SELL), not once per bar. Calling it n times in a Python
+    loop is what actually caused a live 524 gateway timeout on EUR/USD 5min (thousands of
+    individual tiny sklearn calls, each paying real per-call overhead) even after the NaN
+    crash above was fixed -- apply_rules itself (plain per-row Python arithmetic) stays a
+    per-bar loop since it can't be vectorized the same way, but there's no reason the
+    classifier call has to be.
     """
     n = len(indicator_df)
     if model is None:
         return [(0.5, 0.5)] * n
 
     min_warmup = max(config.ema_slow, MIN_WARMUP_BARS)
-    scores: list[tuple[float, float]] = []
-    for i in range(n):
-        if i < max(1, min_warmup):
-            # No prev row yet, or indicators not warmed up -- see this function's own
-            # docstring for why both cases get the same neutral placeholder.
-            scores.append((0.5, 0.5))
-            continue
+    warm_indices = list(range(max(1, min_warmup), n))
+
+    buy_matrix: list[list[float]] = []
+    sell_matrix: list[list[float]] = []
+    for i in warm_indices:
         latest = indicator_df.iloc[i]
         prev = indicator_df.iloc[i - 1]
         reasons, _bullish_votes, _bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(
@@ -369,11 +375,15 @@ def compute_ml_scores(
         sell_features = signal_like_features(
             reasons, rule_votes, rule_strengths, total_rules, profile, "SELL", pair, interval,
         )
-        buy_x = [[buy_features[name] for name in ML_FEATURE_NAMES]]
-        sell_x = [[sell_features[name] for name in ML_FEATURE_NAMES]]
-        buy_score = float(model.predict_proba(buy_x)[0][1])
-        sell_score = float(model.predict_proba(sell_x)[0][1])
-        scores.append((round(buy_score, 4), round(sell_score, 4)))
+        buy_matrix.append([buy_features[name] for name in ML_FEATURE_NAMES])
+        sell_matrix.append([sell_features[name] for name in ML_FEATURE_NAMES])
+
+    scores: list[tuple[float, float]] = [(0.5, 0.5)] * n
+    if warm_indices:
+        buy_probs = model.predict_proba(buy_matrix)[:, 1]
+        sell_probs = model.predict_proba(sell_matrix)[:, 1]
+        for i, buy_p, sell_p in zip(warm_indices, buy_probs, sell_probs):
+            scores[i] = (round(float(buy_p), 4), round(float(sell_p), 4))
     return scores
 
 
