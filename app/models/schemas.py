@@ -96,6 +96,18 @@ class Signal(BaseModel):
     balance_at_signal: Optional[float] = None
     position_size_units: Optional[float] = None
 
+    # Set by create_signal's ML quality gate (main.py) -- the calibrated hit-probability
+    # (app/services/ml_model.py) for whatever direction the rule engine picked, populated
+    # whenever a directional evaluation happened (BUY/SELL, even one that passed the gate).
+    # None for a signal the rule engine itself decided was HOLD (nothing to score), or one
+    # generated before this field existed.
+    ml_hit_probability: Optional[float] = None
+    # Set only when the gate downgraded a would-be BUY/SELL to HOLD because
+    # ml_hit_probability fell below GOOD_SIGNAL_ML_THRESHOLD -- kept on the record itself
+    # (not just the API response) so a blocked signal is auditable later via GET /signals,
+    # same "inspectable, not silently overriding" precedent as RLSignal.memory_override.
+    ml_override: Optional[str] = None
+
 
 class StrategyCall(BaseModel):
     """

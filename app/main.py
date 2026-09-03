@@ -122,6 +122,18 @@ async def ingest(interval: str, output_size: int = 300):
     return results
 
 
+# "Good ones only" bar for GENERATING a live signal (create_signal, create_rl_signal) --
+# NOT for training, which keeps using everything regardless of quality (that's how the
+# classifier gets calibrated in the first place). Backed by GET /ml/runs' own calibration
+# table: the 60-70% and 70-100% predicted buckets both actually hit ~70% of the time in
+# reality, while everything below 50% hits LESS than half the time -- 60% is the first bucket
+# boundary where "the model says this is good" and "this is actually good" agree. Starting
+# guess at exactly that boundary, not independently swept -- same caveat as every other
+# unvalidated threshold in this project; revisit once enough gated-vs-ungated live outcomes
+# exist to check where the real cutoff should be.
+GOOD_SIGNAL_ML_THRESHOLD = 0.6
+
+
 @app.post("/signals/{interval}/{profile}")
 async def create_signal(
     interval: str, profile: str, pair: str,
@@ -138,6 +150,15 @@ async def create_signal(
     candles against later to resolve the signal's status from "pending" to hit/miss/expired.
     target_atr_mult/stop_atr_mult: explicit override; omit to use that profile's config
     values (RuleConfig.target_atr_mult/stop_atr_mult — see signal_engine.PROFILE_DEFAULTS).
+
+    ML quality gate: a BUY/SELL the rule engine would otherwise fire only actually goes out
+    as one if the ML classifier's calibrated hit-probability for it clears
+    GOOD_SIGNAL_ML_THRESHOLD -- otherwise it's downgraded to HOLD (see Signal.ml_override).
+    Fits fresh on every currently-resolved signal, same as GET /ml/predict -- genuinely live,
+    no lookahead concern to guard against the way rl_engine.py's training-time frozen
+    snapshot does. Fails OPEN (signal passes through ungated) when there isn't enough
+    resolved history yet for predict_hit_probability to return a real number -- "not enough
+    data" isn't evidence of a bad signal, so there's nothing to block on.
     """
     config = default_config_for(profile, pair)
     cursor = candles_collection.find(
@@ -156,6 +177,20 @@ async def create_signal(
 
     df = pd.DataFrame(docs)
     signal = generate_signal(df, pair, interval, profile, config)
+
+    if signal.direction in ("BUY", "SELL"):
+        resolved_signals = await signals_collection.find(
+            {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+        ).to_list(length=None)
+        features = extract_features(signal.model_dump())
+        signal.ml_hit_probability = predict_hit_probability(resolved_signals, features)
+        if signal.ml_hit_probability is not None and signal.ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
+            signal.ml_override = (
+                f"ML rated this {signal.direction} at only {signal.ml_hit_probability * 100:.0f}% hit "
+                f"probability (below the {GOOD_SIGNAL_ML_THRESHOLD * 100:.0f}% bar for a live signal) "
+                f"-- held instead."
+            )
+            signal.direction = "HOLD"
 
     if signal.direction in ("BUY", "SELL"):
         atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
@@ -839,7 +874,7 @@ async def predict_signal(interval: str, profile: str, pair: str):
 
 def _rl_state_from_candles(
     docs: list[dict], config: RuleConfig, pair: str, interval: str, profile: str, resolved_signals: list[dict],
-) -> tuple[list[float], pd.DataFrame]:
+) -> tuple[list[float], pd.DataFrame, Optional[float], Optional[float]]:
     """
     Builds the indicator dataframe and the current (latest-bar) market state vector the same
     way compute_strategy_vote_states does internally, without recomputing every prior bar's
@@ -852,6 +887,11 @@ def _rl_state_from_candles(
     lookahead concern, exactly what GET /ml/predict already does for the same reason.
     resolved_signals is fetched by the caller (async) rather than here, since this function is
     plain sync.
+
+    Also returns the raw (buy_score, sell_score) -- None, not the state vector's 0.5
+    placeholder, when there isn't enough resolved history yet -- so create_rl_signal's own ML
+    quality gate can fail OPEN on "not enough data" the same way create_signal's does, rather
+    than reading a placeholder 0.5 as if it were a real (bad) score.
     """
     df = pd.DataFrame(docs)
     indicator_df = add_all_indicators(df, config)
@@ -874,7 +914,7 @@ def _rl_state_from_candles(
         buy_score if buy_score is not None else 0.5,
         sell_score if sell_score is not None else 0.5,
     ]
-    return market_state, df
+    return market_state, df, buy_score, sell_score
 
 
 RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
@@ -1258,7 +1298,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     resolved_signals = await signals_collection.find(
         {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
     ).to_list(length=None)
-    market_state, df = _rl_state_from_candles(
+    market_state, df, ml_buy_score, ml_sell_score = _rl_state_from_candles(
         docs, config, pair, interval, rl_config_profile(interval), resolved_signals,
     )
     state = full_rl_state(market_state, balance, policy.starting_balance)
@@ -1295,6 +1335,26 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
         return {"signal": None, "q_values": q_values}
 
     direction, tier = action.split("_")
+
+    # ML quality gate: same GOOD_SIGNAL_ML_THRESHOLD bar create_signal applies, using the
+    # ml_hit_probability_buy/sell already computed for this exact bar (see
+    # _rl_state_from_candles) rather than a fresh lookup -- whichever score matches the
+    # direction the policy just chose. None (not enough resolved history yet) fails OPEN,
+    # same reasoning as create_signal's own gate: absence of data isn't evidence of a bad
+    # trade. This sits alongside, not instead of, the live-exclusion gate above (policy-level)
+    # and memory_gate below (case-level) -- three independent, layered checks on top of the
+    # raw Q-policy action, same "guaranteed by construction, not left for the agent alone to
+    # discover" philosophy as the fixed 1.5:1 target:stop floor.
+    ml_score = ml_buy_score if direction == "BUY" else ml_sell_score
+    if ml_score is not None and ml_score < GOOD_SIGNAL_ML_THRESHOLD:
+        return {
+            "signal": None, "q_values": q_values,
+            "ml_blocked_reason": (
+                f"ML rated this {direction} at only {ml_score * 100:.0f}% hit probability "
+                f"(below the {GOOD_SIGNAL_ML_THRESHOLD * 100:.0f}% bar for a live signal) "
+                f"-- held instead."
+            ),
+        }
 
     # "Have we seen a state like this before, and how did it actually turn out" -- see
     # case_memory.py. Pooled across EVERY pair/interval, not just this one, the same way ML's
