@@ -923,7 +923,7 @@ RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 async def _run_rl_training(
     pair: str, interval: str, episodes: int, train_frac: float, max_lookforward: int, starting_balance: float,
     reset: bool = False, target_atr_mult_override: float | None = None, stop_atr_mult_override: float | None = None,
-    persist: bool = True,
+    persist: bool = True, random_seed: int | None = None,
 ):
     """
     Shared by POST /rl/train and the /rl/train-all background job below -- fetches candle
@@ -979,7 +979,7 @@ async def _run_rl_training(
         train_rl_policy, df, pair, interval, config, episodes=episodes, train_frac=train_frac,
         max_lookforward=max_lookforward, starting_balance=starting_balance, warm_start=warm_start,
         target_atr_mult_override=target_atr_mult_override, stop_atr_mult_override=stop_atr_mult_override,
-        ml_reference_signals=ml_reference_signals,
+        ml_reference_signals=ml_reference_signals, random_seed=random_seed,
     )
 
     if not persist:
@@ -1007,6 +1007,7 @@ async def train_rl(
     interval: str, pair: str, episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
     starting_balance: float = DEFAULT_STARTING_BALANCE, reset: bool = False,
     target_atr_mult: float | None = None, stop_atr_mult: float | None = None, persist: bool = True,
+    random_seed: int | None = None,
 ):
     """
     Trains a linear Q-policy (app/services/rl_engine.py) for this pair/interval via
@@ -1046,11 +1047,19 @@ async def train_rl(
     NOT what you want here) -- a policy trained under an override, if persisted, would become
     the live policy for this pair/interval while live inference still sizes trades from the
     interval's STORED default, not whatever override this call used.
+
+    random_seed: omit for normal training (stays genuinely exploratory, what lets a policy
+    keep discovering better weights across many days of warm-started retraining). Pass an
+    explicit int only when comparing two runs against each other and you need to isolate a
+    real parameter effect from plain exploration-path luck -- see train_rl_policy's own
+    docstring for why that distinction matters (confirmed live: GBP/USD 4h's ATR sweep
+    reading looked nothing like its replayed behavior under the same config).
     """
     try:
         policy, eval_run = await _run_rl_training(
             pair, interval, episodes, train_frac, max_lookforward, starting_balance, reset=reset,
             target_atr_mult_override=target_atr_mult, stop_atr_mult_override=stop_atr_mult, persist=persist,
+            random_seed=random_seed,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

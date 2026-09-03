@@ -517,7 +517,7 @@ def train_rl_policy(
     episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
     starting_balance: float = DEFAULT_STARTING_BALANCE, warm_start: Optional[RLPolicy] = None,
     target_atr_mult_override: Optional[float] = None, stop_atr_mult_override: Optional[float] = None,
-    ml_reference_signals: Optional[list[dict]] = None,
+    ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = None,
 ) -> tuple[RLPolicy, BacktestRun, list[Signal]]:
     """
     Trains a LinearQPolicy via epsilon-greedy Q-learning over the train slice (chronological
@@ -570,7 +570,21 @@ def train_rl_policy(
     test-slice metrics never reflect a model that secretly knows about outcomes from its own
     future. None or too few (see ml_model.MIN_TRAIN_SIGNALS/MIN_TEST_SIGNALS) -> every bar
     gets compute_ml_scores' neutral (0.5, 0.5) placeholder instead of a real fit.
+
+    random_seed: OFF by default (None) -- normal training (the daily cron retrain, warm-started
+    Train all/Train a policy) stays genuinely exploratory, which is what lets a policy keep
+    discovering better weights across many days of retraining rather than repeating the same
+    epsilon-greedy path forever. Pass an explicit int when what you actually want is a
+    REPRODUCIBLE run to compare against another reproducible run -- e.g. checking whether a
+    parameter change (ATR mult, episode count) really moved a result or whether it's just
+    exploration-path luck, the exact confound that made GBP/USD 4h's ATR sweep reading
+    (+59%) look nothing like its real, replayed behavior (-27% to -48% across 4 replays,
+    same config). Without a seed, LinearQPolicy.epsilon_greedy's random.random()/
+    random.choice(ACTIONS) draw from Python's shared global RNG state, so identical inputs can
+    still converge to meaningfully different final weights purely by chance.
     """
+    if random_seed is not None:
+        random.seed(random_seed)
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1 (exclusive).")
     if starting_balance <= 0:
