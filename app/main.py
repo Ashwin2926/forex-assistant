@@ -924,6 +924,7 @@ async def _run_rl_training(
     pair: str, interval: str, episodes: int, train_frac: float, max_lookforward: int, starting_balance: float,
     reset: bool = False, target_atr_mult_override: float | None = None, stop_atr_mult_override: float | None = None,
     persist: bool = True, random_seed: int | None = None,
+    learning_rate_override: float | None = None, epsilon_min_override: float | None = None,
 ):
     """
     Shared by POST /rl/train and the /rl/train-all background job below -- fetches candle
@@ -980,6 +981,7 @@ async def _run_rl_training(
         max_lookforward=max_lookforward, starting_balance=starting_balance, warm_start=warm_start,
         target_atr_mult_override=target_atr_mult_override, stop_atr_mult_override=stop_atr_mult_override,
         ml_reference_signals=ml_reference_signals, random_seed=random_seed,
+        learning_rate_override=learning_rate_override, epsilon_min_override=epsilon_min_override,
     )
 
     if not persist:
@@ -1008,6 +1010,7 @@ async def train_rl(
     starting_balance: float = DEFAULT_STARTING_BALANCE, reset: bool = False,
     target_atr_mult: float | None = None, stop_atr_mult: float | None = None, persist: bool = True,
     random_seed: int | None = None,
+    learning_rate: float | None = None, epsilon_min: float | None = None,
 ):
     """
     Trains a linear Q-policy (app/services/rl_engine.py) for this pair/interval via
@@ -1054,12 +1057,19 @@ async def train_rl(
     real parameter effect from plain exploration-path luck -- see train_rl_policy's own
     docstring for why that distinction matters (confirmed live: GBP/USD 4h's ATR sweep
     reading looked nothing like its replayed behavior under the same config).
+
+    learning_rate/epsilon_min: override rl_engine.LEARNING_RATE/EPSILON_MIN for THIS call
+    only -- same sweeping-without-a-redeploy idea as target_atr_mult/stop_atr_mult, for
+    hyperparameters that are equally "starting guesses, never backtested." Unlike the ATR
+    mults, these have no live-inference-time counterpart to stay consistent with, so there's
+    no persist=false requirement -- safe to persist a policy trained under an override.
     """
     try:
         policy, eval_run = await _run_rl_training(
             pair, interval, episodes, train_frac, max_lookforward, starting_balance, reset=reset,
             target_atr_mult_override=target_atr_mult, stop_atr_mult_override=stop_atr_mult, persist=persist,
             random_seed=random_seed,
+            learning_rate_override=learning_rate, epsilon_min_override=epsilon_min,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

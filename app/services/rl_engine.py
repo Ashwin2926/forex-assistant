@@ -518,6 +518,7 @@ def train_rl_policy(
     starting_balance: float = DEFAULT_STARTING_BALANCE, warm_start: Optional[RLPolicy] = None,
     target_atr_mult_override: Optional[float] = None, stop_atr_mult_override: Optional[float] = None,
     ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = None,
+    learning_rate_override: Optional[float] = None, epsilon_min_override: Optional[float] = None,
 ) -> tuple[RLPolicy, BacktestRun, list[Signal]]:
     """
     Trains a LinearQPolicy via epsilon-greedy Q-learning over the train slice (chronological
@@ -582,6 +583,14 @@ def train_rl_policy(
     same config). Without a seed, LinearQPolicy.epsilon_greedy's random.random()/
     random.choice(ACTIONS) draw from Python's shared global RNG state, so identical inputs can
     still converge to meaningfully different final weights purely by chance.
+
+    learning_rate_override/epsilon_min_override: same sweeping-without-a-redeploy idea as
+    target_atr_mult_override/stop_atr_mult_override -- LEARNING_RATE (Adagrad's alpha) and
+    EPSILON_MIN (the exploration floor epsilon decays to) are both "starting guesses, never
+    backtested" per their own module-level comments. Omit both to use those constants as
+    before. Not persisted onto the policy itself (unlike the ATR mults, there's no live-
+    inference-time counterpart these need to stay consistent with -- they only ever affect
+    HOW training arrives at a set of weights, not how a trained policy is used afterward).
     """
     if random_seed is not None:
         random.seed(random_seed)
@@ -636,6 +645,9 @@ def train_rl_policy(
         for ms, (buy_score, sell_score) in zip(compute_strategy_vote_states(indicator_df, config), ml_scores)
     ]
 
+    learning_rate = learning_rate_override if learning_rate_override is not None else LEARNING_RATE
+    epsilon_min = epsilon_min_override if epsilon_min_override is not None else EPSILON_MIN
+
     use_warm_start = warm_start is not None and warm_start.feature_names == RL_FEATURE_NAMES
     if use_warm_start:
         policy = LinearQPolicy(len(RL_FEATURE_NAMES), warm_start.weights, warm_start.sum_sq_grad or None)
@@ -644,7 +656,7 @@ def train_rl_policy(
         policy = LinearQPolicy(len(RL_FEATURE_NAMES))
         epsilon_start = EPSILON_START
     epsilon = epsilon_start
-    epsilon_decay = (EPSILON_MIN / epsilon_start) ** (1 / max(episodes, 1))
+    epsilon_decay = (epsilon_min / epsilon_start) ** (1 / max(episodes, 1))
 
     for _episode in range(episodes):
         i = min_warmup
@@ -658,11 +670,11 @@ def train_rl_policy(
             next_i = i + advance
             ruined = balance < MIN_VIABLE_BALANCE
             next_state = full_rl_state(market_states[next_i], balance, starting_balance) if (next_i <= train_last and not ruined) else None
-            policy.update(state, action, reward, next_state, LEARNING_RATE, DISCOUNT_GAMMA)
+            policy.update(state, action, reward, next_state, learning_rate, DISCOUNT_GAMMA)
             if ruined:
                 break  # out of capital -- nothing left to trade with for the rest of this episode
             i = next_i
-        epsilon = max(EPSILON_MIN, epsilon * epsilon_decay)
+        epsilon = max(epsilon_min, epsilon * epsilon_decay)
 
     # Greedy evaluation on the untouched test slice -- same walk-forward, single-position-at-
     # a-time shape as training, just epsilon=0 and no weight updates. Tallied the same way
