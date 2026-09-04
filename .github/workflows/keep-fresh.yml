@@ -18,12 +18,20 @@ name: Keep candle data fresh
 # minute-offset from the others so they don't collide on the same wall-clock minute;
 # github.event.schedule (only set on schedule-triggered runs, not workflow_dispatch)
 # tells each step which cron fired it.
+#
+# SWING PAUSED (see PROGRESS.md): the 1h/4h/1day-specific ingest/generate/consensus/RL-
+# signal steps below are all `if: false` for now -- training and live signal effort is
+# concentrated on fixing intraday's weaker RL policies first. The "3 * * * *" (hourly) and
+# "7 */4 * * *" (every 4h) schedule entries existed only to gate those now-disabled steps,
+# so they're removed too (no point firing a workflow run that does nothing extra). "11 0 * * *"
+# stays -- it still drives the once-daily RL training step, now narrowed to intraday only.
+# This is a pause, not a deletion: existing swing candles/signals/policies are untouched,
+# and reverting is just restoring the two removed schedule entries + flipping the `if: false`
+# steps back to their schedule-matching conditions.
 on:
   schedule:
     - cron: "*/20 * * * *"  # 5min + 15min candles
-    - cron: "3 * * * *"     # + 1h candles, hourly
-    - cron: "7 */4 * * *"   # + 4h candles, every 4 hours
-    - cron: "11 0 * * *"    # + 1day candles, once daily at 00:11 UTC
+    - cron: "11 0 * * *"    # once-daily RL training trigger (intraday only, swing paused)
   workflow_dispatch: {}
 
 jobs:
@@ -45,15 +53,15 @@ jobs:
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5"
           done
       - name: Ingest 1h candles
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
       - name: Ingest 4h candles
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/4h?output_size=5"
       - name: Ingest 1day candles
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1day?output_size=5"
       # Generation was previously frontend-only (api.generateSignal, called when someone
@@ -77,21 +85,21 @@ jobs:
             done
           done
       - name: Generate swing signals (1h)
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/signals/1h/swing?pair=${pair/\//%2F}"
           done
       - name: Generate swing signals (4h)
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/signals/4h/swing?pair=${pair/\//%2F}"
           done
       - name: Generate swing signals (1day)
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
@@ -112,21 +120,21 @@ jobs:
             done
           done
       - name: Check consensus (1h)
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/consensus/1h?pair=${pair/\//%2F}"
           done
       - name: Check consensus (4h)
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/consensus/4h?pair=${pair/\//%2F}"
           done
       - name: Check consensus (1day)
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
@@ -168,10 +176,10 @@ jobs:
       # where one transient hiccup is expected occasionally -- it shouldn't take the rest of
       # the day's RL pipeline down with it. Same reasoning as the "Generate RL signals" steps
       # below, which already use this pattern for a different reason (expected 400s).
-      - name: Train RL policy (all intervals)
+      - name: Train RL policy (intraday only -- swing paused)
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
-          for interval in 5min 15min 1h 4h 1day; do
+          for interval in 5min 15min; do
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
               curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
                 "$API_BASE/rl/train/$interval?pair=${pair/\//%2F}" -o /dev/null || true
@@ -193,21 +201,21 @@ jobs:
             done
           done
       - name: Generate RL signals (1h)
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Generate RL signals (4h)
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Generate RL signals (1day)
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        if: false  # swing paused, see the on.schedule comment above
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \

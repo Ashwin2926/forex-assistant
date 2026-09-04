@@ -917,7 +917,15 @@ def _rl_state_from_candles(
     return market_state, df, buy_score, sell_score
 
 
-RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
+# Narrowed from ["5min", "15min", "1h", "4h", "1day"] -- swing (1h/4h/1day) paused for now so
+# training/generation effort concentrates on fixing intraday's weaker policies first (see
+# PROGRESS.md). Drives every automated RL loop (Train all, Sync now) that iterates pairs x
+# intervals; does NOT block a direct manual call to POST /rl/train/{interval} or
+# POST /rl/signal/{interval} for a swing interval -- this only stops swing from being
+# automatically re-triggered, it doesn't hard-disable the endpoints themselves. Existing
+# swing policies/history are untouched (still queryable via GET /rl/policies,
+# /rl/insights, etc.) -- this is a pause, not a deletion.
+RL_INTERVALS = ["5min", "15min"]
 
 
 async def _run_rl_training(
@@ -1237,6 +1245,73 @@ async def list_rl_policies(pair: str | None = None, interval: str | None = None,
             "total_return_pct": run.get("total_return_pct"),
         } if run else None
     return docs
+
+
+@app.post("/rl/reset")
+async def reset_rl(confirm: bool = False):
+    """
+    Wipes every RL policy and its training artifacts so the next training run starts from
+    zero weights, while keeping the genuine market-outcome history (hit/miss/expired
+    RLSignals) intact -- that history is real evidence of what actually happened and stays
+    valid regardless of which policy generated the trade, so there's no reason to lose it
+    just because the policies themselves are being reset.
+
+    Deletes:
+      - Every rl_policies_collection document (all pair/interval policies).
+      - Every backtest_runs_collection document with profile="rl" (RL's own eval-run
+        summaries), plus every backtest_signals_collection document linked to one of those
+        run_ids via run_id (RL's individual test-slice trade log -- these don't carry
+        profile="rl" themselves, Signal has no RL-specific profile literal, see
+        train_rl_policy's own docstring; linkage is by run_id only).
+      - rl_signals_collection documents with status "pending" or "superseded" -- pending
+        ones would otherwise reference a policy_id that no longer exists after the reset,
+        and superseded ones were never a real market outcome to begin with (the agent
+        changed its mind before label_outcome got the chance).
+
+    Explicitly does NOT touch: rl_signals_collection documents with status "hit"/"miss"/
+    "expired" (the real outcome history -- case_memory.py's cross-pair pool, GET
+    /rl/accuracy's history), the rule-based signals_collection, or anything ML-related
+    (ml_runs_collection, signals_collection) -- this is scoped to RL only.
+
+    confirm: defaults to False, which runs the exact same queries and returns the counts of
+    what WOULD be deleted without deleting anything -- a dry run to sanity-check the numbers
+    before committing to an irreversible operation. Pass confirm=true to actually execute.
+    """
+    rl_run_ids = [
+        d["run_id"] async for d in backtest_runs_collection.find({"profile": "rl"}, {"run_id": 1})
+    ]
+
+    policies_count = await rl_policies_collection.count_documents({})
+    runs_count = len(rl_run_ids)
+    signals_count = await backtest_signals_collection.count_documents(
+        {"run_id": {"$in": rl_run_ids}}
+    ) if rl_run_ids else 0
+    pending_count = await rl_signals_collection.count_documents({"status": "pending"})
+    superseded_count = await rl_signals_collection.count_documents({"status": "superseded"})
+    kept_count = await rl_signals_collection.count_documents(
+        {"status": {"$in": ["hit", "miss", "expired"]}}
+    )
+
+    result = {
+        "confirmed": confirm,
+        "deleted": {
+            "rl_policies": policies_count,
+            "rl_eval_runs": runs_count,
+            "rl_eval_trade_log_signals": signals_count,
+            "rl_signals_pending": pending_count,
+            "rl_signals_superseded": superseded_count,
+        },
+        "kept": {"rl_signals_hit_miss_expired": kept_count},
+    }
+    if not confirm:
+        return result
+
+    if rl_run_ids:
+        await backtest_signals_collection.delete_many({"run_id": {"$in": rl_run_ids}})
+    await backtest_runs_collection.delete_many({"profile": "rl"})
+    await rl_policies_collection.delete_many({})
+    await rl_signals_collection.delete_many({"status": {"$in": ["pending", "superseded"]}})
+    return result
 
 
 @app.post("/rl/signal/{interval}")
