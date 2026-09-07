@@ -1,7 +1,7 @@
 // Mirrors app/models/schemas.py — keep in sync with the backend.
 
 export type Direction = "BUY" | "SELL" | "HOLD";
-export type Profile = "intraday" | "swing";
+export type Profile = "intraday";
 export type SignalStatus = "pending" | "hit" | "miss" | "expired" | "superseded";
 export type SignalSource = "live" | "backtest";
 
@@ -498,4 +498,4 @@ export interface CandlePoint {
 
 export const PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"] as const;
 export const INTERVALS = ["5min", "15min", "1h", "4h", "1day"] as const;
-export const PROFILES: Profile[] = ["intraday", "swing"];
+export const PROFILES: Profile[] = ["intraday"];

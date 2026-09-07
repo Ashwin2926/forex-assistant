@@ -82,10 +82,10 @@ RL_MARKET_FEATURE_NAMES = (
 )
 RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
 
-# Fixed, not sourced from RuleConfig/SWING_PAIR_OVERRIDES -- some of those (e.g. swing's
-# global default target_atr_mult=0.5/stop_atr_mult=1.25) risk MORE than they target, which
-# is exactly what the user said this agent must never do. A 1.5:1 reward:risk floor is
-# guaranteed by construction here, not left for the agent to discover through reward alone.
+# Fixed, not sourced from RuleConfig -- some validated target/stop ratios elsewhere in this
+# project risk MORE than they target, which is exactly what the user said this agent must
+# never do. A 1.5:1 reward:risk floor is guaranteed by construction here, not left for the
+# agent to discover through reward alone.
 # Sizing (RISK_FRACTION_BY_TIER) is additive on top of this -- it changes how much capital is
 # committed to the trade, never this ratio.
 #
@@ -199,21 +199,20 @@ DEFAULT_EPISODES = 200
 
 MIN_WARMUP_BARS = 30  # covers find_swing_levels/stochastic/ADX's own warmup needs
 
-# Which RuleConfig profile each interval's strategy calls should use -- RL previously used
-# "swing" (EMA 50/200, no session filter) unconditionally for every interval, including
-# 5min/15min. A 200-period EMA on 5-minute candles spans ~16.7 hours (multiple sessions),
-# far too slow to say anything meaningful about a 5-minute chart -- this project already
-# solved exactly this mismatch for the regular signal engine (intraday: EMA 9/21 + session
-# filter, cross-pair backtest-validated, see signal_engine.PROFILE_DEFAULTS), RL just never
-# adopted it. Same interval grouping the cron already uses for the regular engine/consensus.
+# Which RuleConfig profile RL's strategy calls should use -- RL previously used a longer-
+# horizon config (EMA 50/200, no session filter) unconditionally for every interval,
+# including 5min/15min. A 200-period EMA on 5-minute candles spans ~16.7 hours (multiple
+# sessions), far too slow to say anything meaningful about a 5-minute chart -- this project
+# already solved exactly this mismatch for the regular signal engine (intraday: EMA 9/21 +
+# session filter, cross-pair backtest-validated, see signal_engine.PROFILE_DEFAULTS), RL
+# just never adopted it. There's now only one validated profile, so every interval uses it.
 # target/stop are separately interval-aware via RL_ATR_MULTS_BY_INTERVAL/rl_atr_mults above --
-# this constant only decides which EMA/RSI/MACD periods and session gating the 7 strategies
+# this function only decides which EMA/RSI/MACD periods and session gating the 7 strategies
 # compute their votes with.
-INTRADAY_INTERVALS = {"5min", "15min"}
 
 
 def rl_config_profile(interval: str) -> str:
-    return "intraday" if interval in INTRADAY_INTERVALS else "swing"
+    return "intraday"
 
 
 def usd_per_unit(pair: str, entry_price: float) -> float:
@@ -550,9 +549,9 @@ def train_rl_policy(
     the eval BacktestRun's run_id -- reuses run_backtest's own persistence path
     (backtest_signals_collection + GET /backtest/runs/{run_id}/signals) instead of inventing
     a separate trade-log mechanism, so "which trades passed and which failed" is answered by
-    an endpoint that already exists. profile="swing" is a compatibility value only (Signal
-    has no RL-specific profile literal), same convention already used elsewhere when an
-    RL-generated decision needs to pass through a Signal-shaped interface; reasons=[] since
+    an endpoint that already exists. profile="intraday" is a compatibility value only
+    (Signal has no RL-specific profile literal), same convention already used elsewhere when
+    an RL-generated decision needs to pass through a Signal-shaped interface; reasons=[] since
     there's no rule-by-rule breakdown for a learned policy the way there is for the rule
     engine.
 
@@ -733,7 +732,7 @@ def train_rl_policy(
         all_pcts.append(pct_move)
 
         trade_signals.append(Signal(
-            pair=pair, profile="swing", interval=interval, timestamp=df.loc[i, "timestamp"],
+            pair=pair, profile="intraday", interval=interval, timestamp=df.loc[i, "timestamp"],
             direction=direction, confidence=0.0, reasons=[], price_at_signal=round(entry_price, 5),
             status=status, outcome_price=round(float(outcome_price), 5), outcome_timestamp=outcome_ts,
             outcome_pct_move=round(pct_move, 5), source="backtest", run_id=eval_run_id,

@@ -2,19 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, PROFILES, type MLPrediction, type MLTrainResult, type Profile } from "@/lib/types";
-
-// Same interval -> profile pairing the cron uses (keep-fresh.yml): 5min/15min are
-// intraday (short EMAs, session-filtered), 1h/4h/1day are swing (long EMAs, no session
-// filter) -- the other combinations exist in the API but aren't what's actually live.
-const INTERVAL_PROFILE: Record<string, Profile> = {
-  "5min": "intraday", "15min": "intraday", "1h": "swing", "4h": "swing", "1day": "swing",
-};
+import { INTERVALS, PAIRS, type MLPrediction, type MLTrainResult } from "@/lib/types";
 
 interface PredictGridCell {
   pair: string;
   interval: string;
-  profile: Profile;
   prediction: MLPrediction | null;
   error?: string;
 }
@@ -29,7 +21,6 @@ export default function MLPage() {
 
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
-  const [profile, setProfile] = useState<Profile>("swing");
   const [predicting, setPredicting] = useState(false);
   const [predictError, setPredictError] = useState<string | null>(null);
   const [prediction, setPrediction] = useState<MLPrediction | null>(null);
@@ -72,7 +63,7 @@ export default function MLPage() {
     setPredictError(null);
     setPrediction(null);
     try {
-      setPrediction(await api.predictML(pair, interval, profile));
+      setPrediction(await api.predictML(pair, interval, "intraday"));
     } catch (e) {
       setPredictError(e instanceof ApiError ? e.message : "Prediction failed.");
     } finally {
@@ -84,17 +75,17 @@ export default function MLPage() {
     setPredictGridRunning(true);
     setPredictGrid([]);
     setPredictGridProgress(0);
-    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i, profile: INTERVAL_PROFILE[i] })));
+    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
     const results: PredictGridCell[] = [];
     // Sequential, not Promise.all -- predictML retrains the classifier from scratch on
     // every call (see predict_hit_probability in ml_model.py), so 20 in parallel would be
     // 20 concurrent training runs hitting the same backend instance at once.
-    for (const { pair: p, interval: i, profile: pr } of combos) {
+    for (const { pair: p, interval: i } of combos) {
       try {
-        const result = await api.predictML(p, i, pr);
-        results.push({ pair: p, interval: i, profile: pr, prediction: result });
+        const result = await api.predictML(p, i, "intraday");
+        results.push({ pair: p, interval: i, prediction: result });
       } catch (e) {
-        results.push({ pair: p, interval: i, profile: pr, prediction: null, error: e instanceof ApiError ? e.message : "Failed" });
+        results.push({ pair: p, interval: i, prediction: null, error: e instanceof ApiError ? e.message : "Failed" });
       }
       setPredictGridProgress(results.length);
       setPredictGrid([...results]);
@@ -217,11 +208,6 @@ export default function MLPage() {
               {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
             </select>
           </Field>
-          <Field label="Profile">
-            <select value={profile} onChange={(e) => setProfile(e.target.value as Profile)} className="select">
-              {PROFILES.map((p) => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </Field>
           <button onClick={handlePredict} disabled={predicting} className="btn-primary">
             {predicting ? "Predicting…" : "Predict"}
           </button>
@@ -256,8 +242,8 @@ export default function MLPage() {
         <div className="mt-6 border-t border-zinc-100 pt-4 dark:border-zinc-800">
           <div className="flex items-center justify-between">
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Or predict all 4 pairs &times; 5 intervals at once (using each interval&apos;s
-              live profile — 5min/15min intraday, 1h/4h/1day swing, same as the cron).
+              Or predict all 4 pairs &times; 5 intervals at once (using the intraday config
+              for every interval, same as the cron).
             </p>
             <button onClick={handlePredictAll} disabled={predictGridRunning} className="btn-primary shrink-0">
               {predictGridRunning ? `Predicting ${predictGridProgress}/20…` : "Predict all"}
@@ -289,7 +275,7 @@ export default function MLPage() {
                         className={`border-t border-zinc-100 dark:border-zinc-800 ${directional ? (p!.direction === "BUY" ? "bg-emerald-50 dark:bg-emerald-950" : "bg-rose-50 dark:bg-rose-950") : ""}`}
                       >
                         <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
-                        <td className="px-3 py-1.5 font-mono">{cell.interval} · {cell.profile}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
                         {cell.error ? (
                           <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>{cell.error}</td>
                         ) : (

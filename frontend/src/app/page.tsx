@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, PROFILES, type Profile, type Signal, type SignalAccuracy } from "@/lib/types";
+import { INTERVALS, PAIRS, type Profile, type Signal, type SignalAccuracy } from "@/lib/types";
 import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
 export default function SignalFeedPage() {
@@ -10,7 +10,6 @@ export default function SignalFeedPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pairFilter, setPairFilter] = useState<string>("");
-  const [profileFilter, setProfileFilter] = useState<string>("");
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const [accuracy, setAccuracy] = useState<SignalAccuracy | null>(null);
@@ -19,7 +18,6 @@ export default function SignalFeedPage() {
 
   const [triggerPair, setTriggerPair] = useState<string>(PAIRS[0]);
   const [triggerInterval, setTriggerInterval] = useState<string>("1h");
-  const [triggerProfile, setTriggerProfile] = useState<Profile>("swing");
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
@@ -31,7 +29,7 @@ export default function SignalFeedPage() {
     setError(null);
     try {
       const data = await api.listSignals({ pair: pairFilter || undefined, limit: 100 });
-      setSignals(profileFilter ? data.filter((s) => s.profile === profileFilter) : data);
+      setSignals(data);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load signals. Is the API running?");
     } finally {
@@ -42,7 +40,7 @@ export default function SignalFeedPage() {
   async function loadAccuracy() {
     setAccuracyError(null);
     try {
-      setAccuracy(await api.getSignalAccuracy({ pair: pairFilter || undefined, profile: profileFilter || undefined }));
+      setAccuracy(await api.getSignalAccuracy({ pair: pairFilter || undefined }));
     } catch (e) {
       setAccuracyError(e instanceof ApiError ? e.message : "Failed to load accuracy.");
     }
@@ -52,7 +50,7 @@ export default function SignalFeedPage() {
     loadSignals();
     loadAccuracy();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairFilter, profileFilter]);
+  }, [pairFilter]);
 
   async function handleScore() {
     setScoring(true);
@@ -83,8 +81,8 @@ export default function SignalFeedPage() {
     setBusy("signal");
     setActionMessage(null);
     try {
-      await api.generateSignal(triggerPair, triggerInterval, triggerProfile);
-      setActionMessage(`Generated signal for ${triggerPair} / ${triggerInterval} / ${triggerProfile}`);
+      await api.generateSignal(triggerPair, triggerInterval, "intraday");
+      setActionMessage(`Generated signal for ${triggerPair} / ${triggerInterval}`);
       await loadSignals();
     } catch (e) {
       setActionMessage(e instanceof ApiError ? `Signal generation failed: ${e.message}` : "Signal generation failed.");
@@ -97,7 +95,7 @@ export default function SignalFeedPage() {
     setGeneratingAll(true);
     setActionMessage(null);
     const combos: { interval: string; profile: Profile }[] = [
-      { interval: "1h", profile: "swing" },
+      { interval: "1h", profile: "intraday" },
       { interval: "15min", profile: "intraday" },
     ];
     const jobs = PAIRS.flatMap((pair) => combos.map((c) => ({ pair, ...c })));
@@ -156,17 +154,6 @@ export default function SignalFeedPage() {
               ))}
             </select>
           </Field>
-          <Field label="Profile">
-            <select
-              value={triggerProfile}
-              onChange={(e) => setTriggerProfile(e.target.value as Profile)}
-              className="select"
-            >
-              {PROFILES.map((p) => (
-                <option key={p} value={p}>{p}</option>
-              ))}
-            </select>
-          </Field>
           <button
             onClick={handleIngest}
             disabled={busy !== null}
@@ -185,7 +172,7 @@ export default function SignalFeedPage() {
             onClick={handleGenerateAll}
             disabled={busy !== null || generatingAll}
             className="btn-secondary"
-            title="Generates a signal for every pair, both profiles (8 total) — ingest candles first if you haven't."
+            title="Generates a signal for every pair, on both 1h and 15min (8 total) — ingest candles first if you haven't."
           >
             {generatingAll ? "Generating all…" : "Generate all (8)"}
           </button>
@@ -201,7 +188,7 @@ export default function SignalFeedPage() {
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-            Live accuracy {pairFilter && `· ${pairFilter}`} {profileFilter && `· ${profileFilter}`}
+            Live accuracy {pairFilter && `· ${pairFilter}`}
           </h2>
           <button onClick={handleScore} disabled={scoring} className="btn-secondary">
             {scoring ? "Scoring…" : "Score pending signals"}
@@ -257,12 +244,6 @@ export default function SignalFeedPage() {
                 <option key={p} value={p}>{p}</option>
               ))}
             </select>
-            <select value={profileFilter} onChange={(e) => setProfileFilter(e.target.value)} className="select">
-              <option value="">All profiles</option>
-              {PROFILES.map((p) => (
-                <option key={p} value={p}>{p}</option>
-              ))}
-            </select>
           </div>
         </div>
 
@@ -294,7 +275,7 @@ export default function SignalFeedPage() {
                   <div className="flex items-center gap-3">
                     <DirectionBadge direction={s.direction} />
                     <span className="text-sm font-medium">{s.pair}</span>
-                    <span className="text-xs text-zinc-500">{s.interval} · {s.profile}</span>
+                    <span className="text-xs text-zinc-500">{s.interval}</span>
                   </div>
                   <div className="flex items-center gap-3 text-xs text-zinc-500">
                     <span>{new Date(s.timestamp).toLocaleString()}</span>

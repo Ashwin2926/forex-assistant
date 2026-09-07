@@ -4,6 +4,24 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-07
+
+**Removed the swing profile; single intraday ruleset now applies to every interval.**
+
+`signal_engine.PROFILE_DEFAULTS["swing"]` and `SWING_PAIR_OVERRIDES` are gone —
+`default_config_for` now only knows `"intraday"`, and every interval (including the
+longer 1h/4h/1day candles that used to route to swing) is evaluated with that one
+cross-pair-validated config instead. Updated in lockstep: `Signal.profile` and
+`PaperTrade.profile` (schemas.py) are now `Literal["intraday"]`; `/candles` and the
+consensus endpoints default to `profile="intraday"`; `rl_engine.rl_config_profile`
+always returns `"intraday"`; the RL backtester's placeholder `profile="swing"` value on
+synthetic Signal rows is now `"intraday"`. `find_swing_levels`/swing-high-low pivot
+detection in `patterns.py` and `strategies.py` is unrelated (chart-pattern term, not the
+trading profile) and untouched. Detailed swing tuning history moved out of the README
+into git history — see the previous revision of "Intraday vs swing" if it's ever worth
+resurrecting. Frontend: removed the intraday/swing toggle from every page that had one,
+and gave the whole app a responsive layout pass (see frontend git log same date).
+
 ## 2026-09-01
 
 **Fixed the real driver of the RL supersede/expired mess, then ran a per-interval ATR sweep

@@ -133,7 +133,7 @@ export default function ConsensusPage() {
           approximation of Smart Money Concepts) each analyze the same candles independently —
           no shared state between them. A consensus only fires when a weighted majority agree on
           direction <em>and</em> their entry/exit prices land within half an ATR of each other.
-          Additive to the existing intraday/swing engine, not a replacement — run the backtest
+          Additive to the existing rule-based engine, not a replacement — run the backtest
           below before trusting anything it says.
         </p>
       </section>

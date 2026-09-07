@@ -132,9 +132,10 @@ def apply_rules(
         detail=f"ATR is {atr_pct:.4f}% of price — {'sufficient' if volatility_ok else 'too low, likely illiquid session'}"
     ))
 
-    # Rule 5: Session filter (intraday only) - skip signals outside the highest-liquidity
-    # window. Not a vote — like volatility_filter, a failure here forces HOLD regardless
-    # of what rules 1-3 say. Swing profile leaves this disabled and always passes.
+    # Rule 5: Session filter - skip signals outside the highest-liquidity window. Not a
+    # vote — like volatility_filter, a failure here forces HOLD regardless of what rules
+    # 1-3 say. Only applies when config.session_filter_enabled is set; a config with it
+    # off leaves this disabled and always passes.
     session_ok = True
     if config.session_filter_enabled:
         hour = pd.Timestamp(latest["timestamp"]).hour
@@ -314,33 +315,18 @@ def generate_signal(
 
 
 # Per-profile defaults, validated (not guessed) via /backtest/optimize with a train/test
-# split — see README "Intraday vs swing" for the numbers. Re-run optimize and update these
-# if the ruleset changes or a wider candle sample tells a different story; don't hand-edit
-# them back to a guess.
+# split. Re-run optimize and update these if the ruleset changes or a wider candle sample
+# tells a different story; don't hand-edit them back to a guess.
 #
 # intraday: cross-pair validated on 15min data, 5000 candles/pair (all 4 majors) — an
 # earlier pass on only 2000 candles/pair had picked EMA 12/26 based on EUR/USD alone and
-# didn't hold up cross-pair (see README "Intraday vs swing" for that history). With enough
-# data, all four pairs converge on EMA 9/21 + session filter (12:00-16:00 UTC) + a tighter
-# volatility_threshold_pct=0.02, each clearly beating swing's ~30% baseline with a believable
-# 4-6pt train->test drop: EUR/USD 37.9%/32.4%, GBP/USD 44.6%/38.6%, USD/JPY 41.9%/37.7%,
-# AUD/USD 37.4%/31.3%.
-# swing: EUR/USD 1h, 1780 candles — EMA 50/200 (hit-rate winner) still won on hit_rate_pct,
-# but adding expectancy_pct (mean pct_move per signal, not just win/loss-bucket averages)
-# revealed the ORIGINAL target_atr_mult=1.5/stop_atr_mult=1.0 was negative-expectancy on
-# every single grid candidate, on every pair — a 29-31% hit-rate looks plausible in
-# isolation but is well under the 40% breakeven that ratio requires (stop/(target+stop)).
-# target/stop themselves are now RuleConfig fields (not fixed endpoint params) specifically
-# so /backtest/optimize can search them. Sweeping found target=0.5/stop=1.25 (a much closer
-# target, a more generous stop) as a real, cross-pair-validated improvement: EUR/USD went
-# clearly positive (train +0.0024%/test +0.0051%, 486 test signals), GBP/USD went from
-# -0.004% to roughly breakeven (-0.0001%/+0.0002%), USD/JPY improved but stayed negative
-# (-0.0072%/-0.0046% — consistent both sides, a real pair-specific shortfall, not noise),
-# AUD/USD showed a train/test sign flip (+0.007%/-0.0032%) — the same overfitting signature
-# as the earlier intraday lesson, so don't fully trust that pair's number. Net: strictly
-# better than the original 1.5/1.0 (negative everywhere) on every pair, genuinely profitable
-# on EUR/USD, but swing is not uniformly profitable across all four pairs yet — per-pair
-# target/stop tuning is a real, still-open gap, not a solved problem.
+# didn't hold up cross-pair. With enough data, all four pairs converge on EMA 9/21 +
+# session filter (12:00-16:00 UTC) + a tighter volatility_threshold_pct=0.02, with a
+# believable 4-6pt train->test drop: EUR/USD 37.9%/32.4%, GBP/USD 44.6%/38.6%, USD/JPY
+# 41.9%/37.7%, AUD/USD 37.4%/31.3%. This is now the only profile — every interval
+# (5min through 1day) is evaluated with this same validated config rather than a
+# separate longer-horizon ruleset, so a signal on any timeframe is judged by the one
+# ruleset that's actually been cross-pair backtest-validated.
 PROFILE_DEFAULTS: dict[str, RuleConfig] = {
     "intraday": RuleConfig(
         ema_fast=9,
@@ -353,88 +339,10 @@ PROFILE_DEFAULTS: dict[str, RuleConfig] = {
         session_end_hour_utc=16,
         # target_atr_mult/stop_atr_mult left at RuleConfig's own 1.5/1.0 default — already
         # modestly positive and consistent (train +0.0005%/test +0.0002%, no sign flip on
-        # EUR/USD), unlike swing this didn't need retuning.
+        # EUR/USD).
     ),
-    "swing": RuleConfig(
-        target_atr_mult=0.5,
-        stop_atr_mult=1.25,
-    ),
-}
-
-# Per-pair swing overrides, closing the gap the global 0.5/1.25 default left open (see
-# README "Per-pair swing target/stop tuning"). Found via /backtest/optimize on
-# ~2500-2700 candles/pair, 1h, train_frac=0.7. Only overriding where train and test
-# *agree in sign* — a pair whose best train candidate flips sign on the untouched test
-# slice is the same overfitting signature already documented for AUD/USD's intraday
-# result, and is not trustworthy just because one slice looks good.
-#
-# Round 1 (target/stop only, EMA 50/200 held fixed):
-#   EUR/USD 0.75/1.25 — train +0.0025%/test +0.0037% (2518/1260 signals): real improvement,
-#     same sign, better than the 0.5/1.25 global default's +0.0006% here.
-#   GBP/USD 0.75/1.5  — train -0.0002%/test -0.0012% (2564/1133 signals): still negative,
-#     but consistent and less negative than the global default's -0.0046% here.
-#   USD/JPY 0.5/2.0   — train -0.0074%/test -0.0023% (2566/1151 signals): still negative,
-#     but consistent and meaningfully better than the global default's -0.0123% here.
-# AUD/USD had no override after round 1: its best train candidate (1.0/1.25, -0.0023%)
-# flipped positive on test (+0.0021%, 2681/1249 signals) — a sign flip, not a validated
-# improvement.
-#
-# Round 2 (EMA x RSI grid, each pair's round-1 target/stop held fixed): tested 9
-# combinations (EMA 50/200, 20/100, 10/50 x RSI 30/70, 25/75, 35/65) per pair.
-#   EUR/USD's best (EMA 20/100) flipped sign: train +0.0045%/test -0.0016% — rejected,
-#     kept EMA 50/200.
-#   GBP/USD's best (EMA 10/50, RSI 35/65) flipped sign: train +0.0017%/test -0.0053% —
-#     rejected, kept EMA 50/200.
-#   AUD/USD's best was just the unmodified global default re-evaluated (EMA 50/200,
-#     RSI 30/70) and still flipped sign (train -0.0047%/test +0.0033%) — still no
-#     override, same open gap as round 1.
-#   USD/JPY's best (EMA 10/50, RSI 25/75) held sign: train -0.0045%/test -0.0011%
-#     (2709/1160 signals) — a real improvement over round 1's -0.0074%/-0.0023%, so
-#     re-ran a target/stop refinement under this new EMA/RSI (round 3 below) instead of
-#     stopping here.
-#
-# Round 3 (USD/JPY only — target/stop refined under its new EMA 10/50 + RSI 25/75):
-#   0.75/2.0 won: train -0.0030%/test -0.0014% (2709/1160 signals) — same sign, the best
-#   result found for USD/JPY across all three rounds. Still net-negative — this is a
-#   real, still-open pair-specific shortfall, not a solved problem — but each round made
-#   it measurably less bad without ever trusting a sign-flipped "winner."
-#
-# Round 4 (MACD period tuning, all 4 pairs except EUR/USD — already profitable, not a
-# tuning target here — each pair's round 1-3 config held fixed; then
-# volatility_threshold_pct sweep, all 4 pairs, same discipline):
-#   MACD: every pair's best candidate either showed a negligible train/test delta
-#   (GBP/USD 8/17/9: train -0.0004%/test -0.0011%, barely different from the 12/26/9
-#   default's train -0.0006%) or flipped sign (USD/JPY 5/13/6: train -0.0028%/test
-#   +0.0005%; AUD/USD 8/17/9: train -0.0038%/test +0.0049%) — no pair got a MACD
-#   override, all keep the RuleConfig default (12/26/9).
-#   volatility_threshold_pct (grid: 0.01/0.02/0.03/0.05, 0.02 is RuleConfig's untouched
-#   default that swing had never actually searched before this round):
-#     EUR/USD 0.05 — train +0.0031%/test +0.0032% (2214/1090 signals): same sign, stable,
-#       a real improvement over 0.02's train +0.0025% here — adopted.
-#     GBP/USD 0.03 — train -0.0001%/test -0.0006% (2477/1058 signals): same sign, both
-#       numbers improved over 0.02's train -0.0006%/test -0.0012% (from round 1) — still
-#       net-negative but measurably less bad — adopted.
-#     USD/JPY 0.05 — train -0.0018%/test +0.0024%: sign flip — rejected, kept vol=0.02.
-#     AUD/USD 0.05 — train -0.0046%/test +0.0049%: sign flip — rejected, kept vol=0.02.
-#   AUD/USD re-evaluation (per README "What's next" item 3): across all four rounds
-#   (EMA/RSI, target/stop, MACD, volatility) every single "winning" candidate for AUD/USD
-#   flipped sign train→test — never once a validated same-sign improvement. Per the plan
-#   set out after round 2, that's accepted as real evidence swing has no edge for this
-#   pair in this rule set, not just an under-searched grid — AUD/USD keeps the global
-#   default with no override, and the search is considered closed rather than open-ended.
-SWING_PAIR_OVERRIDES: dict[str, dict] = {
-    "EUR/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.25, "volatility_threshold_pct": 0.05},
-    "GBP/USD": {"target_atr_mult": 0.75, "stop_atr_mult": 1.5, "volatility_threshold_pct": 0.03},
-    "USD/JPY": {
-        "ema_fast": 10, "ema_slow": 50,
-        "rsi_oversold": 25, "rsi_overbought": 75,
-        "target_atr_mult": 0.75, "stop_atr_mult": 2.0,
-    },
 }
 
 
 def default_config_for(profile: str, pair: Optional[str] = None) -> RuleConfig:
-    config = PROFILE_DEFAULTS.get(profile, RuleConfig())
-    if profile == "swing" and pair in SWING_PAIR_OVERRIDES:
-        config = config.model_copy(update=SWING_PAIR_OVERRIDES[pair])
-    return config
+    return PROFILE_DEFAULTS.get(profile, RuleConfig())

@@ -11,7 +11,7 @@ FEATURE_RULE_MAP: dict[str, str] = {
     "rsi_neutral": "rsi",
     "macd_cross": "macd_hist",
     "volatility_filter": "atr_pct",
-    "session_filter": "session_hour",  # intraday only -- imputed 0.0 for swing, see below
+    "session_filter": "session_hour",  # imputed 0.0 when the rule didn't fire, see below
 }
 
 # The known pair/interval universe this project trades -- duplicated here (rather than
@@ -23,14 +23,16 @@ FEATURE_RULE_MAP: dict[str, str] = {
 KNOWN_PAIRS: list[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"]
 KNOWN_INTERVALS: list[str] = ["5min", "15min", "1h", "4h", "1day"]
 
-# session_hour/session_filter never appears on a swing signal (no session_filter rule for
-# that profile) -- 0.0 there means "not applicable," a real and meaningful state, not a
+# session_hour/session_filter never appears on a signal generated with the session filter
+# disabled -- 0.0 there means "not applicable," a real and meaningful state, not a
 # stand-in for data that should have existed but is missing.
 #
 # pair_*/interval_* one-hots were added because a single shared model previously had no way
-# to tell EUR/USD 5min apart from USD/JPY 1h -- profile_intraday only distinguishes the two
-# broad buckets, not the individual pair/interval, even though live accuracy is known to
-# differ a lot between them (see /rl/accuracy, /signals/accuracy per-pair/interval).
+# to tell EUR/USD 5min apart from USD/JPY 1h -- profile_intraday is currently constant
+# (there's only one profile), so it's the pair/interval one-hots that carry the meaningful
+# distinction, even though live accuracy is known to differ a lot between them (see
+# /rl/accuracy, /signals/accuracy per-pair/interval). profile_intraday is kept as-is
+# (rather than removed) so the feature schema stays compatible with already-trained models.
 FEATURE_NAMES: list[str] = [
     "ema_spread_pct", "rsi", "macd_hist", "atr_pct", "session_hour",
     "confidence", "profile_intraday", "direction_buy",

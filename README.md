@@ -59,7 +59,7 @@ This fetches and stores candles for all 4 pairs at the given interval.
 
 **Step 2 — generate a signal:**
 ```bash
-curl -X POST "http://localhost:8000/signals/1h/swing?pair=EUR%2FUSD"
+curl -X POST "http://localhost:8000/signals/1h/intraday?pair=EUR%2FUSD"
 ```
 Returns a Signal object with direction (BUY/SELL/HOLD), confidence %, and a
 full breakdown of which rules fired and why.
@@ -71,7 +71,7 @@ curl http://localhost:8000/signals
 
 **Step 4 — backtest before you trust it:**
 ```bash
-curl -X POST "http://localhost:8000/backtest/1h/swing?pair=EUR%2FUSD"
+curl -X POST "http://localhost:8000/backtest/1h/intraday?pair=EUR%2FUSD"
 ```
 Replays the same rule engine bar-by-bar over the candles you already ingested (walk-forward,
 no lookahead — each decision only sees data up to that candle) and scores every BUY/SELL
@@ -83,7 +83,7 @@ Optional query params: `target_atr_mult` (default 1.5), `stop_atr_mult` (default
 `max_lookforward` (default 20 candles).
 
 ```bash
-curl -X POST "http://localhost:8000/backtest/1h/swing?pair=EUR%2FUSD&target_atr_mult=2&stop_atr_mult=1&max_lookforward=30"
+curl -X POST "http://localhost:8000/backtest/1h/intraday?pair=EUR%2FUSD&target_atr_mult=2&stop_atr_mult=1&max_lookforward=30"
 curl http://localhost:8000/backtest/runs                       # list past runs
 curl http://localhost:8000/backtest/runs/{run_id}               # one run's summary
 curl http://localhost:8000/backtest/runs/{run_id}/signals       # every labeled signal in that run
@@ -95,7 +95,7 @@ backtest — either a single override in the `/backtest` POST body, or a **param
 comparing several configs against the identical historical candles in one call:
 
 ```bash
-curl -X POST "http://localhost:8000/backtest/sweep/1h/swing?pair=EUR%2FUSD" \
+curl -X POST "http://localhost:8000/backtest/sweep/1h/intraday?pair=EUR%2FUSD" \
   -H "Content-Type: application/json" \
   -d '[{"rsi_oversold": 25, "rsi_overbought": 75}, {"rsi_oversold": 35, "rsi_overbought": 65}]'
 ```
@@ -113,7 +113,7 @@ a few hundred candles isn't enough; a couple thousand is more like it (`/ingest`
 `?output_size=` up to 5000 on Twelve Data's free tier).
 
 ```bash
-curl -X POST "http://localhost:8000/backtest/optimize/1h/swing?pair=USD%2FJPY"
+curl -X POST "http://localhost:8000/backtest/optimize/1h/intraday?pair=USD%2FJPY"
 ```
 Omit the body to search the built-in default grid (varies EMA responsiveness and RSI
 sensitivity), or POST a JSON array of `RuleConfig` overrides to search your own. Returns
@@ -129,8 +129,8 @@ that's right less often can still have better expected value if its wins are big
 relative to its losses. Breakeven hit-rate is `stop_atr_mult/(target_atr_mult+stop_atr_mult)`
 — a 35% hit-rate config with a wide target and tight stop isn't "almost good," it can be
 losing money on average, and `expectancy_pct` being negative says so directly where
-`hit_rate_pct` alone wouldn't (this is exactly how swing's original defaults turned out to
-be unprofitable — see "Intraday vs swing" below).
+`hit_rate_pct` alone wouldn't (this is exactly how the now-removed swing profile's original
+defaults turned out to be unprofitable — see "The intraday ruleset" below).
 
 `target_atr_mult`/`stop_atr_mult` are `RuleConfig` fields, not fixed endpoint params —
 specifically so `/backtest/optimize` can search them alongside everything else instead of
@@ -147,7 +147,7 @@ real time instead of historical replay. Trigger it manually instead of waiting:
 
 ```bash
 curl -X POST http://localhost:8000/signals/score
-curl "http://localhost:8000/signals/accuracy?pair=EUR%2FUSD&profile=swing"   # rolling hit-rate, live signals only
+curl "http://localhost:8000/signals/accuracy?pair=EUR%2FUSD&profile=intraday"   # rolling hit-rate, live signals only
 ```
 
 This is what tells you whether live performance is actually tracking what was
@@ -157,7 +157,7 @@ still pending.
 
 **Step 7 — look at it:**
 ```bash
-curl "http://localhost:8000/candles/1h?pair=EUR%2FUSD&profile=swing&limit=250"
+curl "http://localhost:8000/candles/1h?pair=EUR%2FUSD&profile=intraday&limit=250"
 ```
 Stored candles with EMA/RSI/MACD/ATR attached, computed with that profile's `RuleConfig`
 (so what you see matches what `generate_signal` actually used). The frontend's **Chart**
@@ -170,7 +170,7 @@ See [Paper trading (Deriv)](#paper-trading-deriv) below before running this — 
 real (demo-account) order, not a simulation.
 
 ```bash
-curl -X POST "http://localhost:8000/paper-trade/1h/swing?pair=EUR%2FUSD&stake=10&multiplier=100"
+curl -X POST "http://localhost:8000/paper-trade/1h/intraday?pair=EUR%2FUSD&stake=10&multiplier=100"
 curl http://localhost:8000/paper-trade/open       # refreshes + lists open positions
 curl http://localhost:8000/paper-trade/history    # closed positions with final P&L
 ```
@@ -245,144 +245,36 @@ call goes through this, and it is not configurable or overridable. Still: only e
 `DERIV_API_TOKEN` from a demo account in the first place. Don't rely on the code as the only
 line of defense.
 
-## Intraday vs swing
+## The intraday ruleset
 
-`profile` used to be a label only — both profiles ran the identical `RuleConfig`. They now
-have separate, independently-validated defaults (`signal_engine.PROFILE_DEFAULTS`), picked
-up automatically by `/signals` and `/paper-trade` whenever no explicit config is passed:
+There used to be two profiles here, `intraday` and `swing` — a shorter-horizon rule set
+(EMA 9/21 + session filter) and a longer-horizon one (EMA 50/200, no session filter). Swing
+was removed: it never got past being roughly breakeven at best on two of four pairs and
+net-negative on the others even after several rounds of per-pair tuning (that history is
+still in git if it's ever worth revisiting). This project now runs a single validated
+ruleset (`signal_engine.PROFILE_DEFAULTS["intraday"]`) across every interval, including the
+longer ones (1h/4h/1day) that used to be routed to swing.
 
-- **swing** — EMA 50/200, no session filter (unchanged), but **`target_atr_mult=0.5`/
-  `stop_atr_mult=1.25`**, not the original 1.5/1.0. See "Swing's negative-expectancy fix"
-  below — this isn't a guess, it's a cross-pair-validated correction to a real bug.
-- **intraday** — EMA 9/21, plus a **session filter**: outside 12:00-16:00 UTC (the London/NY
-  overlap — the highest-liquidity window for majors; Asian-session hours are usually too
-  quiet for intraday setups) the rule engine forces HOLD regardless of what the other rules
-  say, plus a tighter `volatility_threshold_pct=0.02`. target/stop left at RuleConfig's own
-  1.5/1.0 default — already modestly positive and consistent (train +0.0005%/test +0.0002%
-  on EUR/USD, no train→test sign flip), so unlike swing it didn't need retuning.
+**intraday** — EMA 9/21, plus a **session filter**: outside 12:00-16:00 UTC (the London/NY
+overlap — the highest-liquidity window for majors; Asian-session hours are usually too
+quiet for these setups) the rule engine forces HOLD regardless of what the other rules say,
+plus `volatility_threshold_pct=0.02`. target/stop are left at `RuleConfig`'s own 1.5/1.0
+default — modestly positive and consistent (train +0.0005%/test +0.0002% on EUR/USD, no
+train→test sign flip).
 
-### Swing's negative-expectancy fix
+This was cross-pair validated on 15min data, 5000 candles/pair (all four majors):
 
-Backtesting had validated swing's EMA 50/200 on **hit-rate** (29.7% train / 30.7% test,
-EUR/USD) and called it done — hit-rate was the only metric that existed at the time. Adding
-`expectancy_pct` (see `/backtest/optimize` above) retroactively invalidated that: **every
-candidate in the grid, on every pair, had negative expectancy** at the original
-`target_atr_mult=1.5`/`stop_atr_mult=1.0`. Breakeven at that ratio needs a 40% hit-rate
-(`stop/(target+stop)`); a 29-31% hit-rate "looks" plausible in isolation, but it's well
-under that bar, and swing had been treated as validated on hit-rate alone with nothing
-checking the actual payout asymmetry until this metric existed.
-
-Root cause: `target_atr_mult`/`stop_atr_mult` weren't part of `RuleConfig` — they were
-fixed endpoint params, so `/backtest/optimize` could tune EMA/RSI/session/vol but never the
-risk/reward ratio itself, no matter how wrong it was. Moved them into `RuleConfig`
-(see `signal_engine.RuleConfig`), then swept target/stop combinations directly:
-
-| Pair | Old (1.5/1.0) | New (0.5/1.25) train | New (0.5/1.25) test |
+| Pair | Train | Test | Drop |
 |---|---|---|---|
-| EUR/USD | -0.0028% | +0.0024% (977 signals) | **+0.0051%** (486 signals) |
-| GBP/USD | -0.0040% | -0.0001% | +0.0002% (roughly breakeven) |
-| USD/JPY | -0.0108% | -0.0072% | -0.0046% (improved, still negative) |
-| AUD/USD | -0.0044% | +0.0070% | -0.0032% (train→test sign flip) |
+| EUR/USD | 37.9% | 32.4% | -5.5 pts |
+| GBP/USD | 44.6% | 38.6% | -6.0 pts |
+| USD/JPY | 41.9% | 37.7% | -4.2 pts |
+| AUD/USD | 37.4% | 31.3% | -6.1 pts |
 
-Every pair moved toward or into positive territory — a real, validated improvement over
-the original ratio everywhere. But it's not a uniform win: EUR/USD shows a genuine edge,
-GBP/USD is roughly breakeven, USD/JPY stays negative on both train and test (a real
-pair-specific shortfall, not noise), and AUD/USD's sign flip is the same overfitting
-signature as the earlier intraday lesson — don't trust that number. **Per-pair target/stop
-tuning for swing is a real, still-open gap**, same as intraday's history — this fix closes
-the "every candidate is doomed by the same bad ratio" bug, it doesn't claim swing is
-uniformly profitable now.
-
-### Per-pair swing target/stop tuning
-
-The gap above — one global target/stop ratio applied to every pair — is now closed for
-three of four pairs. Re-ingested to ~2500-2700 1h candles/pair (Twelve Data's actual
-free-tier ceiling for 1h history, not a deliberate choice) and ran `/backtest/optimize`
-per pair with a target/stop-only grid (13 candidates spanning 0.25-1.0x target, 1.0-2.0x
-stop; EMA held at swing's 50/200), `train_frac=0.7`:
-
-| Pair | Winner | Train | Test | vs. global 0.5/1.25 default (train) |
-|---|---|---|---|---|
-| EUR/USD | 0.75/1.25 | +0.0025% (2518 signals) | **+0.0037%** (1260 signals) | +0.0006% |
-| GBP/USD | 0.75/1.5 | -0.0002% (2564 signals) | -0.0012% (1133 signals) | -0.0046% |
-| USD/JPY | 0.5/2.0 | -0.0074% (2566 signals) | -0.0023% (1151 signals) | -0.0123% |
-| AUD/USD | *(no override — see below)* | — | — | -0.0047% |
-
-EUR/USD, GBP/USD, and USD/JPY all got a same-sign train→test result strictly better than
-the shared default, so `signal_engine.SWING_PAIR_OVERRIDES` now applies each pair's own
-winner instead of the one-size-fits-all 0.5/1.25 — `default_config_for(profile, pair)`
-looks up the override when `profile="swing"` and the pair has one. GBP/USD and USD/JPY are
-**still net-negative** even at their own best ratio; the override just makes them less bad,
-it doesn't make them profitable. USD/JPY in particular remains a real pair-specific
-shortfall that target/stop tuning alone doesn't fix — it likely needs its own EMA/RSI
-tuning too, which this grid didn't search (out of scope for this pass; see "What's next").
-
-AUD/USD deliberately keeps the global default. Its best train candidate (1.0/1.25) scored
--0.0023% on train but **flipped to +0.0021% on test** — the identical train→test
-sign-flip signature already seen for AUD/USD's intraday result above. Adopting it would
-mean picking a config because it happened to win on one slice of history, exactly the
-failure mode this project's own optimize/train-test split exists to catch. Per-pair tuning
-for AUD/USD stays an open gap rather than papering over it with an untrustworthy number.
-
-**Follow-up: EMA/RSI tuning for the pairs still net-negative.** The table above only
-searched target/stop, holding EMA at swing's structural 50/200 — flagged above as
-"likely needs its own EMA/RSI tuning too." Ran a second grid (EMA 50/200 / 20/100 / 10/50
-x RSI 30/70 / 25/75 / 35/65, 9 combinations, each pair's own target/stop from the table
-above held fixed) to check:
-
-| Pair | Best candidate | Train | Test | Verdict |
-|---|---|---|---|---|
-| EUR/USD | EMA 20/100 | +0.0045% | -0.0016% | **Sign flip — rejected**, kept EMA 50/200 |
-| GBP/USD | EMA 10/50, RSI 35/65 | +0.0017% | -0.0053% | **Sign flip — rejected**, kept EMA 50/200 |
-| USD/JPY | EMA 10/50, RSI 25/75 | -0.0045% | -0.0011% | Same sign, real improvement — kept |
-| AUD/USD | EMA 50/200 (i.e. unchanged) | -0.0047% | +0.0033% | **Sign flip — still no override** |
-
-Three of four candidates looked *better on train* than the config already in production —
-and three of four would have been the wrong call, because the improvement didn't survive
-the untouched test slice. Only USD/JPY's held its sign, so it's the only pair that got an
-EMA/RSI change. With its target/stop (0.5/2.0) now stale for the new EMA/RSI, re-ran the
-target/stop grid once more under EMA 10/50 + RSI 25/75:
-
-| Round | Config | Train | Test |
-|---|---|---|---|
-| 1 (target/stop only, EMA 50/200) | 0.5/2.0 | -0.0074% | -0.0023% |
-| 2 (+ EMA 10/50, RSI 25/75, same target/stop) | 0.5/2.0 | -0.0045% | -0.0011% |
-| 3 (target/stop re-tuned for new EMA/RSI) | **0.75/2.0** | **-0.0030%** | **-0.0014%** |
-
-USD/JPY is still net-negative — three rounds of honest tuning narrowed it from -0.0123%
-to -0.0030% (train) without ever adopting a sign-flipped "winner," but didn't flip it
-profitable. That's the expected outcome, not a failure of the method: some pairs may
-simply not have an edge in this rule set, and a train/test split whose whole purpose is
-to reject overfit "improvements" should occasionally do exactly that.
-
-**How that intraday default was actually reached — including a mistake worth keeping.** The
-first pass (EUR/USD only, 2000 15min candles) found EMA 12/26 + session filter looking great
-(40.0% train / 45.2% test) and it went straight into `PROFILE_DEFAULTS`. Checking the other
-three pairs on that same 2000-candle sample overturned it: every other pair showed real
-train→test degradation (GBP -8.6pts, USD/JPY -19.2pts, AUD/USD -12.6pts), and AUD/USD's own
-winner *rejected* session filtering outright — direct evidence the first result was small-sample
-noise (intraday test slices were only 28-404 signals). The instinct at that point was to leave
-`PROFILE_DEFAULTS` alone rather than chase a new single-pair "winner" — correct given the
-data available, but the data itself was the real problem: intraday only fires a few hours a
-day, so 2000 candles isn't enough to tell signal from noise.
-
-Re-ingesting to Twelve Data's free-tier max (**5000** candles/pair) and re-running the same
-grid fixed it — all four pairs converged cleanly:
-
-| Pair | Winner | Train | Test | Drop |
-|---|---|---|---|---|
-| EUR/USD | EMA 9/21 + session, vol 0.02 | 37.9% | 32.4% | -5.5 pts |
-| GBP/USD | EMA 9/21 + session, vol 0.05 | 44.6% | 38.6% | -6.0 pts |
-| USD/JPY | EMA 9/21 + session, vol 0.02 | 41.9% | 37.7% | -4.2 pts |
-| AUD/USD | EMA 9/21 + session, vol 0.02 | 37.4% | 31.3% | -6.1 pts |
-
-Every pair now agrees on EMA 9/21 + session filter, three of four agree on `vol=0.02`, every
-test result clearly beats swing's ~30% baseline, and every train→test drop is a believable
-4-6 points instead of the earlier 8-19. `PROFILE_DEFAULTS["intraday"]` reflects this result.
-The lesson that's worth keeping past this specific number: **when cross-pair validation
-disagrees, check whether there's enough data before concluding the effect isn't real** — the
-session-filtering hypothesis was right all along; the first cross-check just didn't have
-enough signal to see it.
+Every pair agrees on EMA 9/21 + session filter, and every train→test drop is a believable
+4-6 points. An earlier pass on only 2000 candles/pair had picked EMA 12/26 based on EUR/USD
+alone and didn't hold up cross-pair — the lesson worth keeping: when cross-pair validation
+disagrees, check whether there's enough data before concluding an effect isn't real.
 
 `session_filter_enabled`/`session_start_hour_utc`/`session_end_hour_utc` are just more
 `RuleConfig` fields — override them per-request the same way as any other threshold.
@@ -413,35 +305,17 @@ frontend/            # Next.js dashboard (signal feed + live accuracy, chart, ba
 
 ## What's next (not built yet)
 
-Current state after four rounds of per-pair swing tuning (see "Per-pair swing target/stop
-tuning" and its follow-ups above, and `signal_engine.SWING_PAIR_OVERRIDES`'s "Round 4"
-comment for the MACD/volatility numbers): EUR/USD is genuinely profitable (0.75/1.25
-target/stop, EMA 50/200, `volatility_threshold_pct=0.05`). GBP/USD (0.75/1.5,
-`vol=0.03`) and USD/JPY (EMA 10/50, RSI 25/75, 0.75/2.0) are both still net-negative at
-their own best found config — narrower than before, not solved. AUD/USD has no override
-at all: every candidate tried across all four rounds (target/stop, EMA/RSI, MACD,
-volatility) flipped sign between train and test — per the plan below, that search is
-now considered closed rather than open-ended.
-
-Next steps, roughly in order:
-1. ~~**MACD period tuning for swing**~~ — done. Every pair's best candidate either
-   showed a negligible train/test delta (GBP/USD) or flipped sign (USD/JPY, AUD/USD); no
-   pair got a MACD override, all keep `RuleConfig`'s default (12/26/9).
-2. ~~**`volatility_threshold_pct` sweep for swing**~~ — done. EUR/USD (0.05) and
-   GBP/USD (0.03) got real, same-sign, validated overrides; USD/JPY and AUD/USD's best
-   candidates both flipped sign and were rejected, keeping the default 0.02.
-3. ~~**Re-evaluate AUD/USD after (1) and (2)**~~ — done, and the sign-flip-every-round
-   outcome the plan anticipated is exactly what happened: accepted as real evidence swing
-   has no edge for this pair in this rule set, not just an under-searched grid. Not
-   revisiting with more grid search; would need a materially different approach (new
-   indicators, a different profile entirely) to be worth another pass.
-4. **Revisit ML now that (1)-(3) are done** — was deliberately deferred until the
-   rule-based search space was exhausted (the rule engine's failure modes — small
-   samples, train/test sign flips — are easy to see and reason about; a model's failure
-   modes usually aren't). That point has now been reached for swing.
+- Now that there's a single ruleset applied to every interval, the longer intervals
+  (1h/4h/1day) haven't had their own expectancy validation the way 15min intraday data
+  has (see "The intraday ruleset" above, which is hit-rate/cross-pair validated on 15min
+  candles specifically) — worth an `/backtest/optimize` pass per interval to confirm the
+  same config holds up rather than assuming it transfers.
+- **Revisit ML** — deliberately deferred until the rule-based search space was reasonably
+  explored (the rule engine's failure modes — small samples, train/test sign flips — are
+  easy to see and reason about; a model's failure modes usually aren't).
 - The Backtesting page's "Optimize" UI runs the default grid (now includes both target/stop
   ratios, EMA/RSI variations) — it still has no input for a fully custom `configs` JSON
-  body, so an exhaustive search still needs curl (see "Intraday vs swing" above)
+  body, so an exhaustive search still needs curl (see "The intraday ruleset" above)
 - Ingestion runs via `.github/workflows/keep-fresh.yml`, a GitHub Actions cron every 15
   minutes hitting `/ingest/15min`, `/ingest/1h`, and `/signals/score` for all 4 pairs —
   ~768 Twelve Data calls/day if run continuously, close to the free tier's 800/day

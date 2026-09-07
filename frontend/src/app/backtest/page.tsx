@@ -12,15 +12,14 @@ import {
   YAxis,
 } from "recharts";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, PROFILES, type BacktestRun, type OptimizeRankBy, type OptimizeResult, type Profile, type RuleConfig } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type OptimizeRankBy, type OptimizeResult, type RuleConfig } from "@/lib/types";
 
 // Mirrors PROFILE_DEFAULTS["intraday"] in signal_engine.py. Optimize without an explicit
 // `configs` body falls back to the backend's generic DEFAULT_OPTIMIZE_GRID, which never
-// sets session_filter_enabled -- fine for swing (which has no session filter anyway), but
-// for intraday that grid silently tests an unfiltered strategy that has nothing to do with
-// the live config, and the resulting hit-rate numbers aren't comparable to anything real.
-// Every candidate here keeps the session filter on, varying one or two axes at a time
-// around the actual live baseline (the first entry) instead.
+// sets session_filter_enabled -- that grid silently tests an unfiltered strategy that has
+// nothing to do with the live config, and the resulting hit-rate numbers aren't comparable
+// to anything real. Every candidate here keeps the session filter on, varying one or two
+// axes at a time around the actual live baseline (the first entry) instead.
 const INTRADAY_BASELINE: RuleConfig = {
   ema_fast: 9, ema_slow: 21, rsi_period: 14, rsi_oversold: 30, rsi_overbought: 70,
   macd_fast: 12, macd_slow: 26, macd_signal: 9, atr_period: 14,
@@ -48,7 +47,6 @@ export default function BacktestPage() {
 
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
-  const [profile, setProfile] = useState<Profile>("swing");
   const [targetAtrMult, setTargetAtrMult] = useState(1.5);
   const [stopAtrMult, setStopAtrMult] = useState(1.0);
   const [maxLookforward, setMaxLookforward] = useState(20);
@@ -57,7 +55,6 @@ export default function BacktestPage() {
 
   const [optPair, setOptPair] = useState<string>(PAIRS[0]);
   const [optInterval, setOptInterval] = useState<string>("15min");
-  const [optProfile, setOptProfile] = useState<Profile>("intraday");
   const [trainFrac, setTrainFrac] = useState(0.7);
   const [minSignals, setMinSignals] = useState(20);
   const [rankBy, setRankBy] = useState<OptimizeRankBy>("expectancy");
@@ -86,7 +83,7 @@ export default function BacktestPage() {
     setRunning(true);
     setRunError(null);
     try {
-      await api.runBacktest(pair, interval, profile, {
+      await api.runBacktest(pair, interval, "intraday", {
         target_atr_mult: targetAtrMult,
         stop_atr_mult: stopAtrMult,
         max_lookforward: maxLookforward,
@@ -104,13 +101,14 @@ export default function BacktestPage() {
     setOptimizeError(null);
     setOptimizeResult(null);
     try {
-      const result = await api.runOptimize(optPair, optInterval, optProfile, {
+      const result = await api.runOptimize(optPair, optInterval, "intraday", {
         train_frac: trainFrac,
         min_directional_signals: minSignals,
         rank_by: rankBy,
-        // Only intraday needs a custom grid -- swing has no session filter, so the
-        // backend's generic default grid is already a fair, real-baseline comparison for it.
-        configs: optProfile === "intraday" ? INTRADAY_OPTIMIZE_GRID : undefined,
+        // The backend's generic default grid never sets session_filter_enabled, so for
+        // the live intraday config it'd silently test an unfiltered strategy that has
+        // nothing to do with what's actually running -- use the real-baseline grid instead.
+        configs: INTRADAY_OPTIMIZE_GRID,
       });
       setOptimizeResult(result);
       await loadRuns();
@@ -151,11 +149,6 @@ export default function BacktestPage() {
           <Field label="Interval">
             <select value={interval} onChange={(e) => setInterval_(e.target.value)} className="select">
               {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
-            </select>
-          </Field>
-          <Field label="Profile">
-            <select value={profile} onChange={(e) => setProfile(e.target.value as Profile)} className="select">
-              {PROFILES.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
           </Field>
           <Field label="Target (x ATR)">
@@ -207,11 +200,6 @@ export default function BacktestPage() {
           <Field label="Interval">
             <select value={optInterval} onChange={(e) => setOptInterval(e.target.value)} className="select">
               {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
-            </select>
-          </Field>
-          <Field label="Profile">
-            <select value={optProfile} onChange={(e) => setOptProfile(e.target.value as Profile)} className="select">
-              {PROFILES.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
           </Field>
           <Field label="Train fraction">

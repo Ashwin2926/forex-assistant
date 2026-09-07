@@ -56,9 +56,9 @@ app = FastAPI(title="Forex Trading Assistant")
 # backtesting has actually shown to matter (EMA responsiveness, RSI sensitivity, and
 # target/stop — RuleConfig's own 1.5x/1.0x default turned out to have negative expectancy
 # on every EMA/RSI combination on every pair; a closer target with a more generous stop
-# (0.5x/1.25x) is a validated, cross-pair-tested improvement, see signal_engine.PROFILE_DEFAULTS
-# and README "Intraday vs swing"). Both target/stop ratios are included here so a plain
-# "run optimize" has a chance to find the better one instead of only searching a doomed ratio.
+# (0.5x/1.25x) is a validated, cross-pair-tested improvement, see signal_engine.PROFILE_DEFAULTS).
+# Both target/stop ratios are included here so a plain "run optimize" has a chance to find
+# the better one instead of only searching a doomed ratio.
 DEFAULT_OPTIMIZE_GRID = [
     RuleConfig(),
     RuleConfig(ema_fast=20, ema_slow=100),
@@ -141,7 +141,8 @@ async def create_signal(
 ):
     """
     Generate a signal for a pair using stored candle data.
-    profile: 'intraday' or 'swing'. pair is a query param (e.g. ?pair=EUR/USD) —
+    profile: always 'intraday' — the one validated ruleset, used across every interval.
+    pair is a query param (e.g. ?pair=EUR/USD) —
     it contains a literal '/', which breaks Starlette path-parameter matching
     even when percent-encoded, so it can't live in the URL path.
 
@@ -306,11 +307,11 @@ async def signal_accuracy(pair: str | None = None, profile: str | None = None, l
 
 
 @app.get("/candles/{interval}")
-async def get_candles(interval: str, pair: str, profile: str = "swing", limit: int = 300):
+async def get_candles(interval: str, pair: str, profile: str = "intraday", limit: int = 300):
     """
-    Stored candles with EMA/RSI/MACD/ATR attached, for charting — computed with that
-    profile's RuleConfig (so the EMA/RSI periods shown match whatever generate_signal
-    actually used for that profile). Returns the most recent `limit` candles, ascending
+    Stored candles with EMA/RSI/MACD/ATR attached, for charting — computed with the
+    intraday RuleConfig (so the EMA/RSI periods shown match whatever generate_signal
+    actually used). Returns the most recent `limit` candles, ascending
     by timestamp. Indicators need config.ema_slow rows of preceding history to be
     meaningful; the earliest rows in a short result may show as null for that reason.
     """
@@ -369,9 +370,7 @@ async def create_consensus_signal(interval: str, pair: str):
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
-    # Consensus has no PROFILE_DEFAULTS entry of its own; swing's config (no session filter)
-    # is the more neutral pick of the two since consensus isn't scoped to a session window.
-    config = default_config_for("swing", pair)
+    config = default_config_for("intraday", pair)
     cursor = candles_collection.find(
         {"pair": pair, "interval": interval}
     ).sort("timestamp", -1).limit(500)
@@ -436,7 +435,7 @@ async def backtest_consensus(interval: str, pair: str, train_frac: float = 0.7, 
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
-    config = default_config_for("swing", pair)
+    config = default_config_for("intraday", pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
     docs = await cursor.to_list(length=None)
     if not docs:
@@ -917,14 +916,14 @@ def _rl_state_from_candles(
     return market_state, df, buy_score, sell_score
 
 
-# Narrowed from ["5min", "15min", "1h", "4h", "1day"] -- swing (1h/4h/1day) paused for now so
-# training/generation effort concentrates on fixing intraday's weaker policies first (see
-# PROGRESS.md). Drives every automated RL loop (Train all, Sync now) that iterates pairs x
-# intervals; does NOT block a direct manual call to POST /rl/train/{interval} or
-# POST /rl/signal/{interval} for a swing interval -- this only stops swing from being
-# automatically re-triggered, it doesn't hard-disable the endpoints themselves. Existing
-# swing policies/history are untouched (still queryable via GET /rl/policies,
-# /rl/insights, etc.) -- this is a pause, not a deletion.
+# Narrowed from ["5min", "15min", "1h", "4h", "1day"] -- the longer intervals (1h/4h/1day)
+# are paused for now so training/generation effort concentrates on fixing the weaker
+# policies on the shorter intervals first (see PROGRESS.md). Drives every automated RL loop
+# (Train all, Sync now) that iterates pairs x intervals; does NOT block a direct manual call
+# to POST /rl/train/{interval} or POST /rl/signal/{interval} for a longer interval -- this
+# only stops those from being automatically re-triggered, it doesn't hard-disable the
+# endpoints themselves. Existing policies/history for those intervals are untouched (still
+# queryable via GET /rl/policies, /rl/insights, etc.) -- this is a pause, not a deletion.
 RL_INTERVALS = ["5min", "15min"]
 
 
@@ -1032,10 +1031,9 @@ async def train_rl(
     total_return_pct alongside the usual hit_rate/expectancy) so it's directly comparable to
     every other approach via GET /backtest/runs?pair=X&profile=rl.
 
-    Strategy calls use the intraday RuleConfig (short EMAs + session filter) for 5min/15min
-    and swing for everything else (rl_config_profile) -- same interval grouping the regular
-    signal engine already uses, so a 5-minute chart isn't read with EMA periods tuned for
-    multi-day trends.
+    Strategy calls use the intraday RuleConfig (short EMAs + session filter) for every
+    interval (rl_config_profile) -- the one cross-pair-validated ruleset, applied
+    consistently regardless of interval.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
 
@@ -2292,7 +2290,7 @@ async def _run_all_flows_job(job_id: str) -> None:
                     return
 
         for interval in RL_INTERVALS:
-            profile = "intraday" if interval in ("5min", "15min") else "swing"
+            profile = "intraday"
             for pair in settings.pairs_list:
                 key = f"{pair}/{interval}"
                 try:

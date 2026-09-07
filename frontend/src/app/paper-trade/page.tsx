@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, PROFILES, type PaperTrade, type PaperTradeAccount, type PaperTradeResult, type Profile } from "@/lib/types";
+import { INTERVALS, PAIRS, type PaperTrade, type PaperTradeAccount, type PaperTradeResult } from "@/lib/types";
 import { DirectionBadge, PaperTradeStatusBadge } from "@/components/Badges";
 
 export default function PaperTradePage() {
@@ -17,7 +17,6 @@ export default function PaperTradePage() {
 
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
-  const [profile, setProfile] = useState<Profile>("swing");
   const [stake, setStake] = useState(10);
   const [multiplier, setMultiplier] = useState(100);
   const [running, setRunning] = useState(false);
@@ -63,7 +62,7 @@ export default function PaperTradePage() {
     setRunError(null);
     setRunResult(null);
     try {
-      const result = await api.executePaperTrade(pair, interval, profile, { stake, multiplier });
+      const result = await api.executePaperTrade(pair, interval, "intraday", { stake, multiplier });
       setRunResult(result);
       await loadTrades();
     } catch (e) {
@@ -132,11 +131,6 @@ export default function PaperTradePage() {
           <Field label="Interval">
             <select value={interval} onChange={(e) => setInterval_(e.target.value)} className="select">
               {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
-            </select>
-          </Field>
-          <Field label="Profile">
-            <select value={profile} onChange={(e) => setProfile(e.target.value as Profile)} className="select">
-              {PROFILES.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
           </Field>
           <Field label="Stake">

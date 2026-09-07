@@ -15,7 +15,7 @@ import {
   YAxis,
 } from "recharts";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, PROFILES, type CandlePoint, type Profile, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type CandlePoint, type Signal } from "@/lib/types";
 
 // Validated against the dataviz skill's CVD/contrast checks (light + dark):
 // node scripts/validate_palette.js "#2a78d6,#eb6834,#10b981,#e34948" --mode light  -> PASS
@@ -61,7 +61,6 @@ export default function ChartPage() {
 
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
-  const [profile, setProfile] = useState<Profile>("swing");
 
   const [candles, setCandles] = useState<CandlePoint[]>([]);
   const [signals, setSignals] = useState<Signal[]>([]);
@@ -73,11 +72,11 @@ export default function ChartPage() {
     setError(null);
     try {
       const [candleData, signalData] = await Promise.all([
-        api.getCandles(pair, interval, profile, 250),
+        api.getCandles(pair, interval, "intraday", 250),
         api.listSignals({ pair, limit: 300 }),
       ]);
       setCandles(candleData);
-      setSignals(signalData.filter((s) => s.interval === interval && s.profile === profile && s.direction !== "HOLD"));
+      setSignals(signalData.filter((s) => s.interval === interval && s.direction !== "HOLD"));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load chart data. Is the API running?");
       setCandles([]);
@@ -90,7 +89,7 @@ export default function ChartPage() {
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pair, interval, profile]);
+  }, [pair, interval]);
 
   // Merge signal markers onto the candle series by nearest timestamp, so Scatter can
   // plot them on the same x-axis as the price line without a separate axis.
@@ -135,11 +134,6 @@ export default function ChartPage() {
           <Field label="Interval">
             <select value={interval} onChange={(e) => setInterval_(e.target.value)} className="select">
               {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
-            </select>
-          </Field>
-          <Field label="Profile">
-            <select value={profile} onChange={(e) => setProfile(e.target.value as Profile)} className="select">
-              {PROFILES.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
           </Field>
           <button onClick={load} disabled={loading} className="btn-secondary">

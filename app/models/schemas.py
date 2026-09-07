@@ -66,7 +66,7 @@ class SignalReason(BaseModel):
 
 class Signal(BaseModel):
     pair: str
-    profile: Literal["intraday", "swing"]
+    profile: Literal["intraday"]
     interval: str
     timestamp: datetime
     direction: Literal["BUY", "SELL", "HOLD"]
@@ -450,7 +450,7 @@ class PaperTrade(BaseModel):
     """
     pair: str
     interval: str
-    profile: Literal["intraday", "swing"]
+    profile: Literal["intraday"]
     direction: Literal["BUY", "SELL"]
 
     deriv_symbol: str
