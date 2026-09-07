@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type Profile, type Signal, type SignalAccuracy } from "@/lib/types";
+import { INTERVALS, PAIRS, type Signal, type SignalAccuracy } from "@/lib/types";
 import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
 export default function SignalFeedPage() {
@@ -126,21 +126,20 @@ export default function SignalFeedPage() {
   async function handleGenerateAll() {
     setGeneratingAll(true);
     setActionMessage(null);
-    const combos: { interval: string; profile: Profile }[] = [
-      { interval: "1h", profile: "intraday" },
-      { interval: "15min", profile: "intraday" },
-    ];
-    const jobs = PAIRS.flatMap((pair) => combos.map((c) => ({ pair, ...c })));
+    // All 5 intervals now that 1h/4h/1day are back to being live (see PROGRESS.md) --
+    // every one uses the same intraday-validated config, so there's no more "profile" to
+    // vary across combos, just the interval.
+    const jobs = PAIRS.flatMap((pair) => INTERVALS.map((interval) => ({ pair, interval })));
     const results: string[] = [];
 
     for (let i = 0; i < jobs.length; i++) {
-      const { pair, interval, profile } = jobs[i];
-      setGenerateAllProgress(`${i + 1}/${jobs.length}: ${pair} ${interval}/${profile}…`);
+      const { pair, interval } = jobs[i];
+      setGenerateAllProgress(`${i + 1}/${jobs.length}: ${pair} ${interval}…`);
       try {
-        const signal = await api.generateSignal(pair, interval, profile);
-        results.push(`${pair} ${profile}: ${signal.direction}`);
+        const signal = await api.generateSignal(pair, interval, "intraday");
+        results.push(`${pair} ${interval}: ${signal.direction}`);
       } catch (e) {
-        results.push(`${pair} ${profile}: FAILED (${e instanceof ApiError ? e.message : "error"})`);
+        results.push(`${pair} ${interval}: FAILED (${e instanceof ApiError ? e.message : "error"})`);
       }
       await loadSignals(); // refresh incrementally so results appear as they land, not just at the end
     }
@@ -212,9 +211,9 @@ export default function SignalFeedPage() {
             onClick={handleGenerateAll}
             disabled={busy !== null || generatingAll || ingestingAll}
             className="btn-secondary"
-            title="Generates a signal for every pair, on both 1h and 15min (8 total) — ingest candles first if you haven't."
+            title={`Generates a signal for every pair on every interval (${PAIRS.length * INTERVALS.length} total) — ingest candles first if you haven't.`}
           >
-            {generatingAll ? "Generating all…" : "Generate all (8)"}
+            {generatingAll ? "Generating all…" : `Generate all (${PAIRS.length * INTERVALS.length})`}
           </button>
         </div>
         {ingestAllProgress && (
