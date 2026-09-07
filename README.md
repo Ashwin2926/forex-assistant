@@ -1,8 +1,15 @@
 # Forex Trading Assistant — v1
 
-Rule-based signal engine for forex (starting with EUR/USD, GBP/USD, USD/JPY, AUD/USD).
-No execution, no live trading — this generates and logs BUY/SELL/HOLD signals with
-full reasoning so you can backtest and improve the logic over time.
+Signal engine for forex (EUR/USD, GBP/USD, USD/JPY, AUD/USD) with three independent
+decision-makers reading the same 7 technical strategies — a rule-based engine, a weighted
+consensus layer, and a learned RL agent — plus a supervised classifier that scores how likely
+any of them is to actually hit. No execution, no live trading (aside from Deriv demo-account
+paper trading, see below) — this generates and logs signals with full reasoning so you can
+backtest and improve the logic over time.
+
+**This README covers local setup, auth, and the rule engine's own workflow. For how the
+full system (consensus, ML, RL, live quality gates) actually works end to end, see
+[`ARCHITECTURE.md`](./ARCHITECTURE.md).**
 
 ## Setup (VS Code, local)
 
@@ -280,6 +287,10 @@ disagrees, check whether there's enough data before concluding an effect isn't r
 `RuleConfig` fields — override them per-request the same way as any other threshold.
 
 ## Project structure
+
+This has grown well past the rule-engine-only description above — see **`ARCHITECTURE.md`**
+for the full current system (consensus, the ML classifier, the RL agent, the live quality
+gates, and how they all feed back into each other). Structure:
 ```
 app/
   core/
@@ -287,20 +298,29 @@ app/
     auth.py        # login/JWT verification + AuthMiddleware guarding every non-public route
     database.py    # MongoDB connection + collections
   models/
-    schemas.py      # Candle, Signal, BacktestRun, PaperTrade, LoginRequest pydantic models
+    schemas.py      # Candle, Signal, ConsensusSignal, RLPolicy, RLSignal, BacktestRun, PaperTrade, LoginRequest pydantic models
   services/
-    data_fetcher.py    # Twelve Data API -> MongoDB
-    indicators.py       # EMA, RSI, MACD, ATR calculations
+    data_fetcher.py     # Twelve Data API -> MongoDB
+    indicators.py       # EMA, RSI, MACD, ATR, Bollinger, Stochastic, ADX, volume calculations
+    strategies.py        # the 7 independent StrategyCall-producing strategies shared by every signal source
     signal_engine.py    # rule-based BUY/SELL/HOLD logic + PROFILE_DEFAULTS + label_outcome (shared with backtester)
+    consensus.py         # weighted-majority additive signal source over the same 7 strategies
     backtester.py        # walk-forward replay + ATR-based outcome labeling + metrics
-    outcome_scoring.py    # resolves pending LIVE signals against real candles as they arrive
+    outcome_scoring.py    # resolves pending LIVE signals (rule/consensus/RL) against real candles as they arrive
+    ml_features.py        # Signal -> flat feature vector, shared by training and live prediction
+    ml_model.py            # supervised hit/miss LogisticRegression classifier (NOT reinforcement learning)
+    rl_engine.py           # the RL agent: state/actions/reward, training loop, ATR/hyperparameter tuning
+    case_memory.py         # RL's k-nearest-neighbor "have we seen this before" cross-pair lookup
     deriv_client.py      # Deriv WebSocket session + virtual-account safety gate
     paper_trading.py     # Signal -> Deriv Multipliers contract execution + sync
-  main.py            # FastAPI app + endpoints (incl. /candles, /auth/login)
+  main.py            # FastAPI app + every endpoint
 scripts/              # one-off maintenance scripts (dedupe/cleanup live signals) — run manually, not on any schedule
 .github/workflows/
-  keep-fresh.yml       # GitHub Actions cron: /ingest + /signals/score every 15 minutes
-frontend/            # Next.js dashboard (signal feed + live accuracy, chart, backtesting, paper trading)
+  keep-fresh.yml       # GitHub Actions cron -- the actual production heartbeat (ingest/generate/
+                       # consensus/RL/score/ML-retrain); see ARCHITECTURE.md for the current schedule.
+                       # NOT an in-process scheduler -- an earlier APScheduler approach silently died
+                       # whenever the FastAPI Cloud instance scaled to zero between requests.
+frontend/            # Next.js dashboard (signal feed + live accuracy, chart, backtesting, RL page, ML page, paper trading)
 ```
 
 ## What's next (not built yet)
