@@ -4,6 +4,23 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-07 (cont.)
+
+**Restored ingest/generate/consensus/RL for 1h/4h/1day — they were still fully paused
+after the swing removal above, not actually running under intraday config.**
+
+The swing removal earlier today only touched application code. `.github/workflows/
+keep-fresh.yml` — the actual unattended pipeline — still had every 1h/4h/1day step
+`if: false` from an earlier commit ("Pause swing (1h/4h/1day)...") that bundled the
+swing pause together with narrowing ingestion/generation/consensus/RL down to 5min/15min
+only. Net effect: those three intervals had zero live candles and zero live signals
+being generated at all, contradicting the "keep 1h/4h/1day" decision from earlier today.
+Restored the pre-pause workflow (cron schedule entries for hourly/every-4h/daily, all
+four gated step groups) with every `/signals/.../swing` URL changed to `/signals/.../
+intraday`. Also restored `RL_INTERVALS` in `main.py` back to all 5 intervals (was
+narrowed to `["5min", "15min"]` as part of the same bundled pause) so the manual
+"Train all"/"Sync now" flow and `/rl/insights` match what the cron now actually does.
+
 ## 2026-09-07
 
 **Removed the swing profile; single intraday ruleset now applies to every interval.**

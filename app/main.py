@@ -916,15 +916,10 @@ def _rl_state_from_candles(
     return market_state, df, buy_score, sell_score
 
 
-# Narrowed from ["5min", "15min", "1h", "4h", "1day"] -- the longer intervals (1h/4h/1day)
-# are paused for now so training/generation effort concentrates on fixing the weaker
-# policies on the shorter intervals first (see PROGRESS.md). Drives every automated RL loop
-# (Train all, Sync now) that iterates pairs x intervals; does NOT block a direct manual call
-# to POST /rl/train/{interval} or POST /rl/signal/{interval} for a longer interval -- this
-# only stops those from being automatically re-triggered, it doesn't hard-disable the
-# endpoints themselves. Existing policies/history for those intervals are untouched (still
-# queryable via GET /rl/policies, /rl/insights, etc.) -- this is a pause, not a deletion.
-RL_INTERVALS = ["5min", "15min"]
+# Restored to all 5 intervals (was narrowed to 5min/15min only as part of the swing pause,
+# see PROGRESS.md) -- drives every automated RL loop (Train all, Sync now) that iterates
+# pairs x intervals, and GET /rl/insights' scan.
+RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 
 async def _run_rl_training(

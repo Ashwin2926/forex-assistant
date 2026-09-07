@@ -14,24 +14,23 @@ name: Keep candle data fresh
 # each interval's underlying candle actually advances, plus running the fast tier every
 # 20 min instead of 15, brings this down to ~700/day (5min+15min: 576, 1h: 96, 4h: 24,
 # 1day: 4) — comfortably under the cap while keeping the fastest possible refresh for
-# 5min/15min, the two intervals intraday's signal quality depends on most. Each entry is
+# 5min/15min, the two intervals whose signal quality depends on it most. Each entry is
 # minute-offset from the others so they don't collide on the same wall-clock minute;
 # github.event.schedule (only set on schedule-triggered runs, not workflow_dispatch)
 # tells each step which cron fired it.
 #
-# SWING PAUSED (see PROGRESS.md): the 1h/4h/1day-specific ingest/generate/consensus/RL-
-# signal steps below are all `if: false` for now -- training and live signal effort is
-# concentrated on fixing intraday's weaker RL policies first. The "3 * * * *" (hourly) and
-# "7 */4 * * *" (every 4h) schedule entries existed only to gate those now-disabled steps,
-# so they're removed too (no point firing a workflow run that does nothing extra). "11 0 * * *"
-# stays -- it still drives the once-daily RL training step, now narrowed to intraday only.
-# This is a pause, not a deletion: existing swing candles/signals/policies are untouched,
-# and reverting is just restoring the two removed schedule entries + flipping the `if: false`
-# steps back to their schedule-matching conditions.
+# All five intervals run the same validated RuleConfig now (see
+# signal_engine.PROFILE_DEFAULTS["intraday"]) -- the separate "swing" profile that used
+# to run on 1h/4h/1day was removed (see PROGRESS.md), and this workflow's own 1h/4h/1day
+# steps had been temporarily disabled as part of that same change. Restored here with
+# every /signals/.../swing URL updated to /signals/.../intraday and RL widened back to
+# all 5 intervals -- see PROGRESS.md for the date this was flipped back on.
 on:
   schedule:
     - cron: "*/20 * * * *"  # 5min + 15min candles
-    - cron: "11 0 * * *"    # once-daily RL training trigger (intraday only, swing paused)
+    - cron: "3 * * * *"     # + 1h candles, hourly
+    - cron: "7 */4 * * *"   # + 4h candles, every 4 hours
+    - cron: "11 0 * * *"    # + 1day candles, once daily at 00:11 UTC
   workflow_dispatch: {}
 
 jobs:
@@ -53,29 +52,25 @@ jobs:
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5"
           done
       - name: Ingest 1h candles
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
       - name: Ingest 4h candles
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/4h?output_size=5"
       - name: Ingest 1day candles
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1day?output_size=5"
       # Generation was previously frontend-only (api.generateSignal, called when someone
       # loads the dashboard) — ingest/score ran unattended but no new signals appeared
       # unless a human visited the site. These steps make generation unattended too, on
-      # the same per-interval cadence as that interval's own ingest step above.
-      # Interval-to-profile pairing: intraday (EMA9/21, session-filtered) for the two
-      # fastest intervals, swing (EMA50/200, no session filter) for the three slower ones —
-      # matches the existing 15min/intraday and 1h/swing convention the frontend and README
-      # already use; the long EMAs/no session-filter combo would be meaningless on 5min
-      # candles and vice versa for intraday's short EMAs on daily candles. create_signal is
-      # itself de-duped (see app/main.py) against the last live signal for the same
-      # pair/interval/profile, so re-running this won't insert duplicates when the
-      # underlying candle hasn't advanced.
+      # the same per-interval cadence as that interval's own ingest step above. Every
+      # interval uses the same intraday-validated RuleConfig now (see
+      # signal_engine.PROFILE_DEFAULTS) -- create_signal is itself de-duped (see
+      # app/main.py) against the last live signal for the same pair/interval/profile, so
+      # re-running this won't insert duplicates when the underlying candle hasn't advanced.
       - name: Generate intraday signals (5min, 15min)
         run: |
           for interval in 5min 15min; do
@@ -84,29 +79,29 @@ jobs:
                 "$API_BASE/signals/$interval/intraday?pair=${pair/\//%2F}"
             done
           done
-      - name: Generate swing signals (1h)
-        if: false  # swing paused, see the on.schedule comment above
+      - name: Generate intraday signals (1h)
+        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/1h/swing?pair=${pair/\//%2F}"
+              "$API_BASE/signals/1h/intraday?pair=${pair/\//%2F}"
           done
-      - name: Generate swing signals (4h)
-        if: false  # swing paused, see the on.schedule comment above
+      - name: Generate intraday signals (4h)
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/4h/swing?pair=${pair/\//%2F}"
+              "$API_BASE/signals/4h/intraday?pair=${pair/\//%2F}"
           done
-      - name: Generate swing signals (1day)
-        if: false  # swing paused, see the on.schedule comment above
+      - name: Generate intraday signals (1day)
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/1day/swing?pair=${pair/\//%2F}"
+              "$API_BASE/signals/1day/intraday?pair=${pair/\//%2F}"
           done
       # Consensus (app/services/consensus.py) is a separate, additive signal source on top
-      # of intraday/swing -- checked on the same per-interval cadence as the generate steps
+      # of the rule engine -- checked on the same per-interval cadence as the generate steps
       # above, reusing the candles that step already ingested (zero extra Twelve Data calls).
       # Only fires a stored signal on genuine weighted-majority agreement (see consensus.py's
       # REQUIRED_WEIGHT_FRACTION), so most of these calls are
@@ -120,21 +115,21 @@ jobs:
             done
           done
       - name: Check consensus (1h)
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/consensus/1h?pair=${pair/\//%2F}"
           done
       - name: Check consensus (4h)
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/consensus/4h?pair=${pair/\//%2F}"
           done
       - name: Check consensus (1day)
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
@@ -155,18 +150,17 @@ jobs:
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train"
       # RL agent (app/services/rl_engine.py) -- a learned, adaptive alternative to consensus's
-      # fixed weighted-vote threshold over the same 7 strategies. Now covers all 5 intervals
-      # (widened from 1h-only, see PROGRESS.md), one independent policy per pair PER interval.
-      # Training (many epsilon-greedy episodes over each interval's full candle history) is
-      # the heavy part -- gated to once daily across every pair/interval regardless of that
-      # interval's own candle cadence, unlike ML's near-instant retrain above; there's no
-      # reason to train more than once a day even for 5min/15min, since a policy doesn't need
-      # to be as fresh as the candles it reads. Generate + score follow each interval's own
-      # natural cadence (same split already used for ingest/generate/consensus above) since
-      # that part is cheap -- a handful of strategy evaluations on the latest candle, not a
-      # training run. Paper-trade execution was removed entirely (Deriv isn't available in
-      # every region) -- RL signals are sized (lot size) and traded manually instead, see the
-      # RL page.
+      # fixed weighted-vote threshold over the same 7 strategies. Covers all 5 intervals, one
+      # independent policy per pair PER interval. Training (many epsilon-greedy episodes over
+      # each interval's full candle history) is the heavy part -- gated to once daily across
+      # every pair/interval regardless of that interval's own candle cadence, unlike ML's
+      # near-instant retrain above; there's no reason to train more than once a day even for
+      # 5min/15min, since a policy doesn't need to be as fresh as the candles it reads.
+      # Generate + score follow each interval's own natural cadence (same split already used
+      # for ingest/generate/consensus above) since that part is cheap -- a handful of strategy
+      # evaluations on the latest candle, not a training run. Paper-trade execution was
+      # removed entirely (Deriv isn't available in every region) -- RL signals are sized (lot
+      # size) and traded manually instead, see the RL page.
       # -f dropped (replaced with a plain -s + `|| true` per call) here specifically after a
       # live failure: one transient 500 on a single pair/interval (confirmed non-reproducible
       # -- the exact same call succeeded immediately on retry) aborted this whole step under
@@ -176,10 +170,10 @@ jobs:
       # where one transient hiccup is expected occasionally -- it shouldn't take the rest of
       # the day's RL pipeline down with it. Same reasoning as the "Generate RL signals" steps
       # below, which already use this pattern for a different reason (expected 400s).
-      - name: Train RL policy (intraday only -- swing paused)
+      - name: Train RL policy (all intervals)
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
-          for interval in 5min 15min; do
+          for interval in 5min 15min 1h 4h 1day; do
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
               curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
                 "$API_BASE/rl/train/$interval?pair=${pair/\//%2F}" -o /dev/null || true
@@ -201,21 +195,21 @@ jobs:
             done
           done
       - name: Generate RL signals (1h)
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Generate RL signals (4h)
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Generate RL signals (1day)
-        if: false  # swing paused, see the on.schedule comment above
+        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
