@@ -23,6 +23,8 @@ export default function SignalFeedPage() {
 
   const [generatingAll, setGeneratingAll] = useState(false);
   const [generateAllProgress, setGenerateAllProgress] = useState<string | null>(null);
+  const [ingestingAll, setIngestingAll] = useState(false);
+  const [ingestAllProgress, setIngestAllProgress] = useState<string | null>(null);
 
   async function loadSignals() {
     setLoading(true);
@@ -75,6 +77,36 @@ export default function SignalFeedPage() {
     } finally {
       setBusy(null);
     }
+  }
+
+  // Ingests every interval, one at a time -- mirrors what "Sync now" does internally for
+  // its own ingest step, but standalone: no RL training, signal generation, consensus, or
+  // ML retrain attached, just fresh candles. An 8s pause between calls avoids the Twelve
+  // Data 429 that firing all 5 intervals x 4 pairs back-to-back with zero spacing produced
+  // the first time run_all_flows did exactly that (see main.py's _run_all_flows_job).
+  async function handleIngestAll() {
+    setIngestingAll(true);
+    setActionMessage(null);
+    const results: string[] = [];
+
+    for (let i = 0; i < INTERVALS.length; i++) {
+      const interval = INTERVALS[i];
+      if (i > 0) {
+        setIngestAllProgress(`Waiting before ${interval}…`);
+        await new Promise((resolve) => setTimeout(resolve, 8000));
+      }
+      setIngestAllProgress(`${i + 1}/${INTERVALS.length}: ${interval}…`);
+      try {
+        const result = await api.ingest(interval);
+        results.push(`${interval}: ${JSON.stringify(result)}`);
+      } catch (e) {
+        results.push(`${interval}: FAILED (${e instanceof ApiError ? e.message : "error"})`);
+      }
+    }
+
+    setIngestAllProgress(null);
+    setActionMessage(`Ingest all done — ${results.join(" · ")}`);
+    setIngestingAll(false);
   }
 
   async function handleGenerateSignal() {
@@ -156,27 +188,38 @@ export default function SignalFeedPage() {
           </Field>
           <button
             onClick={handleIngest}
-            disabled={busy !== null}
+            disabled={busy !== null || ingestingAll}
             className="btn-secondary"
           >
             {busy === "ingest" ? "Ingesting…" : "Ingest candles"}
           </button>
           <button
+            onClick={handleIngestAll}
+            disabled={busy !== null || ingestingAll}
+            className="btn-secondary"
+            title={`Ingests every interval (${INTERVALS.join(", ")}), one at a time, 8s apart to avoid a rate limit.`}
+          >
+            {ingestingAll ? "Ingesting all…" : `Ingest all (${INTERVALS.length})`}
+          </button>
+          <button
             onClick={handleGenerateSignal}
-            disabled={busy !== null || generatingAll}
+            disabled={busy !== null || generatingAll || ingestingAll}
             className="btn-primary"
           >
             {busy === "signal" ? "Generating…" : "Generate signal"}
           </button>
           <button
             onClick={handleGenerateAll}
-            disabled={busy !== null || generatingAll}
+            disabled={busy !== null || generatingAll || ingestingAll}
             className="btn-secondary"
             title="Generates a signal for every pair, on both 1h and 15min (8 total) — ingest candles first if you haven't."
           >
             {generatingAll ? "Generating all…" : "Generate all (8)"}
           </button>
         </div>
+        {ingestAllProgress && (
+          <p className="mt-3 text-xs" style={{ color: "var(--text-muted)" }}>{ingestAllProgress}</p>
+        )}
         {generateAllProgress && (
           <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">{generateAllProgress}</p>
         )}
