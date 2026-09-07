@@ -111,9 +111,18 @@ async def ingest(interval: str, output_size: int = 300):
     output_size: candles to fetch per pair (Twelve Data allows up to 5000 on the free tier).
     Backtest optimization (train/test split) needs more history than a single live signal
     does — raise this when you want a meaningful split, e.g. ?output_size=2000.
+
+    A short pause between pairs (not just between separate /ingest calls) -- confirmed live
+    that firing all 4 pairs back-to-back, repeated across a few intervals in quick
+    succession (e.g. the "Ingest all" dashboard button, or Sync now), can burst past Twelve
+    Data's per-minute rate limit well before the daily credit cap is anywhere close.
+    fetch_candles itself also retries with backoff on a 429 (see data_fetcher.py), so this
+    is belt-and-suspenders: spacing to avoid triggering it, retry in case it happens anyway.
     """
     results = {}
-    for pair in settings.pairs_list:
+    for i, pair in enumerate(settings.pairs_list):
+        if i > 0:
+            await asyncio.sleep(2)
         try:
             count = await fetch_and_store(pair, interval, output_size=output_size)
             results[pair] = f"{count} candles stored"

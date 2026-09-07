@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 from datetime import datetime
 from pymongo import UpdateOne
@@ -7,6 +8,16 @@ from app.models.schemas import Candle
 
 settings = get_settings()
 BASE_URL = "https://api.twelvedata.com/time_series"
+
+# Twelve Data's free tier caps requests per minute (separately from the 800/day credit
+# cap) -- ingesting several intervals back-to-back (each looping all 4 pairs with zero
+# delay between them, see /ingest/{interval} in main.py) can burst past that per-minute
+# limit even while staying well under the daily one. Confirmed live: a 4-interval sweep
+# (5min/15min/1h/4h) 429'd on every pair for 4h specifically, then 1day succeeded right
+# after -- proof the limit is a transient, self-resolving per-minute window, not a hard
+# stop. Retry with backoff here instead of failing the whole ingest outright.
+MAX_RETRIES_ON_RATE_LIMIT = 3
+RETRY_BACKOFF_SECONDS = 20
 
 
 async def fetch_candles(pair: str, interval: str, output_size: int = 100) -> list[Candle]:
@@ -22,10 +33,17 @@ async def fetch_candles(pair: str, interval: str, output_size: int = 100) -> lis
         "timezone": "UTC",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(BASE_URL, params=params)
+    for attempt in range(MAX_RETRIES_ON_RATE_LIMIT + 1):
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(BASE_URL, params=params)
+
+        if resp.status_code == 429 and attempt < MAX_RETRIES_ON_RATE_LIMIT:
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+            continue
+
         resp.raise_for_status()
         data = resp.json()
+        break
 
     if data.get("status") == "error":
         raise ValueError(f"Twelve Data error for {pair}/{interval}: {data.get('message')}")
