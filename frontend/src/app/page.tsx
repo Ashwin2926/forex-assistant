@@ -129,7 +129,7 @@ export default function SignalFeedPage() {
         </p>
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Manual triggers</h2>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Pair">
@@ -185,7 +185,7 @@ export default function SignalFeedPage() {
         )}
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
             Live accuracy {pairFilter && `· ${pairFilter}`}
@@ -266,7 +266,7 @@ export default function SignalFeedPage() {
             return (
               <li
                 key={key}
-                className="rounded-lg border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900"
+                className="card"
               >
                 <button
                   onClick={() => setExpanded(isOpen ? null : key)}
@@ -320,9 +320,9 @@ export default function SignalFeedPage() {
 
 function AccuracyStat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-800">
-      <p className="text-xs text-zinc-500">{label}</p>
-      <p className="mt-1 text-lg font-semibold">{value}</p>
+    <div className="rounded-lg p-3" style={{ background: "var(--surface-sunken)" }}>
+      <p className="text-xs" style={{ color: "var(--text-muted)" }}>{label}</p>
+      <p className="num mt-1 text-lg font-semibold">{value}</p>
     </div>
   );
 }

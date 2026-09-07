@@ -81,7 +81,7 @@ const VERDICT_COLOR: Record<RLLearningVerdict["status"], string> = {
 
 function VerdictCard({ title, verdict, sampleUnit, minN }: { title: string; verdict: RLLearningVerdict; sampleUnit: string; minN: number }) {
   return (
-    <div className="min-w-[220px] flex-1 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+    <div className="min-w-[220px] flex-1 card p-4">
       <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">{title}</p>
       <p className={`mt-1 text-xl font-semibold ${VERDICT_COLOR[verdict.status]}`}>{VERDICT_LABEL[verdict.status]}</p>
       {verdict.first_half_rate_pct != null && verdict.second_half_rate_pct != null ? (
@@ -443,7 +443,7 @@ export default function RLPage() {
       </section>
 
       <section className="flex flex-wrap gap-3">
-        <div className="min-w-[220px] flex-1 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <div className="min-w-[220px] flex-1 card p-4">
           <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
             AI confidence {trainAllRunning ? "(training live)" : "(last training run)"}
           </p>
@@ -464,7 +464,7 @@ export default function RLPage() {
             </>
           )}
         </div>
-        <div className="min-w-[220px] flex-1 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <div className="min-w-[220px] flex-1 card p-4">
           <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Overall trading accuracy (live signals)</p>
           {!overallAccuracy || overallAccuracy.total_resolved === 0 ? (
             <p className="mt-1 text-sm text-zinc-400">No resolved live RL signals yet.</p>
@@ -493,7 +493,7 @@ export default function RLPage() {
         </div>
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Is it getting smarter?</h2>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Compares the earlier half of the last 30 days against the later half, pooling real
@@ -511,7 +511,7 @@ export default function RLPage() {
         )}
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <div className="flex items-center justify-between">
           <div>
             <SectionToggle open={insightsOpen} onToggle={() => setInsightsOpen((o) => !o)} title="What to improve" />
@@ -565,7 +565,7 @@ export default function RLPage() {
         ))}
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <SectionToggle open={trainOpen} onToggle={() => setTrainOpen((o) => !o)} title="Train a policy" />
         {trainOpen && (
         <>
@@ -669,7 +669,7 @@ export default function RLPage() {
           {trainAllJob && trainAllJob.results.length > 0 && (
             <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
               <table className="w-full text-left text-xs">
-                <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                <thead className="table-head uppercase">
                   <tr>
                     <th className="px-3 py-1.5">Pair</th>
                     <th className="px-3 py-1.5">Interval</th>
@@ -717,7 +717,7 @@ export default function RLPage() {
         )}
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <div className="flex items-center justify-between">
           <div>
             <SectionToggle open={generateOpen} onToggle={() => setGenerateOpen((o) => !o)} title="Generate signals" />
@@ -750,7 +750,7 @@ export default function RLPage() {
           {generateAllResults.length > 0 && (
             <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
               <table className="w-full text-left text-xs">
-                <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                <thead className="table-head uppercase">
                   <tr>
                     <th className="px-3 py-1.5">Pair</th>
                     <th className="px-3 py-1.5">Interval</th>
@@ -866,7 +866,7 @@ export default function RLPage() {
         ) : (
           <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
             <table className="w-full text-left text-xs">
-              <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+              <thead className="table-head uppercase">
                 <tr>
                   <th className="px-3 py-1.5">Pair</th>
                   <th className="px-3 py-1.5">Interval</th>
@@ -959,7 +959,7 @@ export default function RLPage() {
         {recentSignalsOpen && recentSignals.length > 0 && (
           <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
             <table className="w-full text-left text-sm">
-              <thead className="bg-zinc-50 text-xs uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+              <thead className="table-head text-xs uppercase">
                 <tr>
                   <th className="px-4 py-2">Pair</th>
                   <th className="px-4 py-2">Direction</th>
@@ -1016,7 +1016,7 @@ export default function RLPage() {
         {trainingHistoryOpen && policies.length > 0 && (
           <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
             <table className="w-full text-left text-sm">
-              <thead className="bg-zinc-50 text-xs uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+              <thead className="table-head text-xs uppercase">
                 <tr>
                   <th className="px-4 py-2">Pair</th>
                   <th className="px-4 py-2">Episodes</th>
@@ -1166,7 +1166,7 @@ function WeightsTable({ policy }: { policy: RLPolicy }) {
   return (
     <div className="mt-2 overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
       <table className="w-full text-left text-xs">
-        <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+        <thead className="table-head uppercase">
           <tr>
             <th className="px-3 py-1.5">Feature</th>
             {actions.map((a) => <th key={a} className="px-3 py-1.5">{a}</th>)}

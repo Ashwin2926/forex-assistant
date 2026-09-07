@@ -138,7 +138,7 @@ export default function BacktestPage() {
         </p>
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Run a backtest</h2>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           <Field label="Pair">
@@ -183,7 +183,7 @@ export default function BacktestPage() {
         )}
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Optimize (train/test validated)</h2>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Grid-searches RuleConfig on the first <code className="font-mono">train_frac</code> of
@@ -263,7 +263,7 @@ export default function BacktestPage() {
               <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">All candidates (train slice)</p>
               <div className="mt-1 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
                 <table className="w-full text-left text-xs">
-                  <thead className="bg-zinc-50 uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                  <thead className="table-head uppercase">
                     <tr>
                       <th className="px-3 py-1.5">EMA</th>
                       <th className="px-3 py-1.5">RSI</th>
@@ -309,7 +309,7 @@ export default function BacktestPage() {
       </section>
 
       {chartData.length > 1 && (
-        <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <section className="card p-4">
           <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Hit-rate over runs</h2>
           <div className="mt-3 h-64 w-full">
             <ResponsiveContainer width="100%" height="100%">
@@ -338,7 +338,7 @@ export default function BacktestPage() {
         )}
         <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
           <table className="w-full text-left text-sm">
-            <thead className="bg-zinc-50 text-xs uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+            <thead className="table-head text-xs uppercase">
               <tr>
                 <th className="px-4 py-2">Run</th>
                 <th className="px-4 py-2">Pair</th>

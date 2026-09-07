@@ -26,11 +26,18 @@ export function SideNav() {
           <Link
             key={href}
             href={href}
-            className={`rounded-md px-3 py-2 text-sm transition-colors ${
+            className="rounded-md px-3 py-2 text-sm transition-colors"
+            style={
               active
-                ? "bg-zinc-200 font-medium text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
-                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-900 dark:hover:text-zinc-100"
-            }`}
+                ? { background: "var(--accent-bg)", color: "var(--accent)", fontWeight: 500 }
+                : { color: "var(--text-muted)" }
+            }
+            onMouseEnter={(e) => {
+              if (!active) e.currentTarget.style.background = "var(--surface-sunken)";
+            }}
+            onMouseLeave={(e) => {
+              if (!active) e.currentTarget.style.background = "transparent";
+            }}
           >
             {label}
           </Link>

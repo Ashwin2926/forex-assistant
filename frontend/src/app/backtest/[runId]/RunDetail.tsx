@@ -72,7 +72,7 @@ export default function RunDetail({ runId }: { runId: string }) {
         </h2>
         <div className="mt-3 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
           <table className="w-full text-left text-sm">
-            <thead className="bg-zinc-50 text-xs uppercase text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+            <thead className="table-head text-xs uppercase">
               <tr>
                 <th className="px-4 py-2">Rule</th>
                 <th className="px-4 py-2">Fired</th>
@@ -110,7 +110,7 @@ export default function RunDetail({ runId }: { runId: string }) {
           {signals.map((s) => (
             <li
               key={s._id}
-              className="flex items-center justify-between rounded-lg border border-zinc-200 bg-white px-4 py-2 text-sm dark:border-zinc-800 dark:bg-zinc-900"
+              className="flex items-center justify-between card px-4 py-2 text-sm"
             >
               <div className="flex items-center gap-3">
                 <DirectionBadge direction={s.direction} />
@@ -134,7 +134,7 @@ export default function RunDetail({ runId }: { runId: string }) {
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900">
+    <div className="card p-3">
       <p className="text-xs text-zinc-500">{label}</p>
       <p className="mt-1 text-lg font-semibold">{value}</p>
     </div>

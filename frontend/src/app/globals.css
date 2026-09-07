@@ -1,36 +1,144 @@
 @import "tailwindcss";
 
+/*
+  Design tokens for the trading dashboard. Colors are chosen for what they mean, not
+  for decoration: buy/sell/hold map directly to the three things a signal can say, and
+  accent is reserved for primary actions/links so it doesn't compete with them. Light
+  mode uses a warm stone background (not pure white, not the generic cream), dark mode
+  uses a cool near-black navy in the vein of a trading terminal.
+*/
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg: #f6f6f3;
+  --surface: #ffffff;
+  --surface-sunken: #efefec;
+  --border: #e3e2dc;
+  --border-strong: #cfcec6;
+  --text: #1b1d1f;
+  --text-muted: #6b6f76;
+
+  --buy: #0e7c5f;
+  --buy-bg: #e3f4ec;
+  --sell: #c43d26;
+  --sell-bg: #fbeae5;
+  --hold: #8a6d1f;
+  --hold-bg: #f5efdd;
+  --accent: #2451c4;
+  --accent-bg: #e7eefc;
+  --accent-contrast: #ffffff;
+
+  --radius: 0.625rem;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --bg: #0d1117;
+    --surface: #131920;
+    --surface-sunken: #0a0e13;
+    --border: #232b34;
+    --border-strong: #313b47;
+    --text: #e7ecf1;
+    --text-muted: #8a93a0;
+
+    --buy: #3fbe94;
+    --buy-bg: rgba(63, 190, 148, 0.14);
+    --sell: #e8654b;
+    --sell-bg: rgba(232, 101, 75, 0.14);
+    --hold: #d6a73b;
+    --hold-bg: rgba(214, 167, 59, 0.14);
+    --accent: #5a8df0;
+    --accent-bg: rgba(90, 141, 240, 0.16);
+    --accent-contrast: #0d1117;
   }
 }
 
 body {
   font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* Tabular figures for anything that's actually a number -- prices, percentages,
+   confidence scores. Columns of digits should line up. */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono), ui-monospace, monospace;
 }
 
 @layer components {
+  .card {
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .table-head {
+    letter-spacing: 0.02em;
+    color: var(--text-muted);
+    background: var(--surface-sunken);
+  }
+
   .select {
-    @apply rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900;
+    border-radius: 0.5rem;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    padding: 0.375rem 0.5rem;
+    font-size: 0.875rem;
   }
+  .select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
   .btn-primary {
-    @apply rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300;
+    border-radius: 0.5rem;
+    padding: 0.375rem 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    background: var(--accent);
+    color: var(--accent-contrast);
+    transition: filter 120ms ease;
   }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.12);
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+  }
+
   .btn-secondary {
-    @apply rounded-md border border-zinc-300 px-3 py-1.5 text-sm font-medium transition-colors hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:hover:bg-zinc-800;
+    border-radius: 0.5rem;
+    padding: 0.375rem 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    transition: background-color 120ms ease;
   }
+  .btn-secondary:hover:not(:disabled) {
+    background: var(--surface-sunken);
+  }
+  .btn-secondary:disabled {
+    opacity: 0.5;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 9999px;
+    padding: 0.125rem 0.625rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+  }
+  .badge-buy { background: var(--buy-bg); color: var(--buy); }
+  .badge-sell { background: var(--sell-bg); color: var(--sell); }
+  .badge-hold { background: var(--hold-bg); color: var(--hold); }
+  .badge-neutral { background: var(--surface-sunken); color: var(--text-muted); }
 }

@@ -44,7 +44,7 @@ export default function LoginPage() {
             onChange={(e) => setUsername(e.target.value)}
             autoComplete="username"
             required
-            className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900"
+            className="select w-full outline-none focus:border-[var(--accent)]"
           />
         </div>
         <div className="flex flex-col gap-1">
@@ -58,14 +58,14 @@ export default function LoginPage() {
             onChange={(e) => setPassword(e.target.value)}
             autoComplete="current-password"
             required
-            className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900"
+            className="select w-full outline-none focus:border-[var(--accent)]"
           />
         </div>
         {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
         <button
           type="submit"
           disabled={busy}
-          className="rounded-md bg-zinc-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+          className="btn-primary w-full py-2 text-center"
         >
           {busy ? "Signing in..." : "Sign in"}
         </button>

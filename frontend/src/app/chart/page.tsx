@@ -124,7 +124,7 @@ export default function ChartPage() {
         </p>
       </section>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="card p-4">
         <div className="flex flex-wrap items-end gap-3">
           <Field label="Pair">
             <select value={pair} onChange={(e) => setPair(e.target.value)} className="select">
@@ -152,7 +152,7 @@ export default function ChartPage() {
       )}
 
       {chartData.length > 0 && (
-        <div className="viz-root flex flex-col gap-1 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <div className="viz-root flex flex-col gap-1 card p-4">
           <div className="mb-2 flex items-center gap-4 text-xs text-zinc-500 dark:text-zinc-400">
             <LegendSwatch color={COLOR.price[mode]} label="Close" line />
             <LegendSwatch color={COLOR.emaFast[mode]} label={`EMA fast`} line />
@@ -238,7 +238,7 @@ function LegendSwatch({ color, label, line }: { color: string; label: string; li
 function ChartTooltip({ active, payload, label, mode }: any) {
   if (!active || !payload?.length) return null;
   return (
-    <div className="rounded-md border border-zinc-200 bg-white px-3 py-2 text-xs shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
+    <div className="card px-3 py-2 text-xs shadow-sm">
       <p className="mb-1 font-medium text-zinc-700 dark:text-zinc-200">{label}</p>
       {payload.map((p: any) => (
         p.value != null && (

@@ -20,7 +20,8 @@ export function AuthNav() {
         clearToken();
         router.replace("/login");
       }}
-      className="whitespace-nowrap text-sm text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+      className="whitespace-nowrap text-sm transition-colors"
+      style={{ color: "var(--text-muted)" }}
     >
       Log out
     </button>
