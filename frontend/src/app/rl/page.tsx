@@ -2,11 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type PPOPolicy, type PPOTrainDiagnostics, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLSignal, type RLTrainAllCell, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type PPOPolicy, type PPOTrainDiagnostics, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
-// How long "Stop" stays disabled after a click, giving the client-side train-all loop (see
-// handleTrainAll) one iteration's worth of time to notice trainAllCancelRef and settle.
+// How often to poll GET /rl/train-all/{job_id} while a train-all run is in progress.
 const TRAIN_ALL_POLL_MS = 4000;
 
 interface GenerateAllCell {
@@ -122,7 +121,7 @@ export default function RLPage() {
 
   const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
   const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
-  const trainAllCancelRef = useRef(false);
+  const trainAllPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [expandedHistoryTrades, setExpandedHistoryTrades] = useState<string | null>(null);
   const [tradeLogs, setTradeLogs] = useState<Record<string, Signal[]>>({});
@@ -192,6 +191,29 @@ export default function RLPage() {
     return () => clearInterval(id);
   }, []);
 
+  // Rehydrates the last train-all run (server-persisted, GitHub-Actions-backed -- see
+  // POST /rl/train-all) on mount/reload so trainingConfidence below has real data
+  // immediately instead of staying empty until someone manually clicks "Train all" again
+  // in this exact tab. Resumes polling if that run is still in progress (e.g. the page was
+  // reloaded mid-run).
+  useEffect(() => {
+    (async () => {
+      try {
+        const job = await api.getLatestTrainAllRLJob();
+        if (job) {
+          setTrainAllJob(job);
+          if (job.status === "running") pollTrainAllJob(job.job_id);
+        }
+      } catch {
+        // non-critical section
+      }
+    })();
+    return () => {
+      if (trainAllPollRef.current) clearInterval(trainAllPollRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function handleTrain() {
     setTraining(true);
     setTrainError(null);
@@ -206,56 +228,57 @@ export default function RLPage() {
     }
   }
 
-  // Client-driven sequential loop, NOT the backend's POST /rl/train-all + BackgroundTasks job
-  // (still there server-side, unused from here) -- that mechanism relies on a background
-  // coroutine outliving the request that scheduled it, which this project has already been
-  // burned by once before (see keep-fresh.yml's own history: the in-process APScheduler died
-  // the same way whenever FastAPI Cloud recycled the instance right after a response went
-  // out). This mirrors handleGenerateAll below, which uses the same pattern for the same
-  // reason and is the one batch flow on this page that's never gotten stuck.
+  // Server-side job (POST /rl/train-all), backed by a GitHub Actions run
+  // (.github/workflows/train-rl.yml) rather than FastAPI's BackgroundTasks -- the earlier
+  // client-side loop this replaced existed specifically because BackgroundTasks didn't
+  // reliably survive on FastAPI Cloud (see keep-fresh.yml's own history: the in-process
+  // APScheduler died the same way). Training now actually executes on a GitHub Actions
+  // runner instead of inside the backend process, so this can go back to "start a job,
+  // poll it" without that risk -- and unlike the client-side version, this survives the tab
+  // being closed, and rehydrates on reload (see the mount effect above).
+  function pollTrainAllJob(jobId: string) {
+    if (trainAllPollRef.current) clearInterval(trainAllPollRef.current);
+    trainAllPollRef.current = setInterval(async () => {
+      try {
+        const job = await api.getTrainAllRLJob(jobId);
+        setTrainAllJob(job);
+        if (job.status !== "running") {
+          if (trainAllPollRef.current) clearInterval(trainAllPollRef.current);
+          trainAllPollRef.current = null;
+          await loadPolicies();
+        }
+      } catch {
+        // transient poll failure -- try again next tick rather than aborting the whole poll
+      }
+    }, TRAIN_ALL_POLL_MS);
+  }
+
   async function handleTrainAll() {
     setTrainAllStartError(null);
-    trainAllCancelRef.current = false;
-    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
-    const results: RLTrainAllCell[] = [];
-    setTrainAllJob({
-      job_id: "client-local", status: "running", created_at: new Date().toISOString(),
-      total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance,
-      total: combos.length, completed: 0, results: [], cancel_requested: false,
-    });
-    for (const { pair: p, interval: i } of combos) {
-      if (trainAllCancelRef.current) break;
-      try {
-        const { policy, evaluation } = await api.trainRLPolicy(p, i, {
-          total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance,
-        });
-        results.push({
-          pair: p, interval: i, ok: true, policy_id: policy.policy_id,
-          hit_rate_pct: evaluation.hit_rate_pct, expectancy_pct: evaluation.expectancy_pct,
-          directional_signals: evaluation.directional_signals, hold_signals: evaluation.hold_signals,
-          starting_balance: evaluation.starting_balance, ending_balance: evaluation.ending_balance,
-          total_return_pct: evaluation.total_return_pct,
-        });
-      } catch (e) {
-        results.push({ pair: p, interval: i, ok: false, error: e instanceof ApiError ? e.message : "Failed" });
-      }
-      setTrainAllJob((prev) => prev && ({ ...prev, completed: results.length, results: [...results] }));
+    try {
+      const job = await api.startTrainAllRL({ total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance });
+      setTrainAllJob(job);
+      pollTrainAllJob(job.job_id);
+    } catch (e) {
+      setTrainAllStartError(e instanceof ApiError ? e.message : "Failed to start training.");
     }
-    setTrainAllJob((prev) => prev && ({
-      ...prev, status: trainAllCancelRef.current ? "cancelled" : "done", finished_at: new Date().toISOString(),
-    }));
-    await loadPolicies();
   }
 
   const [cancelling, setCancelling] = useState(false);
 
-  function handleCancelTrainAll() {
-    trainAllCancelRef.current = true;
+  async function handleCancelTrainAll() {
+    if (!trainAllJob) return;
     setCancelling(true);
-    // The loop itself flips status to "cancelled" once it notices this flag between combos
-    // (a combo already in flight always finishes -- no PPO training call can be interrupted
-    // mid-run) -- clear the transient button state once that catches up.
-    setTimeout(() => setCancelling(false), TRAIN_ALL_POLL_MS);
+    try {
+      const job = await api.cancelTrainAllRLJob(trainAllJob.job_id);
+      setTrainAllJob(job);
+      if (trainAllPollRef.current) clearInterval(trainAllPollRef.current);
+      trainAllPollRef.current = null;
+    } catch (e) {
+      setTrainAllStartError(e instanceof ApiError ? e.message : "Failed to cancel.");
+    } finally {
+      setCancelling(false);
+    }
   }
 
   const trainAllRunning = trainAllJob?.status === "running";
@@ -570,9 +593,9 @@ export default function RLPage() {
           <div className="flex items-center justify-between">
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Or train all 4 pairs &times; 5 intervals at once (using the settings above) —
-              same thing the cron does once daily, run on demand. Runs as a sequence of
-              requests from this tab (usually ~5-6 minutes total) — keep this tab open until
-              it finishes; closing it stops the run partway through.
+              same thing the cron does once daily, run on demand. Runs server-side on GitHub
+              Actions (usually ~5-6 minutes total) — safe to close this tab or navigate away;
+              reopening this page picks the run back up.
             </p>
             <div className="flex shrink-0 items-center gap-2">
               <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">
