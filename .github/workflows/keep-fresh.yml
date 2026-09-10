@@ -151,34 +151,17 @@ jobs:
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train"
       # RL agent (app/services/rl_engine.py) -- a learned, adaptive alternative to consensus's
       # fixed weighted-vote threshold over the same 7 strategies. Covers all 5 intervals, one
-      # independent policy per pair PER interval. Training (many epsilon-greedy episodes over
-      # each interval's full candle history) is the heavy part -- gated to once daily across
-      # every pair/interval regardless of that interval's own candle cadence, unlike ML's
-      # near-instant retrain above; there's no reason to train more than once a day even for
-      # 5min/15min, since a policy doesn't need to be as fresh as the candles it reads.
-      # Generate + score follow each interval's own natural cadence (same split already used
-      # for ingest/generate/consensus above) since that part is cheap -- a handful of strategy
-      # evaluations on the latest candle, not a training run. Paper-trade execution was
-      # removed entirely (Deriv isn't available in every region) -- RL signals are sized (lot
-      # size) and traded manually instead, see the RL page.
-      # -f dropped (replaced with a plain -s + `|| true` per call) here specifically after a
-      # live failure: one transient 500 on a single pair/interval (confirmed non-reproducible
-      # -- the exact same call succeeded immediately on retry) aborted this whole step under
-      # `-f`, which cascaded into skipping every downstream RL step (generate + score) for the
-      # entire cron cycle since GitHub Actions stops a job on a failed step by default. 20
-      # sequential ~60-90s CPU-heavy training calls is exactly the kind of sustained load
-      # where one transient hiccup is expected occasionally -- it shouldn't take the rest of
-      # the day's RL pipeline down with it. Same reasoning as the "Generate RL signals" steps
-      # below, which already use this pattern for a different reason (expected 400s).
-      - name: Train RL policy (all intervals)
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
-        run: |
-          for interval in 5min 15min 1h 4h 1day; do
-            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-              curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-                "$API_BASE/rl/train/$interval?pair=${pair/\//%2F}" -o /dev/null || true
-            done
-          done
+      # independent policy per pair PER interval. Training itself no longer happens here --
+      # see .github/workflows/train-rl.yml and PROGRESS.md's 2026-09-10 entry: looping 20
+      # sequential ~60-90s synchronous /rl/train calls from this workflow already produced a
+      # documented 524, so training moved to its own workflow that runs the actual PPO code
+      # directly on the runner instead of relaying through the API. Generate + score below
+      # still follow each interval's own natural cadence (same split already used for
+      # ingest/generate/consensus above) since that part is cheap -- a handful of strategy
+      # evaluations on the latest candle against whatever policy train-rl.yml last produced,
+      # not a training run. Paper-trade execution was removed entirely (Deriv isn't available
+      # in every region) -- RL signals are sized (lot size) and traded manually instead, see
+      # the RL page.
       # -f is deliberately dropped (replaced with a plain -s + `|| true` per call) on these
       # four steps only: unlike ingest/score, a 400 "no trained policy yet" here is an
       # expected, self-resolving state -- e.g. right after this cron first started running

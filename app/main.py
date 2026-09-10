@@ -5,6 +5,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 import asyncio
 import uuid
+import httpx
 import pandas as pd
 
 from app.core.config import get_settings
@@ -1032,6 +1033,13 @@ async def train_rl(
     here by simply looping client-side is what used to make the frontend's "Train all" a
     ~15-minute sequence of fetches the browser tab had to hold open the whole time.
 
+    Runs synchronously, in-process, on FastAPI Cloud -- a single combo already takes 60-90s
+    and has previously 524'd against the platform's gateway/proxy timeout (see PROGRESS.md's
+    2026-09-10 entry). Nothing automated calls this anymore (.github/workflows/train-rl.yml
+    and /rl/train-all both go through scripts/train_rl.py on a GitHub Actions runner
+    instead) -- kept only as a manual/dev escape hatch, expect it to be slow and treat an
+    occasional timeout as a known risk, not a bug to chase here.
+
     No warm start (unlike the retired linear policy) -- every call trains a fresh PPO model
     from total_timesteps real environment steps, it doesn't continue a prior run's weights.
 
@@ -1053,67 +1061,58 @@ async def train_rl(
     }
 
 
-async def run_train_all_job(job_id: str, total_timesteps: int, train_frac: float, starting_balance: float):
+async def _trigger_rl_train_workflow(job_id: str, total_timesteps: int, train_frac: float, starting_balance: float):
     """
-    The actual batch loop, scheduled via BackgroundTasks from POST /rl/train-all so it keeps
-    running after that request has already returned -- trains every pair x interval
-    combination sequentially (same set .github/workflows/keep-fresh.yml's cron trains once
-    daily), writing progress to rl_train_jobs_collection after each combo so GET
-    /rl/train-all/{job_id} always reflects real progress, not just "still running somewhere."
+    Dispatches .github/workflows/train-rl.yml via GitHub's REST API instead of training
+    in-process -- see PROGRESS.md's 2026-09-10 entry. Training every pair x interval used to
+    run here via BackgroundTasks (run_train_all_job, removed), which works for surviving the
+    *triggering request* returning early but not for surviving the FastAPI Cloud instance
+    itself being recycled mid-run -- the same failure class that killed the old in-process
+    APScheduler ingestion cron. The GitHub Actions runner this dispatches to doesn't have
+    that problem, and scripts/train_rl.py there runs the identical training/persistence code
+    this endpoint used to call directly.
 
-    Checks cancel_requested before starting each combo (cheap, single-doc lookup) so
-    POST /rl/train-all/{job_id}/cancel can stop it -- cooperative, not preemptive: a combo
-    already in flight always finishes (train_ppo_policy can't be interrupted mid-call without
-    much more complexity) UNLESS it hangs outright (seen in practice with the prior linear
-    policy: a single combo running 60+ minutes when the whole 20-combo job should take
-    ~15-30), in which case this loop's own "next combo" check never runs at all. POST
-    .../cancel therefore also force-marks the job cancelled immediately, not just requests it
-    -- see that endpoint's docstring. Every write here is filtered on
-    {"job_id": job_id, "status": "running"} specifically so that if a force-cancelled job's
-    stuck combo eventually wakes up and finishes on its own, its leftover result/completion
-    writes become no-ops instead of silently resurrecting a job the user already told to stop.
+    Requires settings.github_pat (a PAT with the `workflow` scope -- NOT the read-only
+    Actions-log PAT noted in project memory; check scope before reusing it) and
+    settings.github_repo ("owner/repo"). Raises HTTPException on any non-204 response so the
+    caller gets a real error instead of a job_id nothing will ever update.
     """
-    for pair in settings.pairs_list:
-        for interval in RL_INTERVALS:
-            job_doc = await rl_train_jobs_collection.find_one({"job_id": job_id}, {"status": 1})
-            if not job_doc or job_doc.get("status") != "running":
-                return  # already cancelled (cooperatively or forced) -- stop here
-            try:
-                policy, eval_run, _poc_diagnostics = await _run_rl_training(
-                    pair, interval, total_timesteps, train_frac, max_lookforward=20, starting_balance=starting_balance,
-                )
-                cell = RLTrainAllCell(
-                    pair=pair, interval=interval, ok=True, policy_id=policy.policy_id,
-                    hit_rate_pct=eval_run.hit_rate_pct, expectancy_pct=eval_run.expectancy_pct,
-                    directional_signals=eval_run.directional_signals, hold_signals=eval_run.hold_signals,
-                    starting_balance=eval_run.starting_balance, ending_balance=eval_run.ending_balance,
-                    total_return_pct=eval_run.total_return_pct,
-                )
-            except Exception as e:
-                cell = RLTrainAllCell(pair=pair, interval=interval, ok=False, error=str(e))
-            await rl_train_jobs_collection.update_one(
-                {"job_id": job_id, "status": "running"},
-                {"$push": {"results": cell.model_dump()}, "$inc": {"completed": 1}},
-            )
-    await rl_train_jobs_collection.update_one(
-        {"job_id": job_id, "status": "running"},
-        {"$set": {"status": "done", "finished_at": datetime.utcnow()}},
-    )
+    if not settings.github_pat or not settings.github_repo:
+        raise HTTPException(
+            status_code=500,
+            detail="github_pat/github_repo not configured -- can't dispatch .github/workflows/train-rl.yml.",
+        )
+    url = f"https://api.github.com/repos/{settings.github_repo}/actions/workflows/train-rl.yml/dispatches"
+    payload = {
+        # master, not main -- see CLAUDE.md's deploy notes for this repo's default branch.
+        "ref": "master",
+        "inputs": {
+            "job_id": job_id,
+            "total_timesteps": str(total_timesteps),
+            "train_frac": str(train_frac),
+            "starting_balance": str(starting_balance),
+        },
+    }
+    headers = {"Authorization": f"Bearer {settings.github_pat}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+    if resp.status_code != 204:
+        raise HTTPException(
+            status_code=502, detail=f"GitHub workflow_dispatch failed ({resp.status_code}): {resp.text[:300]}",
+        )
 
 
 @app.post("/rl/train-all")
 async def train_rl_all(
-    background_tasks: BackgroundTasks,
     total_timesteps: int = 50_000, train_frac: float = 0.7, starting_balance: float = DEFAULT_STARTING_BALANCE,
 ):
     """
-    Starts training every pair x interval combination (the same set the daily cron trains) as
-    a server-side background job and returns immediately with a job_id -- poll GET
-    /rl/train-all/{job_id} for progress. Runs server-side specifically so the total duration
-    (20 combos) doesn't depend on the triggering browser tab staying open, foregrounded, or
-    connected the whole time; a frontend-driven version holding 20 sequential fetches open in
-    the tab would abandon the run silently on a lost connection partway through (mobile screen
-    lock, backgrounding, a network switch).
+    Triggers training every pair x interval combination (the same set the daily cron trains)
+    on a GitHub Actions runner (.github/workflows/train-rl.yml) and returns immediately with
+    a job_id -- poll GET /rl/train-all/{job_id} for progress, same as before. Training used to
+    run here in-process via BackgroundTasks; moved off FastAPI Cloud entirely (see
+    PROGRESS.md's 2026-09-10 entry) so a 20-combo, ~20-30 minute run can't be cut short by an
+    instance recycle or a gateway/proxy timeout on any individual combo.
     """
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
@@ -1121,13 +1120,13 @@ async def train_rl_all(
         raise HTTPException(status_code=400, detail="starting_balance must be positive.")
 
     job_id = uuid.uuid4().hex[:12]
+    await _trigger_rl_train_workflow(job_id, total_timesteps, train_frac, starting_balance)
     job = RLTrainAllJob(
         job_id=job_id, status="running", created_at=datetime.utcnow(),
         total_timesteps=total_timesteps, train_frac=train_frac, starting_balance=starting_balance,
         total=len(settings.pairs_list) * len(RL_INTERVALS),
     )
     await rl_train_jobs_collection.insert_one(job.model_dump())
-    background_tasks.add_task(run_train_all_job, job_id, total_timesteps, train_frac, starting_balance)
     return job
 
 
@@ -1143,16 +1142,19 @@ async def get_train_all_job(job_id: str):
 async def cancel_train_all_job(job_id: str):
     """
     Immediately marks a running train-all job "cancelled" -- not just a request the loop
-    picks up between combos. Originally this only set cancel_requested and waited for
-    run_train_all_job's own between-combo check, but that's a no-op if the in-flight combo
-    hangs outright rather than just running long (seen in practice: a single pair/interval
-    stuck for 60+ minutes with the whole job normally taking ~15-30). Since a hung combo
-    means that background task's own coroutine will never come back around to check a flag,
-    this endpoint updates the job document directly instead of waiting for it to.
+    picks up between combos. Originally this only set cancel_requested and waited for the
+    old in-process training loop's own between-combo check, but that's a no-op if the
+    in-flight combo hangs outright rather than just running long (seen in practice: a single
+    pair/interval stuck for 60+ minutes with the whole job normally taking ~15-30). Training
+    now runs on a GitHub Actions runner (scripts/train_rl.py, see PROGRESS.md's 2026-09-10
+    entry) rather than an in-process background task, but the same cooperative-cancel gap
+    applies there too -- the script only checks this job doc's status between combos, so this
+    endpoint still updates the document directly rather than waiting for that check to land.
 
     Already-completed combos and their trained policies are kept, not rolled back; only the
-    remaining ones are skipped. If the stuck combo eventually finishes on its own after this,
-    its leftover write is a no-op -- see run_train_all_job's status="running" write guard.
+    remaining ones are skipped. If a combo already in flight on the runner finishes anyway
+    after this, its leftover write is a no-op -- see scripts/train_rl.py's
+    status="running" write guard.
     """
     doc = await rl_train_jobs_collection.find_one({"job_id": job_id})
     if not doc:
@@ -1989,10 +1991,16 @@ async def _retrain_degraded_policy_background(pair: str, interval: str) -> None:
     BackgroundTasks target for a degradation-triggered retrain -- a thin wrapper around
     _run_rl_training so a failure here (e.g. a transient DB hiccup) doesn't surface as an
     unhandled exception in server logs with no useful destination; same "don't let a
-    best-effort background job crash noisily" reasoning as run_train_all_job's own per-combo
-    try/except. Nothing to report the error TO here (unlike train-all, there's no job
+    best-effort background job crash noisily" reasoning every per-combo try/except in this
+    file uses. Nothing to report the error TO here (unlike train-all, there's no job
     document this is updating) -- silently skipping means it simply gets caught again by
     the NEXT /rl/score cycle's degradation check, on already-fresh data.
+
+    Deliberately NOT delegated to the GitHub Actions workflow the way POST /rl/train-all and
+    _run_all_flows_job's RL-training phase now are (see PROGRESS.md's 2026-09-10 entry) --
+    this is a single combo (60-90s), not a 20-combo/~20-30min batch, so the in-process
+    recycle risk that motivated moving those two is far smaller here; revisit if this ever
+    proves otherwise in practice.
     """
     try:
         await _run_rl_training(pair, interval, 50_000, 0.7, 20, DEFAULT_STARTING_BALANCE)
@@ -2205,7 +2213,7 @@ async def _run_all_flows_job(job_id: str) -> None:
     already sent) specifically because the full sequence can take well over Cloudflare's
     ~100s proxy timeout, the same 524 this project already hit with a single /rl/train call
     -- a synchronous request/response here would just be a bigger version of that same
-    problem, not a fix. Same "persist a job doc, poll it" pattern as run_train_all_job.
+    problem, not a fix. Same "persist a job doc, poll it" pattern POST /rl/train-all uses.
 
     Writes progress after every checkpoint (_run_all_flows_step) and wraps the entire body
     in try/except -- found live: users reported this "sometimes getting stuck or not
@@ -2255,21 +2263,49 @@ async def _run_all_flows_job(job_id: str) -> None:
             if not await _run_all_flows_step(job_id, results, f"ingest {interval}"):
                 return
 
-        for interval in RL_INTERVALS:
-            for pair in settings.pairs_list:
-                key = f"{pair}/{interval}"
-                try:
-                    policy, eval_run, _poc_diagnostics = await _run_rl_training(
-                        pair, interval, 50_000, 0.7, max_lookforward=20, starting_balance=DEFAULT_STARTING_BALANCE,
-                    )
-                    results["rl_training"][key] = {
-                        "policy_id": policy.policy_id, "hit_rate_pct": eval_run.hit_rate_pct,
-                        "total_return_pct": eval_run.total_return_pct,
-                    }
-                except Exception as e:
-                    results["rl_training"][key] = f"error: {e}"
+        # Delegates to the same GitHub Actions workflow POST /rl/train-all uses (see
+        # _trigger_rl_train_workflow and PROGRESS.md's 2026-09-10 entry) instead of calling
+        # _run_rl_training in-process -- this loop used to be the other in-process,
+        # BackgroundTasks-scheduled 20-combo PPO training path, carrying the same "may not
+        # survive an instance recycle" risk /rl/train-all had. Polling rl_train_jobs_collection
+        # every 15s is cheap (a single-doc lookup, no CPU-heavy work) so it doesn't reintroduce
+        # that risk itself -- and even if THIS job's polling loop were interrupted by a recycle,
+        # the actual training keeps running on the GitHub Actions runner and its results still
+        # land in ppo_policies_collection regardless, unlike the old in-process version where an
+        # interrupted loop meant losing whatever combo was mid-training.
+        rl_job_id = uuid.uuid4().hex[:12]
+        await _trigger_rl_train_workflow(rl_job_id, 50_000, 0.7, DEFAULT_STARTING_BALANCE)
+        seen = 0
+        while True:
+            await asyncio.sleep(15)
+            rl_job_doc = await rl_train_jobs_collection.find_one({"job_id": rl_job_id})
+            if not rl_job_doc:
+                continue  # scripts/train_rl.py hasn't created its job doc yet -- keep waiting
+            cancelled = False
+            for cell in rl_job_doc.get("results", [])[seen:]:
+                key = f"{cell['pair']}/{cell['interval']}"
+                results["rl_training"][key] = (
+                    {
+                        "policy_id": cell.get("policy_id"), "hit_rate_pct": cell.get("hit_rate_pct"),
+                        "total_return_pct": cell.get("total_return_pct"),
+                    } if cell.get("ok") else f"error: {cell.get('error')}"
+                )
                 if not await _run_all_flows_step(job_id, results, f"train {key}"):
-                    return
+                    cancelled = True
+                    break
+            seen = len(rl_job_doc.get("results", []))
+            if cancelled:
+                # Cancelling THIS run-all-flows job should also stop the still-running GitHub
+                # Actions training run -- same status="running" write guard/cooperative-cancel
+                # mechanism POST /rl/train-all/{job_id}/cancel already uses; scripts/train_rl.py
+                # checks this before starting each remaining combo.
+                await rl_train_jobs_collection.update_one(
+                    {"job_id": rl_job_id, "status": "running"},
+                    {"$set": {"status": "cancelled", "finished_at": datetime.utcnow()}},
+                )
+                return
+            if rl_job_doc.get("status") != "running":
+                break
 
         for interval in RL_INTERVALS:
             profile = "intraday"

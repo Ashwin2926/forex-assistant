@@ -1,0 +1,75 @@
+name: Train RL policy (PPO)
+
+# Runs PPO training directly on this runner instead of inside the FastAPI Cloud process --
+# see PROGRESS.md's 2026-09-10 entry. keep-fresh.yml used to drive this by looping curl
+# calls against the synchronous POST /rl/train/{interval} for all 20 pair/interval combos
+# (60-90s each), which already produced a documented 524 from FastAPI Cloud's gateway.
+# scripts/train_rl.py reuses the exact same training/persistence code that endpoint calls,
+# just run here where a 20-30 minute job is normal, not something fighting a ~60s request
+# timeout or an in-process background task that might not survive an instance recycle.
+#
+# Schedule matches keep-fresh.yml's old once-daily RL slot (11 0 * * *, i.e. right after
+# that workflow's own daily 1day-candle ingest) -- a policy doesn't need to be as fresh as
+# the candles it reads, see keep-fresh.yml's own RL step comment for why once a day is
+# plenty even for 5min/15min policies.
+on:
+  schedule:
+    - cron: "20 0 * * *"
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "rl_train_jobs_collection job id to report progress into (POST /rl/train-all passes this; a manual run can leave it blank)."
+        required: false
+      pair:
+        description: "Single pair, e.g. EUR/USD. Leave blank (with interval) to train every pair x interval."
+        required: false
+      interval:
+        description: "Single interval, e.g. 5min. Leave blank (with pair) to train every pair x interval."
+        required: false
+      total_timesteps:
+        description: "PPO total_timesteps per combo."
+        required: false
+        default: "50000"
+      train_frac:
+        description: "Chronological train/test split fraction."
+        required: false
+        default: "0.7"
+      starting_balance:
+        description: "Starting account balance for the compounding-reward eval."
+        required: false
+        default: "50"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    # Training every pair x interval can take ~20-30 minutes (same duration the old
+    # in-process /rl/train-all job documented) -- default 6h job timeout is more than
+    # enough headroom, no override needed.
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+      FOREX_PAIRS: ${{ secrets.FOREX_PAIRS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Train
+        # Built as a bash array instead of inline GH expression ternaries -- inputs.* is
+        # unset entirely on a schedule-triggered run (no workflow_dispatch event), and empty
+        # GH-expression conditionals left as literal blank lines in a `\`-continued command
+        # are easy to get subtly wrong; plain -n checks here are simpler to get right.
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          PAIR: ${{ inputs.pair }}
+          INTERVAL: ${{ inputs.interval }}
+          TOTAL_TIMESTEPS: ${{ inputs.total_timesteps || '50000' }}
+          TRAIN_FRAC: ${{ inputs.train_frac || '0.7' }}
+          STARTING_BALANCE: ${{ inputs.starting_balance || '50' }}
+        run: |
+          args=(--total-timesteps "$TOTAL_TIMESTEPS" --train-frac "$TRAIN_FRAC" --starting-balance "$STARTING_BALANCE")
+          if [ -n "$JOB_ID" ]; then args+=(--job-id "$JOB_ID"); fi
+          if [ -n "$PAIR" ] && [ -n "$INTERVAL" ]; then args+=(--pair "$PAIR" --interval "$INTERVAL"); fi
+          python scripts/train_rl.py "${args[@]}"

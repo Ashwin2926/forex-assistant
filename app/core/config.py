@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # one. Either value alone is sufficient to authenticate as a service caller.
     auth_secret_key3: str = ""
 
+    # Triggers .github/workflows/train-rl.yml's workflow_dispatch from POST /rl/train-all
+    # (see PROGRESS.md's 2026-09-10 entry) instead of training in-process -- needs a PAT with
+    # the `workflow` scope (a read-only Actions-log PAT is NOT sufficient; check scope before
+    # reusing an existing one). github_repo is "owner/repo", e.g. "someuser/forex-assistant".
+    github_pat: str = ""
+    github_repo: str = ""
+
     @property
     def pairs_list(self) -> list[str]:
         return [p.strip() for p in self.forex_pairs.split(",")]

@@ -4,6 +4,31 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-10
+
+**Decided: move PPO training execution off FastAPI Cloud entirely, into GitHub Actions.**
+
+`keep-fresh.yml`'s "Train RL policy" step drives all 20 pair/interval combos sequentially
+against the synchronous `POST /rl/train/{interval}` (not the async `/rl/train-all` job) —
+each combo already takes 60-90s, and this has already produced a documented 524 from
+FastAPI Cloud's gateway/Cloudflare proxy timeout. The existing async path
+(`POST /rl/train-all`, `BackgroundTasks` + `rl_train_jobs_collection` job doc) avoids that
+symptom but still runs training *inside* the FastAPI Cloud process — the same failure
+class that silently killed the old in-process APScheduler ingestion cron (nothing
+guarantees `BackgroundTasks` survives an instance recycle mid-run, and this has never been
+verified live).
+
+Considered two fixes: (1) keep training in-process, just retarget the cron to poll
+`/rl/train-all` instead of looping the synchronous endpoint — small change, but leaves the
+unverified `BackgroundTasks`-survives-recycling assumption in place; (2) move actual PPO
+training compute onto the GitHub Actions runner itself, the same reasoning that already
+moved ingestion off in-process APScheduler, applied one level deeper. Chose (2) — full
+design in the plan file this session used (`scripts/train_rl.py` reusing
+`ppo_engine.train_ppo_policy` directly via a sync `pymongo` client, a new
+`.github/workflows/train-rl.yml` on its own daily schedule + `workflow_dispatch`, and
+`POST /rl/train-all` changed to trigger that workflow via GitHub's REST API instead of
+`BackgroundTasks`). Implementation in progress — see git log for what actually landed.
+
 ## 2026-09-07 (cont.)
 
 **Restored ingest/generate/consensus/RL for 1h/4h/1day — they were still fully paused
