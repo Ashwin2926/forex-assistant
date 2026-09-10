@@ -182,6 +182,43 @@ export interface RLPolicy {
   } | null;
 }
 
+// Signal Stack v2 phase 3 -- this project's second RL agent, PPO (stable-baselines3), trained
+// against the exact same replay mechanics RLPolicy's linear Q-learning uses. Separate model/
+// collection/page from RLPolicy on purpose (see app/models/schemas.py's PPOPolicy) -- additive
+// alongside the linear agent, not a replacement for it. model_bytes (the serialized neural
+// network) never appears here -- the backend excludes it from every response that returns this.
+export interface PPOPolicy {
+  _id?: string;
+  policy_id: string;
+  pair: string;
+  interval: string;
+  created_at: string;
+  feature_names: string[];
+  eval_run_id: string;
+  starting_balance: number;
+  total_timesteps: number;
+  // Only present from GET /rl/ppo/policies (enriched server-side from the linked BacktestRun)
+  // -- absent on the PPOPolicy returned directly by POST /rl/train-ppo.
+  evaluation?: {
+    hit_rate_pct: number | null;
+    expectancy_pct: number | null;
+    directional_signals: number;
+    hold_signals: number;
+    starting_balance: number | null;
+    ending_balance: number | null;
+    total_return_pct: number | null;
+  } | null;
+}
+
+// Proof-of-concept sanity checks POST /rl/train-ppo returns alongside every real training
+// run, not just ppo_engine.py's own synthetic-data smoke test -- see that endpoint's docstring.
+export interface PPOTrainDiagnostics {
+  beats_random: boolean;
+  model_size_bytes: number;
+  save_load_latency_ms: number;
+  random_baseline_total_return_pct: number | null;
+}
+
 export interface RLTrainAllCell {
   pair: string;
   interval: string;
@@ -229,6 +266,12 @@ export interface RLSignal {
   stop_price: number;
   q_values: Record<string, number>;
   policy_id: string;
+  // Which RL agent produced this signal -- "linear_q" (rl_policies_collection) or "ppo"
+  // (ppo_policies_collection, see PPOPolicy). Absent on any signal generated before PPO
+  // existed; treat a missing value the same as "linear_q" (that's the backend's own default).
+  // For a PPO signal, q_values holds the policy's action-probability distribution instead of
+  // actual Q-values -- same shape, different number underneath (see PPOPolicy's own comment).
+  algo?: "linear_q" | "ppo";
   // The state vector this decision was made from -- see app/services/case_memory.py. Absent
   // on pre-existing signals the same way size_tier etc. can be, below.
   state?: number[];

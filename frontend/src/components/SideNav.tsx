@@ -12,6 +12,7 @@ const LINKS = [
   { href: "/paper-trade", label: "Paper Trading" },
   { href: "/ml", label: "ML" },
   { href: "/rl", label: "RL Agent" },
+  { href: "/rl-ppo", label: "PPO Agent" },
 ];
 
 export function SideNav() {

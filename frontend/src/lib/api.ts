@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
+import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicy, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -292,6 +292,53 @@ export const api = {
     const qs = maxLookforward !== undefined ? `?max_lookforward=${maxLookforward}` : "";
     return request<{ hit: number; miss: number; expired: number; still_pending: number; skipped_no_data: number }>(
       `/rl/score${qs}`, { method: "POST" },
+    );
+  },
+
+  // Signal Stack v2 phase 3 -- PPO, this project's second RL agent, additive alongside the
+  // linear Q-learning one above (POST /rl/train / POST /rl/signal are untouched by any of
+  // this). See app/services/ppo_engine.py and PPOPolicy's own comment for why it's a
+  // separate model/collection rather than a variant of RLPolicy.
+  trainPPOPolicy(
+    pair: string,
+    interval: string,
+    opts: { total_timesteps?: number; train_frac?: number; max_lookforward?: number; starting_balance?: number; random_seed?: number } = {},
+  ) {
+    const qs = new URLSearchParams({ pair });
+    if (opts.total_timesteps !== undefined) qs.set("total_timesteps", String(opts.total_timesteps));
+    if (opts.train_frac !== undefined) qs.set("train_frac", String(opts.train_frac));
+    if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
+    if (opts.starting_balance !== undefined) qs.set("starting_balance", String(opts.starting_balance));
+    if (opts.random_seed !== undefined) qs.set("random_seed", String(opts.random_seed));
+    return request<{ policy: PPOPolicy; evaluation: BacktestRun; poc_diagnostics: PPOTrainDiagnostics }>(
+      `/rl/train-ppo/${interval}?${qs.toString()}`,
+      { method: "POST" },
+    );
+  },
+
+  listPPOPolicies(params: { pair?: string; interval?: string; limit?: number } = {}) {
+    const qs = new URLSearchParams();
+    if (params.pair) qs.set("pair", params.pair);
+    if (params.interval) qs.set("interval", params.interval);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const query = qs.toString();
+    return request<PPOPolicy[]>(`/rl/ppo/policies${query ? `?${query}` : ""}`);
+  },
+
+  generatePPOSignal(pair: string, interval: string, balance?: number) {
+    // pair goes in the query string, not the path — a literal '/' in a path segment
+    // breaks Starlette's routing even when percent-encoded.
+    const qs = new URLSearchParams({ pair });
+    if (balance !== undefined) qs.set("balance", String(balance));
+    // q_values here holds PPO's action-probability distribution, not actual Q-values -- same
+    // shape as generateRLSignal's response, see RLSignal.algo's own comment in types.ts.
+    return request<{
+      signal: RLSignal | null; q_values: Record<string, number>;
+      memory?: RLMemorySummary; memory_override?: string | null;
+      excluded_reason?: string | null; ml_blocked_reason?: string | null;
+    }>(
+      `/rl/signal-ppo/${interval}?${qs.toString()}`,
+      { method: "POST" },
     );
   },
 
