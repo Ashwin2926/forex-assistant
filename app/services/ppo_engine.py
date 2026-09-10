@@ -1,18 +1,29 @@
 """
-Proof-of-concept only (Signal Stack v2, phase 3a) -- NOT wired into any live endpoint yet.
+Signal Stack v2, phase 3 -- this project's second RL agent, PPO (stable-baselines3) via a
+thin gymnasium.Env adapter, trained against the exact same replay mechanics
+rl_engine.train_rl_policy already uses for its LinearQPolicy: the same _take_action_sized
+reward logic, the same compute_strategy_vote_states/compute_ml_scores market-state features,
+the same chronological_train_test_split/frozen_ml_snapshot lookahead-bias discipline. This
+module reuses every one of those pieces rather than reimplementing them -- the env is an
+adapter, not a rewrite, per the plan this was built against.
 
-Trains a PPO agent (stable-baselines3, via a thin gymnasium.Env adapter) against the exact
-same replay mechanics rl_engine.train_rl_policy already uses for its LinearQPolicy: the same
-_take_action_sized reward logic, the same compute_strategy_vote_states/compute_ml_scores
-market-state features, the same chronological_train_test_split/frozen_ml_snapshot lookahead-
-bias discipline. This module reuses every one of those pieces rather than reimplementing them
--- the env is an adapter, not a rewrite, per the plan this was built against.
+Phase 3a (train_and_evaluate_ppo_poc) was the proof-of-concept: does this train at all, does
+it beat random, is a saved model small/fast enough to serve live. Phase 3b
+(train_ppo_policy/choose_action_ppo, wired into main.py's POST /rl/train-ppo/{interval} and
+POST /rl/signal-ppo/{interval}) is the live path -- deliberately ADDITIVE, not a replacement:
+the linear Q-learning system (rl_engine.py, rl_policies_collection, POST /rl/train,
+POST /rl/signal) is untouched and still the one driving any existing live policy. A PPO
+policy only starts actually being used for a given pair/interval once POST /rl/train-ppo has
+been called for it AND POST /rl/signal-ppo is what a caller chooses to hit instead of
+POST /rl/signal -- nothing here auto-migrates or deletes an existing linear policy.
 
-What this module deliberately does NOT do: persist a PPO policy anywhere live inference could
-load it, touch RLPolicy/main.py's /rl/* endpoints, or retrain any of the 20 existing live
-policies. Full rollout (Signal Stack v2 phase 3b) is a separate, later step, gated on this
-proof-of-concept actually clearing four checks -- see train_and_evaluate_ppo_poc's docstring
-and its return value's own fields for whether it did.
+STILL UNVERIFIED as of this module's own introduction: a real deploy of the PyTorch
+dependency this pulls in on FastAPI Cloud (build time, image size, cold-start latency -- see
+requirements.txt's own comment), and real-market-data validation (every check this module's
+own tests ran used synthetic OHLCV, since this development sandbox has no Twelve Data/Mongo
+access) -- treat a freshly-trained PPO policy as unproven until POST /rl/train-ppo has
+actually been run against real ingested candle history and its eval_run's hit_rate_pct/
+total_return_pct reviewed, the same skepticism any freshly-trained linear policy already gets.
 """
 import io
 import time
@@ -27,7 +38,7 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from app.models.schemas import BacktestRun, RuleConfig, Signal
+from app.models.schemas import BacktestRun, PPOPolicy, RuleConfig, Signal
 from app.services.indicators import add_all_indicators
 from app.services.signal_engine import compute_atr_target_stop, label_outcome, spread_cost_pct
 from app.services import rl_engine as rl
@@ -338,3 +349,84 @@ def train_and_evaluate_ppo_poc(
         "save_load_latency_ms": round(save_ms + load_ms, 2),
         "model": model,
     }
+
+
+def train_ppo_policy(
+    df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
+    total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: int = 20,
+    starting_balance: float = rl.DEFAULT_STARTING_BALANCE,
+    ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = None,
+    ppo_kwargs: Optional[dict] = None,
+) -> tuple[PPOPolicy, BacktestRun, list[Signal], dict]:
+    """
+    The live-persistence wrapper around train_and_evaluate_ppo_poc -- same training/evaluation,
+    plus serializing the trained model into a PPOPolicy ready for a caller (main.py's
+    POST /rl/train-ppo/{interval}) to insert into ppo_policies_collection. Kept as a thin
+    wrapper rather than folding serialization into train_and_evaluate_ppo_poc itself, since a
+    caller doing a quick POC check (persist=false equivalent) has no reason to pay for
+    serializing a model it's about to discard.
+
+    Unlike rl_engine.train_rl_policy, there is no warm_start here -- stable-baselines3's PPO
+    has no equivalent of LinearQPolicy's "continue from these exact weights and Adagrad
+    accumulators" resume; every training call starts a fresh PPO model. Repeated calls for the
+    same pair/interval each train total_timesteps from scratch, they don't build on the
+    previous run the way the linear policy's warm start does -- something a caller comparing
+    the two algorithms' "keep training" behavior should know going in.
+
+    Returns (policy, eval_run, trade_signals, poc_diagnostics) -- poc_diagnostics carries
+    beats_random/model_size_bytes/save_load_latency_ms forward from
+    train_and_evaluate_ppo_poc so a caller (or the API response) can still see them even
+    though the model itself is now serialized into `policy` rather than returned raw.
+    """
+    result = train_and_evaluate_ppo_poc(
+        df, pair, interval, config, total_timesteps=total_timesteps, train_frac=train_frac,
+        max_lookforward=max_lookforward, starting_balance=starting_balance,
+        ml_reference_signals=ml_reference_signals, random_seed=random_seed, ppo_kwargs=ppo_kwargs,
+    )
+    model: PPO = result["model"]
+    buffer = io.BytesIO()
+    model.save(buffer)
+
+    policy = PPOPolicy(
+        policy_id=uuid.uuid4().hex[:12],
+        pair=pair,
+        interval=interval,
+        created_at=datetime.utcnow(),
+        feature_names=rl.RL_FEATURE_NAMES,
+        eval_run_id=result["ppo_eval_run"].run_id,
+        starting_balance=starting_balance,
+        total_timesteps=total_timesteps,
+        model_bytes=buffer.getvalue(),
+    )
+    poc_diagnostics = {
+        "beats_random": result["beats_random"],
+        "model_size_bytes": result["model_size_bytes"],
+        "save_load_latency_ms": result["save_load_latency_ms"],
+        "random_baseline_total_return_pct": result["random_baseline_eval_run"].total_return_pct,
+    }
+    return policy, result["ppo_eval_run"], result["ppo_trade_signals"], poc_diagnostics
+
+
+def choose_action_ppo(policy: PPOPolicy, state: list[float]) -> tuple[str, dict[str, float]]:
+    """
+    Live-inference counterpart to rl_engine.choose_action, for a PPOPolicy instead of an
+    RLPolicy -- same staleness guard (a policy trained under an older/different state schema
+    raises rather than silently producing a meaningless result), same (action, action ->
+    float) return shape so a caller can display either algorithm's decision identically.
+
+    Loads the model fresh from policy.model_bytes on every call rather than caching a loaded
+    model across requests -- see train_and_evaluate_ppo_poc's own save/load latency
+    measurement (tens of milliseconds) for why this is workable for a live signal endpoint
+    that's called at most a few times a minute, not a hot path needing a persistent in-memory
+    model cache.
+    """
+    if policy.feature_names != rl.RL_FEATURE_NAMES:
+        raise ValueError(
+            f"PPO policy {policy.policy_id} for {policy.pair}/{policy.interval} was trained "
+            f"against a different state feature set ({len(policy.feature_names)} features, "
+            f"current code produces {len(rl.RL_FEATURE_NAMES)}) -- stale after a feature-set "
+            f"change, retrain via POST /rl/train-ppo/{policy.interval}?pair={policy.pair} first."
+        )
+    model = PPO.load(io.BytesIO(policy.model_bytes), device="cpu")
+    obs = np.asarray(state, dtype=np.float32)
+    return _greedy_ppo_action(model, obs)

@@ -22,9 +22,11 @@ from app.core.database import (
     rl_signals_collection,
     rl_train_jobs_collection,
     run_all_flows_jobs_collection,
+    ppo_policies_collection,
 )
 from app.models.schemas import (
     LoginRequest, RuleConfig, RLPolicy, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
+    PPOPolicy,
 )
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
@@ -42,6 +44,7 @@ from app.services.rl_engine import (
 from app.services.case_memory import (
     memory_summary, memory_gate, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
 )
+from app.services.ppo_engine import train_ppo_policy, choose_action_ppo
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import (
@@ -1210,6 +1213,278 @@ async def get_latest_train_all_job():
     return RLTrainAllJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 
+async def _run_ppo_training(
+    pair: str, interval: str, total_timesteps: int, train_frac: float, max_lookforward: int,
+    starting_balance: float, random_seed: Optional[int] = None,
+):
+    """
+    PPO counterpart to _run_rl_training -- same candle/ML-reference fetching, same
+    run_in_threadpool wrapping (train_ppo_policy is sync/CPU-bound, and PPO's own rollout
+    collection is considerably heavier per-timestep than LinearQPolicy's plain Python update,
+    so keeping this off the event loop matters at least as much here). No warm_start
+    equivalent -- see train_ppo_policy's own docstring for why every call trains a fresh PPO
+    model rather than continuing a prior one.
+
+    Always persists (no persist=false dry-run mode the way _run_rl_training has for ATR-mult
+    sweeping) -- POST /rl/train-ppo doesn't expose a target/stop override to sweep in the
+    first place, so there's no "trained under a mismatched setting" risk to guard against here.
+    """
+    if not 0 < train_frac < 1:
+        raise ValueError("train_frac must be between 0 and 1 (exclusive).")
+    if starting_balance <= 0:
+        raise ValueError("starting_balance must be positive.")
+
+    config = default_config_for(rl_config_profile(interval), pair)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
+    docs = await cursor.to_list(length=None)
+    if not docs:
+        raise ValueError(f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.")
+
+    ml_reference_signals = await signals_collection.find(
+        {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    ).to_list(length=None)
+
+    df = pd.DataFrame(docs)
+    policy, eval_run, trade_signals, poc_diagnostics = await run_in_threadpool(
+        train_ppo_policy, df, pair, interval, config, total_timesteps=total_timesteps,
+        train_frac=train_frac, max_lookforward=max_lookforward, starting_balance=starting_balance,
+        ml_reference_signals=ml_reference_signals, random_seed=random_seed,
+    )
+
+    if trade_signals:
+        await backtest_signals_collection.insert_many([s.model_dump() for s in trade_signals])
+    await backtest_runs_collection.insert_one(eval_run.model_dump())
+    await ppo_policies_collection.insert_one(policy.model_dump())
+    return policy, eval_run, poc_diagnostics
+
+
+@app.post("/rl/train-ppo/{interval}")
+async def train_rl_ppo(
+    interval: str, pair: str, total_timesteps: int = 50_000, train_frac: float = 0.7,
+    max_lookforward: int = 20, starting_balance: float = DEFAULT_STARTING_BALANCE,
+    random_seed: Optional[int] = None,
+):
+    """
+    Trains a PPO policy (app/services/ppo_engine.py, Signal Stack v2 phase 3) for this
+    pair/interval -- a second, additive RL agent alongside the existing linear Q-learning one
+    (POST /rl/train), NOT a replacement for it. Persists the trained PPOPolicy plus its
+    test-slice evaluation (a real BacktestRun, profile="rl_ppo", directly comparable to the
+    linear policy's profile="rl" runs via GET /backtest/runs?pair=X&profile=rl_ppo) exactly
+    the same way POST /rl/train persists an RLPolicy.
+
+    A pair/interval with a PPO policy trained here is NOT automatically live -- POST
+    /rl/signal/{interval} (no path change) keeps using the linear policy exactly as before;
+    only POST /rl/signal-ppo/{interval} uses what this endpoint trains. Nothing here deletes
+    or disables any existing linear policy.
+
+    The response includes `poc_diagnostics` (beats_random/model_size_bytes/
+    save_load_latency_ms/random_baseline_total_return_pct) -- the same proof-of-concept
+    checks ppo_engine.train_and_evaluate_ppo_poc reports, still worth checking on every real
+    training run against real market data, not just the synthetic-data smoke test this was
+    originally built and verified against.
+
+    total_timesteps: PPO's own training-length knob (no direct equivalent to
+    rl_engine.DEFAULT_EPISODES -- PPO counts environment steps, not epsilon-greedy episodes).
+    50,000 is a starting guess, not backtested -- same caveat as every other unvalidated
+    constant in this project.
+    """
+    try:
+        policy, eval_run, poc_diagnostics = await _run_ppo_training(
+            pair, interval, total_timesteps, train_frac, max_lookforward, starting_balance, random_seed,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "policy": policy.model_dump(exclude={"model_bytes"}),
+        "evaluation": eval_run,
+        "poc_diagnostics": poc_diagnostics,
+    }
+
+
+@app.get("/rl/ppo/policies")
+async def list_ppo_policies(pair: str | None = None, interval: str | None = None, limit: int = 20):
+    """PPO counterpart to GET /rl/policies -- same eval-summary enrichment, model_bytes
+    excluded from the response (it's a serialized neural network, not something a caller
+    displays; POST /rl/signal-ppo loads it straight from the DB document, not from this
+    response)."""
+    query: dict = {}
+    if pair:
+        query["pair"] = pair
+    if interval:
+        query["interval"] = interval
+    cursor = ppo_policies_collection.find(query, {"model_bytes": 0}).sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+
+    eval_run_ids = [d["eval_run_id"] for d in docs if d.get("eval_run_id")]
+    eval_runs = {}
+    if eval_run_ids:
+        eval_cursor = backtest_runs_collection.find({"run_id": {"$in": eval_run_ids}})
+        async for run in eval_cursor:
+            eval_runs[run["run_id"]] = run
+
+    for d in docs:
+        d["_id"] = str(d["_id"])
+        run = eval_runs.get(d.get("eval_run_id"))
+        d["evaluation"] = {
+            "hit_rate_pct": run["hit_rate_pct"],
+            "expectancy_pct": run["expectancy_pct"],
+            "directional_signals": run["directional_signals"],
+            "hold_signals": run["hold_signals"],
+            "starting_balance": run.get("starting_balance"),
+            "ending_balance": run.get("ending_balance"),
+            "total_return_pct": run.get("total_return_pct"),
+        } if run else None
+    return docs
+
+
+@app.post("/rl/signal-ppo/{interval}")
+async def create_rl_signal_ppo(interval: str, pair: str, balance: float = DEFAULT_STARTING_BALANCE):
+    """
+    PPO counterpart to POST /rl/signal/{interval} -- identical three-gate live safety stack
+    (live-exclusion on the latest eval's total_return_pct, the ML quality gate, case_memory's
+    memory_gate) and identical state computation (_rl_state_from_candles, fully
+    policy-agnostic), fed by choose_action_ppo's greedy action instead of
+    rl_engine.choose_action's Q-argmax -- confirming the plan's own prediction that this
+    safety stack is independent of the underlying policy algorithm. q_values in the response/
+    stored RLSignal holds PPO's action-probability distribution instead of Q-values (see
+    RLSignal.q_values' own docstring) -- same shape, different number underneath.
+
+    Writes into the SAME rl_signals_collection the linear endpoint uses, including its
+    single-open-position-per-pair/interval lock -- deliberately, not an oversight: this
+    project should never let a linear-Q policy and a PPO policy both independently open a
+    live position on the same pair/interval at once. Whichever endpoint is called first for a
+    given pair/interval "owns" that open position until it resolves; the other endpoint just
+    hands back the same pending signal as-is in the meantime, exactly like calling
+    POST /rl/signal/{interval} twice in a row already does.
+
+    See POST /rl/signal/{interval}'s own docstring for the parts of this that aren't
+    PPO-specific -- duplicated here rather than sharing one function, since the two diverge
+    exactly at "how is the action chosen" and stay identical everywhere else, which made
+    threading a single shared implementation through more confusing than two parallel,
+    clearly-labeled endpoints.
+    """
+    if balance <= 0:
+        raise HTTPException(status_code=400, detail="balance must be positive.")
+
+    pending = await rl_signals_collection.find_one(
+        {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
+    )
+    if pending is not None:
+        real_outcome, _ = await resolve_rl_signal_real_outcome(pending)
+        if real_outcome is not None:
+            await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": real_outcome})
+        else:
+            pending["_id"] = str(pending["_id"])
+            return {"signal": pending, "q_values": pending.get("q_values"), "memory": None}
+
+    policy_doc = await ppo_policies_collection.find_one(
+        {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
+    )
+    if policy_doc is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No trained PPO policy yet for {pair}/{interval}. Call POST /rl/train-ppo/{interval}?pair={pair} first.",
+        )
+    policy = PPOPolicy(**{k: v for k, v in policy_doc.items() if k != "_id"})
+
+    config = default_config_for(rl_config_profile(interval), pair)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
+    docs = await cursor.to_list(length=500)
+    docs.reverse()
+
+    min_needed = max(config.ema_slow, MIN_WARMUP_BARS)
+    if len(docs) < min_needed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for RL. "
+                    f"Run /ingest/{interval} first."
+        )
+
+    resolved_signals = await signals_collection.find(
+        {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
+    ).to_list(length=None)
+    market_state, df, ml_buy_score, ml_sell_score = _rl_state_from_candles(
+        docs, config, pair, interval, rl_config_profile(interval), resolved_signals,
+    )
+    state = full_rl_state(market_state, balance, policy.starting_balance)
+    try:
+        action, q_values = choose_action_ppo(policy, state)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    current_price = float(df.iloc[-1]["close"])
+
+    eval_run = await backtest_runs_collection.find_one({"run_id": policy.eval_run_id})
+    excluded_return = eval_run.get("total_return_pct") if eval_run else None
+    if excluded_return is not None and excluded_return <= STRONG_LOSS_RETURN_PCT:
+        return {
+            "signal": None, "q_values": q_values,
+            "excluded_reason": (
+                f"Latest training run lost {abs(excluded_return):.0f}% of a simulated $50 "
+                f"start (hit rate {eval_run.get('hit_rate_pct')}%) -- excluded from live "
+                f"signals until a retrain clears this."
+            ),
+        }
+
+    if action == "HOLD":
+        return {"signal": None, "q_values": q_values}
+
+    direction, tier = action.split("_")
+
+    ml_score = ml_buy_score if direction == "BUY" else ml_sell_score
+    if ml_score is not None and ml_score < GOOD_SIGNAL_ML_THRESHOLD:
+        return {
+            "signal": None, "q_values": q_values,
+            "ml_blocked_reason": (
+                f"ML rated this {direction} at only {ml_score * 100:.0f}% hit probability "
+                f"(below the {GOOD_SIGNAL_ML_THRESHOLD * 100:.0f}% bar for a live signal) "
+                f"-- held instead."
+            ),
+        }
+
+    memory_candidates = await rl_signals_collection.find({
+        "direction": direction,
+        "status": {"$in": list(RESOLVED_STATUSES)},
+    }).to_list(length=None)
+    memory = memory_summary(state, memory_candidates)
+
+    overall_hits = await rl_signals_collection.count_documents(
+        {"pair": pair, "interval": interval, "status": "hit"}
+    )
+    overall_misses = await rl_signals_collection.count_documents(
+        {"pair": pair, "interval": interval, "status": "miss"}
+    )
+    overall_decided = overall_hits + overall_misses
+    memory["policy_hit_rate_pct"] = round(overall_hits / overall_decided * 100, 1) if overall_decided else None
+    memory["policy_decided_trades"] = overall_decided
+
+    gated_tier, memory_override = memory_gate(memory, tier)
+    if gated_tier == "HOLD":
+        return {"signal": None, "q_values": q_values, "memory": memory, "memory_override": memory_override}
+    tier = gated_tier
+    risk_fraction = RISK_FRACTION_BY_TIER[tier]
+
+    latest = df.iloc[-1]
+    entry_price = current_price
+    atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+    target_atr_mult, stop_atr_mult = rl_atr_mults(interval, pair)
+    target_price, stop_price = compute_atr_target_stop(
+        entry_price, atr_val, direction, target_atr_mult, stop_atr_mult,
+    )
+    units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
+
+    rl_signal = RLSignal(
+        signal_id=uuid.uuid4().hex[:12], algo="ppo",
+        pair=pair, interval=interval, timestamp=latest["timestamp"], direction=direction,
+        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
+        q_values=q_values, policy_id=policy.policy_id,
+        size_tier=tier, risk_fraction=risk_fraction, balance_at_signal=round(balance, 2),
+        position_size_units=round(units, 2), state=state, memory_override=memory_override,
+    )
+
+    await rl_signals_collection.insert_one(rl_signal.model_dump())
+    return {"signal": rl_signal, "q_values": q_values, "memory": memory}
+
+
 @app.get("/rl/policies")
 async def list_rl_policies(pair: str | None = None, interval: str | None = None, limit: int = 20):
     """
@@ -1265,15 +1540,23 @@ async def reset_rl(confirm: bool = False):
         run_ids via run_id (RL's individual test-slice trade log -- these don't carry
         profile="rl" themselves, Signal has no RL-specific profile literal, see
         train_rl_policy's own docstring; linkage is by run_id only).
-      - rl_signals_collection documents with status "pending" or "superseded" -- pending
-        ones would otherwise reference a policy_id that no longer exists after the reset,
-        and superseded ones were never a real market outcome to begin with (the agent
-        changed its mind before label_outcome got the chance).
+      - rl_signals_collection documents with status "pending" or "superseded" AND
+        algo != "ppo" (i.e. produced by the linear policy this endpoint actually resets) --
+        pending ones would otherwise reference a policy_id that no longer exists after the
+        reset, and superseded ones were never a real market outcome to begin with (the agent
+        changed its mind before label_outcome got the chance). A PPO-sourced pending/
+        superseded signal is deliberately left alone: this endpoint never touches
+        ppo_policies_collection, so a PPO policy_id it might reference is still perfectly
+        valid, and deleting it would silently forget a still-open PPO position while its
+        model stays live.
 
     Explicitly does NOT touch: rl_signals_collection documents with status "hit"/"miss"/
     "expired" (the real outcome history -- case_memory.py's cross-pair pool, GET
-    /rl/accuracy's history), the rule-based signals_collection, or anything ML-related
-    (ml_runs_collection, signals_collection) -- this is scoped to RL only.
+    /rl/accuracy's history), any rl_signals_collection document with algo="ppo", the
+    rule-based signals_collection, ppo_policies_collection, or anything ML-related
+    (ml_runs_collection, signals_collection) -- this is scoped to the LINEAR RL policy only.
+    See POST /rl/train-ppo/{interval}'s own docstring for the PPO agent this deliberately
+    leaves alone.
 
     confirm: defaults to False, which runs the exact same queries and returns the counts of
     what WOULD be deleted without deleting anything -- a dry run to sanity-check the numbers
@@ -1282,14 +1565,18 @@ async def reset_rl(confirm: bool = False):
     rl_run_ids = [
         d["run_id"] async for d in backtest_runs_collection.find({"profile": "rl"}, {"run_id": 1})
     ]
+    # $ne "ppo" (not $eq "linear_q") so this also matches every signal stored before the
+    # `algo` field existed at all -- those predate PPO entirely and are exactly as much this
+    # endpoint's business as an explicit algo="linear_q" record.
+    linear_only = {"algo": {"$ne": "ppo"}}
 
     policies_count = await rl_policies_collection.count_documents({})
     runs_count = len(rl_run_ids)
     signals_count = await backtest_signals_collection.count_documents(
         {"run_id": {"$in": rl_run_ids}}
     ) if rl_run_ids else 0
-    pending_count = await rl_signals_collection.count_documents({"status": "pending"})
-    superseded_count = await rl_signals_collection.count_documents({"status": "superseded"})
+    pending_count = await rl_signals_collection.count_documents({"status": "pending", **linear_only})
+    superseded_count = await rl_signals_collection.count_documents({"status": "superseded", **linear_only})
     kept_count = await rl_signals_collection.count_documents(
         {"status": {"$in": ["hit", "miss", "expired"]}}
     )
@@ -1312,7 +1599,7 @@ async def reset_rl(confirm: bool = False):
         await backtest_signals_collection.delete_many({"run_id": {"$in": rl_run_ids}})
     await backtest_runs_collection.delete_many({"profile": "rl"})
     await rl_policies_collection.delete_many({})
-    await rl_signals_collection.delete_many({"status": {"$in": ["pending", "superseded"]}})
+    await rl_signals_collection.delete_many({"status": {"$in": ["pending", "superseded"]}, **linear_only})
     return result
 
 
