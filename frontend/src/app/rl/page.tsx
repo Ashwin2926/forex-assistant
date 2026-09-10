@@ -2,12 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLPolicy, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
-import { StatusBadge } from "@/components/Badges";
+import { INTERVALS, PAIRS, type BacktestRun, type PPOPolicy, type PPOTrainDiagnostics, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
-// How often to poll GET /rl/train-all/{job_id} while a batch run is in progress -- the job
-// itself takes ~15 minutes total (20 combos x ~40-50s each), so this just needs to be
-// frequent enough to feel live, not frequent enough to matter for load.
+// How often to poll GET /rl/train-all/{job_id} while a batch run is in progress.
 const TRAIN_ALL_POLL_MS = 4000;
 
 interface GenerateAllCell {
@@ -16,22 +14,14 @@ interface GenerateAllCell {
   signal: RLSignal | null;
   qValues: Record<string, number> | null;
   memory?: RLMemorySummary | null;
-  // Set when memory_gate blocked the trade to HOLD outright (signal is null in that case) --
-  // a downsize-only override instead lives on signal.memory_override, since a trade still
-  // happened. See app/services/case_memory.py's memory_gate.
   memoryOverride?: string | null;
-  // Set when this pair/interval's latest training run showed a clear losing edge -- live
-  // signals withheld until a retrain clears it (see app/main.py's create_rl_signal).
   excludedReason?: string | null;
+  mlBlockedReason?: string | null;
   error?: string;
 }
 
 type Trend = "up" | "down" | null;
 
-// Tracks whether a percentage is currently rising or falling compared to its own last value
-// -- not a multi-tick history, just "did it move since the last time this changed." Used by
-// both confidence widgets: training confidence updates on every poll while a job runs,
-// overall accuracy updates on the 60s refetch above.
 function useTrend(value: number | null): Trend {
   const prevRef = useRef<number | null>(null);
   const [trend, setTrend] = useState<Trend>(null);
@@ -54,9 +44,6 @@ function TrendArrow({ trend }: { trend: Trend }) {
   );
 }
 
-// Clickable chevron+title for a collapsible section header -- the body content stays wherever
-// it already lives in each section (varies too much section-to-section to share, some have a
-// subtitle, some have header-right buttons); this just standardizes the toggle control itself.
 function SectionToggle({ open, onToggle, title }: { open: boolean; onToggle: () => void; title: string }) {
   return (
     <button onClick={onToggle} className="flex items-center gap-2 text-left">
@@ -96,17 +83,25 @@ function VerdictCard({ title, verdict, sampleUnit, minN }: { title: string; verd
   );
 }
 
+// PPO's q_values ARE real action probabilities (they sum to 1) -- unlike the retired linear
+// policy's raw Q-values, no softmax/normalization is needed to turn them into a "confidence"
+// percentage, just read the chosen action's own probability directly.
+function actionProbability(qValues: Record<string, number> | null | undefined, action: string | null | undefined): number | null {
+  if (!qValues || !action || !(action in qValues)) return null;
+  return qValues[action] * 100;
+}
+
 export default function RLPage() {
   const [pair, setPair] = useState<string>(PAIRS[0]);
   const [interval, setInterval_] = useState<string>("1h");
-  const [episodes, setEpisodes] = useState(200);
+  const [totalTimesteps, setTotalTimesteps] = useState(50_000);
   const [trainFrac, setTrainFrac] = useState(0.7);
   const [startingBalance, setStartingBalance] = useState(50);
   const [training, setTraining] = useState(false);
   const [trainError, setTrainError] = useState<string | null>(null);
-  const [trainResult, setTrainResult] = useState<{ policy: RLPolicy; evaluation: BacktestRun } | null>(null);
+  const [trainResult, setTrainResult] = useState<{ policy: PPOPolicy; evaluation: BacktestRun; poc_diagnostics: PPOTrainDiagnostics } | null>(null);
 
-  const [policies, setPolicies] = useState<RLPolicy[]>([]);
+  const [policies, setPolicies] = useState<PPOPolicy[]>([]);
   const [policiesLoading, setPoliciesLoading] = useState(true);
 
   const [currentBalance, setCurrentBalance] = useState(50);
@@ -118,22 +113,16 @@ export default function RLPage() {
   const [learningCurve, setLearningCurve] = useState<RLLearningCurve | null>(null);
   const [insights, setInsights] = useState<RLInsights | null>(null);
 
-  // Section collapse state -- the page grew to 9 sections and got too long to scan at a
-  // glance. The "how is it doing" summary sections (confidence/accuracy, the verdict cards,
-  // What to improve) stay expanded by default; the action/detail sections (train, generate,
-  // and the tables fed by them) start collapsed and open on demand.
   const [insightsOpen, setInsightsOpen] = useState(true);
   const [trainOpen, setTrainOpen] = useState(false);
   const [generateOpen, setGenerateOpen] = useState(false);
-  const [confidenceRankingOpen, setConfidenceRankingOpen] = useState(false);
   const [recentSignalsOpen, setRecentSignalsOpen] = useState(false);
   const [trainingHistoryOpen, setTrainingHistoryOpen] = useState(false);
 
   const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
   const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
-  const trainAllPollGuard = useRef<string | null>(null); // job_id currently being polled, to avoid a stray double-poll
+  const trainAllPollGuard = useRef<string | null>(null);
 
-  const [expandedHistoryWeights, setExpandedHistoryWeights] = useState<string | null>(null);
   const [expandedHistoryTrades, setExpandedHistoryTrades] = useState<string | null>(null);
   const [tradeLogs, setTradeLogs] = useState<Record<string, Signal[]>>({});
   const [tradeLogsLoading, setTradeLogsLoading] = useState<string | null>(null);
@@ -142,10 +131,6 @@ export default function RLPage() {
   const [generateAllProgress, setGenerateAllProgress] = useState(0);
   const [generateAllRunning, setGenerateAllRunning] = useState(false);
   const [expandedQValues, setExpandedQValues] = useState<string | null>(null);
-
-  const [expandedContribution, setExpandedContribution] = useState<string | null>(null);
-  const [contributionCache, setContributionCache] = useState<Record<string, { feature: string; contribution: number }[]>>({});
-  const [contributionLoading, setContributionLoading] = useState<string | null>(null);
 
   async function loadPolicies() {
     setPoliciesLoading(true);
@@ -193,9 +178,6 @@ export default function RLPage() {
     }
   }
 
-  // Trains sequentially server-side now (see app/main.py's run_train_all_job) -- this just
-  // polls GET /rl/train-all/{job_id} until status flips to "done". Recurses via setTimeout
-  // rather than setInterval so a slow poll response can't overlap the next one.
   async function pollTrainAllJob(jobId: string) {
     trainAllPollGuard.current = jobId;
     let job: RLTrainAllJob;
@@ -219,8 +201,6 @@ export default function RLPage() {
     loadOverallAccuracy();
     loadLearningCurve();
     loadInsights();
-    // Rehydrate an in-progress "Train all" job on load/reload -- the job itself lives
-    // server-side now, so a reload should resume watching it, not lose track of it.
     api.getLatestTrainAllRLJob().then((job) => {
       if (job && job.status === "running") {
         setTrainAllJob(job);
@@ -231,10 +211,6 @@ export default function RLPage() {
     }).catch(() => {});
   }, []);
 
-  // Overall accuracy only changes as live signals resolve (roughly the cron's own cadence),
-  // not on every render -- refetch periodically so the trend arrow next to it (useTrend
-  // below) has something real to compare against over the course of a session, not just a
-  // single static snapshot from page load.
   useEffect(() => {
     const id = setInterval(loadOverallAccuracy, 60_000);
     return () => clearInterval(id);
@@ -244,7 +220,7 @@ export default function RLPage() {
     setTraining(true);
     setTrainError(null);
     try {
-      const result = await api.trainRLPolicy(pair, interval, { episodes, train_frac: trainFrac, starting_balance: startingBalance });
+      const result = await api.trainRLPolicy(pair, interval, { total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance });
       setTrainResult(result);
       await loadPolicies();
     } catch (e) {
@@ -257,7 +233,7 @@ export default function RLPage() {
   async function handleTrainAll() {
     setTrainAllStartError(null);
     try {
-      const job = await api.startTrainAllRL({ episodes, train_frac: trainFrac, starting_balance: startingBalance });
+      const job = await api.startTrainAllRL({ total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance });
       setTrainAllJob(job);
       pollTrainAllJob(job.job_id);
     } catch (e) {
@@ -271,11 +247,8 @@ export default function RLPage() {
     if (!trainAllJob) return;
     setCancelling(true);
     try {
-      // Cancel takes effect immediately server-side now (not just a flag the loop picks up
-      // between combos -- a hung combo would never come back around to check it), so the
-      // response already reflects status: "cancelled". No need to wait for the next poll.
       const job = await api.cancelTrainAllRLJob(trainAllJob.job_id);
-      trainAllPollGuard.current = null; // stop any in-flight poll loop from overwriting this
+      trainAllPollGuard.current = null;
       setTrainAllJob(job);
       await loadPolicies();
     } catch (e) {
@@ -287,10 +260,6 @@ export default function RLPage() {
 
   const trainAllRunning = trainAllJob?.status === "running";
 
-  // Live "confidence" while a Train all job runs -- test-slice hit rate averaged across the
-  // pair/intervals completed so far, weighted by each one's own trade count (directional_signals)
-  // rather than a flat per-combo average, so a combo with 300 test trades isn't drowned out by
-  // one with 5. hit_rate_pct is itself hits/directional_signals*100, so hits is recoverable.
   const trainingConfidence = (() => {
     const cells = (trainAllJob?.results ?? []).filter(
       (c) => c.ok && c.hit_rate_pct != null && c.directional_signals != null && c.directional_signals > 0,
@@ -302,18 +271,6 @@ export default function RLPage() {
   })();
   const trainingConfidenceTrend = useTrend(trainingConfidence?.pct ?? null);
   const overallAccuracyTrend = useTrend(overallAccuracy?.directional_hit_rate_pct ?? null);
-
-  // Today's "Generate all" trades, ranked low-to-high confidence -- the least-confident ones
-  // (what you asked to see) sort to the top. Confidence is the same per-trade softmax already
-  // shown inline in the Generate-all grid; this just reorders that same data around it.
-  const confidenceRanked = generateAllResults
-    .filter((c): c is GenerateAllCell & { signal: RLSignal } => !!c.signal)
-    .map((c) => ({
-      cell: c,
-      confidence: actionConfidence(c.qValues, c.signal.size_tier ? `${c.signal.direction}_${c.signal.size_tier}` : c.signal.direction),
-    }))
-    .filter((r): r is { cell: GenerateAllCell & { signal: RLSignal }; confidence: number } => r.confidence != null)
-    .sort((a, b) => a.confidence - b.confidence);
 
   const [scoringRL, setScoringRL] = useState(false);
   const [scoreResult, setScoreResult] = useState<string | null>(null);
@@ -327,8 +284,6 @@ export default function RLPage() {
         `${result.hit} hit, ${result.miss} miss, ${result.expired} expired, ${result.still_pending} still pending`
         + (result.skipped_no_data > 0 ? `, ${result.skipped_no_data} skipped (no data yet)` : ""),
       );
-      // Scoring can flip pending signals to resolved and can trigger a degradation-driven
-      // retrain in the background -- both change what's already on screen.
       await Promise.all([loadRecentSignals(), loadOverallAccuracy(), loadPolicies(), loadLearningCurve(), loadInsights()]);
     } catch (e) {
       setScoreResult(e instanceof ApiError ? e.message : "Scoring failed.");
@@ -349,7 +304,7 @@ export default function RLPage() {
         results.push({
           pair: p, interval: i, signal: result.signal, qValues: result.q_values,
           memory: result.memory ?? null, memoryOverride: result.memory_override ?? null,
-          excludedReason: result.excluded_reason ?? null,
+          excludedReason: result.excluded_reason ?? null, mlBlockedReason: result.ml_blocked_reason ?? null,
         });
       } catch (e) {
         results.push({ pair: p, interval: i, signal: null, qValues: null, error: e instanceof ApiError ? e.message : "Failed" });
@@ -361,55 +316,14 @@ export default function RLPage() {
     await loadRecentSignals();
   }
 
-  // Per-feature contribution to the chosen action's Q-value: weight[chosen_action][i] *
-  // state[i] -- decomposes "why did the agent favor this action" into which of the 7
-  // strategy votes (plus the raw indicator/balance features) actually drove it, ranked by
-  // magnitude. Fetches that pair/interval's own recent policies (not the possibly-incomplete
-  // global `policies` list) and matches on the signal's own policy_id -- falls back to the
-  // most recent one for that pair/interval if the exact policy has since aged out.
-  async function handleShowContribution(cell: GenerateAllCell) {
-    const key = `${cell.pair}-${cell.interval}`;
-    if (expandedContribution === key) {
-      setExpandedContribution(null);
-      return;
-    }
-    setExpandedContribution(key);
-    if (contributionCache[key] || !cell.signal) return; // already cached (or nothing to compute)
-    const signal = cell.signal;
-    setContributionLoading(key);
-    try {
-      const candidates = await api.listRLPolicies({ pair: cell.pair, interval: cell.interval, limit: 5 });
-      const policy = candidates.find((p) => p.policy_id === signal.policy_id) ?? candidates[0];
-      const state = signal.state;
-      if (!policy || !state || state.length === 0) {
-        setContributionCache((prev) => ({ ...prev, [key]: [] }));
-        return;
-      }
-      const chosenAction = signal.size_tier ? `${signal.direction}_${signal.size_tier}` : signal.direction;
-      const weights = policy.weights[chosenAction];
-      if (!weights) {
-        setContributionCache((prev) => ({ ...prev, [key]: [] }));
-        return;
-      }
-      const contributions = policy.feature_names
-        .map((feature, i) => ({ feature, contribution: (weights[i] ?? 0) * (state[i] ?? 0) }))
-        .sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution));
-      setContributionCache((prev) => ({ ...prev, [key]: contributions }));
-    } catch {
-      setContributionCache((prev) => ({ ...prev, [key]: [] }));
-    } finally {
-      setContributionLoading(null);
-    }
-  }
-
-  async function handleShowTrades(policy: RLPolicy) {
+  async function handleShowTrades(policy: PPOPolicy) {
     const key = policy.policy_id;
     if (expandedHistoryTrades === key) {
       setExpandedHistoryTrades(null);
       return;
     }
     setExpandedHistoryTrades(key);
-    if (tradeLogs[policy.eval_run_id]) return; // already cached
+    if (tradeLogs[policy.eval_run_id]) return;
     setTradeLogsLoading(policy.eval_run_id);
     try {
       const signals = await api.getBacktestRunSignals(policy.eval_run_id);
@@ -424,21 +338,23 @@ export default function RLPage() {
   return (
     <div className="flex flex-col gap-8">
       <section>
-        <h1 className="text-xl font-semibold tracking-tight">RL agent (v2)</h1>
+        <h1 className="text-xl font-semibold tracking-tight">RL agent (PPO)</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          A linear Q-learning agent that learns how to weight the same 7 strategies consensus
-          uses, instead of a fixed vote threshold — <strong>and how much to risk on each
-          trade</strong>, choosing between a SMALL (1%) or LARGE (3%) size against a
-          compounding account balance, trained to maximize log-growth (the same objective the
-          Kelly criterion is built on, which also naturally punishes oversized bets that risk
-          ruin). One independent policy per pair <em>and</em> interval, trained on historical
-          candle replay starting from a chosen balance (default $50) — not live signal
-          outcomes. Every trade still uses a fixed 1.5:1 target:stop ATR ratio regardless of
-          size tier, so it can never risk more than it stands to gain. Additive and separate
-          from the regular signal feed, consensus, and the ML classifier — doesn&apos;t touch
-          any of them. No broker execution here — Deriv isn&apos;t available in every region,
-          so signals are sized against your real balance (below) and traded manually on
-          whatever broker you actually have.
+          A PPO agent (stable-baselines3, via a gymnasium.Env adapter) that learns how to
+          weight the same strategies consensus uses, instead of a fixed vote threshold —{" "}
+          <strong>and how much to risk on each trade</strong>, choosing between a SMALL (1%) or
+          LARGE (3%) size against a compounding account balance, trained to maximize
+          log-growth (the same objective the Kelly criterion is built on, which also naturally
+          punishes oversized bets that risk ruin). One independent policy per pair{" "}
+          <em>and</em> interval, trained on historical candle replay starting from a chosen
+          balance (default $50) — not live signal outcomes. Every trade still uses a fixed
+          1.5:1 target:stop ATR ratio regardless of size tier, so it can never risk more than
+          it stands to gain. This project&apos;s RL agent was linear Q-learning before PPO
+          replaced it — every policy here is a fresh PPO model, with no warm-start carried
+          over from that prior algorithm. Additive and separate from the regular signal feed,
+          consensus, and the ML classifier — doesn&apos;t touch any of them. No broker
+          execution here — signals are sized against your real balance (below) and traded
+          manually on whatever broker you actually have.
         </p>
       </section>
 
@@ -497,9 +413,10 @@ export default function RLPage() {
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Is it getting smarter?</h2>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Compares the earlier half of the last 30 days against the later half, pooling real
-          counts within each half rather than averaging daily percentages — a 1-trade day and
-          an 18-trade day used to sway the number equally, which is exactly why the daily rate
-          looked noisy even while the underlying policies were genuinely improving.
+          counts within each half rather than averaging daily percentages. Unlike the retired
+          linear policy, PPO has no warm start — each retrain is an independent from-scratch
+          run, so a rising trend here reflects genuinely improving training data/setup, not
+          accumulated weight refinement.
         </p>
         {!learningCurve ? (
           <p className="mt-4 text-sm text-zinc-400">Loading…</p>
@@ -580,11 +497,11 @@ export default function RLPage() {
               {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
             </select>
           </Field>
-          <Field label="Episodes">
+          <Field label="Total timesteps">
             <input
-              type="number" step="10" min="10" value={episodes}
-              onChange={(e) => setEpisodes(Number(e.target.value))}
-              className="select w-24"
+              type="number" step="1000" min="1000" value={totalTimesteps}
+              onChange={(e) => setTotalTimesteps(Number(e.target.value))}
+              className="select w-28"
             />
           </Field>
           <Field label="Train fraction">
@@ -605,6 +522,10 @@ export default function RLPage() {
             {training ? "Training…" : "Train"}
           </button>
         </div>
+        <p className="mt-2 text-xs text-zinc-400">
+          No warm start — every training run starts a fresh PPO model from total_timesteps
+          real environment steps, it doesn&apos;t continue a prior run&apos;s weights.
+        </p>
         {trainError && (
           <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
             {trainError}
@@ -614,7 +535,7 @@ export default function RLPage() {
           <div className="mt-4 flex flex-col gap-4">
             <div>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                Test-slice evaluation (a real backtest run, greedy/no exploration) — directly
+                Test-slice evaluation (a real backtest run, greedy/deterministic) — directly
                 comparable to any other approach&apos;s expectancy on the same pair/interval.
               </p>
               <div className="mt-2 max-w-xs">
@@ -622,14 +543,25 @@ export default function RLPage() {
               </div>
             </div>
             <div>
-              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">What it learned to value</p>
+              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Proof-of-concept diagnostics</p>
               <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
-                Reward/punishment isn&apos;t logged trade-by-trade — it&apos;s baked directly
-                into these weights during training. For each action, a positive weight on a
-                strategy&apos;s vote means agreeing with that strategy got reinforced
-                (led to reward); negative means it got punished (led to loss).
+                Worth checking on every real training run, not just once — a policy that fails
+                these isn&apos;t ready to trust live.
               </p>
-              <WeightsTable policy={trainResult.policy} />
+              <div className="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                <StatTile
+                  label="Beats random?"
+                  value={trainResult.poc_diagnostics.beats_random ? "Yes" : "No"}
+                  accent={trainResult.poc_diagnostics.beats_random ? "emerald" : "rose"}
+                />
+                <StatTile label="Model size" value={`${(trainResult.poc_diagnostics.model_size_bytes / 1024).toFixed(0)} KB`} />
+                <StatTile label="Save+load latency" value={`${trainResult.poc_diagnostics.save_load_latency_ms.toFixed(1)} ms`} />
+              </div>
+              {trainResult.poc_diagnostics.random_baseline_total_return_pct != null && (
+                <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
+                  Random baseline total return: {trainResult.poc_diagnostics.random_baseline_total_return_pct}%
+                </p>
+              )}
             </div>
           </div>
         )}
@@ -637,10 +569,10 @@ export default function RLPage() {
         <div className="mt-6 border-t border-zinc-100 pt-4 dark:border-zinc-800">
           <div className="flex items-center justify-between">
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Or train all 4 pairs &times; 5 intervals at once (using the episodes/train
-              fraction above) — same thing the cron does once daily, run on demand. Runs
-              server-side (~15 min total) once started, so it&apos;s safe to close this tab —
-              reopening the page picks the same run back up.
+              Or train all 4 pairs &times; 5 intervals at once (using the settings above) —
+              same thing the cron does once daily, run on demand. Runs server-side once
+              started, so it&apos;s safe to close this tab — reopening the page picks the
+              same run back up.
             </p>
             <div className="flex shrink-0 items-center gap-2">
               <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">
@@ -708,7 +640,7 @@ export default function RLPage() {
                 </tbody>
               </table>
               <p className="border-t border-zinc-100 px-3 py-2 text-xs text-zinc-400 dark:border-zinc-800">
-                Weights for each freshly-trained policy are in Training history below.
+                Full details for each freshly-trained policy are in Training history below.
               </p>
             </div>
           )}
@@ -724,8 +656,9 @@ export default function RLPage() {
             {generateOpen && (
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
                 Loads each pair/interval&apos;s latest trained policy and picks its greedy
-                action on the current candle, sized against the balance below — all 4 pairs
-                &times; 5 intervals at once. Only BUY/SELL get stored; a HOLD row shows as HOLD.
+                (deterministic) action on the current candle, sized against the balance below
+                — all 4 pairs &times; 5 intervals at once. Only BUY/SELL get stored; a HOLD
+                row shows as HOLD.
               </p>
             )}
           </div>
@@ -769,7 +702,7 @@ export default function RLPage() {
                     const key = `${cell.pair}-${cell.interval}`;
                     const s = cell.signal;
                     const qOpen = expandedQValues === key;
-                    const confidence = s ? actionConfidence(cell.qValues, s.size_tier ? `${s.direction}_${s.size_tier}` : s.direction) : null;
+                    const confidence = s ? actionProbability(cell.qValues, s.size_tier ? `${s.direction}_${s.size_tier}` : s.direction) : null;
                     return (
                       <>
                         <tr
@@ -784,11 +717,11 @@ export default function RLPage() {
                             <>
                               {!s ? (
                                 <td
-                                  className={`px-3 py-1.5 ${cell.excludedReason ? "text-amber-600 dark:text-amber-400" : "text-zinc-400"}`}
+                                  className={`px-3 py-1.5 ${cell.excludedReason || cell.mlBlockedReason ? "text-amber-600 dark:text-amber-400" : "text-zinc-400"}`}
                                   colSpan={6}
-                                  title={cell.excludedReason ?? cell.memoryOverride ?? undefined}
+                                  title={cell.excludedReason ?? cell.mlBlockedReason ?? cell.memoryOverride ?? undefined}
                                 >
-                                  {cell.excludedReason ? "Excluded (losing edge)" : cell.memoryOverride ? "HOLD (memory override)" : "HOLD"}
+                                  {cell.excludedReason ? "Excluded (losing edge)" : cell.mlBlockedReason ? "HOLD (ML blocked)" : cell.memoryOverride ? "HOLD (memory override)" : "HOLD"}
                                 </td>
                               ) : (
                                 <>
@@ -824,7 +757,7 @@ export default function RLPage() {
                                     onClick={() => setExpandedQValues(qOpen ? null : key)}
                                     className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
                                   >
-                                    {qOpen ? "Hide" : "Show"} q-values
+                                    {qOpen ? "Hide" : "Show"} probabilities
                                   </button>
                                 )}
                               </td>
@@ -848,91 +781,6 @@ export default function RLPage() {
         </div>
         </>
         )}
-      </section>
-
-      <section>
-        <SectionToggle open={confidenceRankingOpen} onToggle={() => setConfidenceRankingOpen((o) => !o)} title="Confidence ranking" />
-        {confidenceRankingOpen && (
-        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Today&apos;s generated trades, least confident first — expand a row to see which
-          strategy votes (and raw indicator readings) pushed the decision most, ranked by how
-          much each one actually moved the chosen action&apos;s score.
-        </p>
-        )}
-        {confidenceRankingOpen && (generateAllResults.length === 0 ? (
-          <p className="mt-4 text-sm text-zinc-400">Run &quot;Generate all&quot; above to populate this.</p>
-        ) : confidenceRanked.length === 0 ? (
-          <p className="mt-4 text-sm text-zinc-400">No directional trades in the latest &quot;Generate all&quot; run — all HOLD.</p>
-        ) : (
-          <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-            <table className="w-full text-left text-xs">
-              <thead className="table-head uppercase">
-                <tr>
-                  <th className="px-3 py-1.5">Pair</th>
-                  <th className="px-3 py-1.5">Interval</th>
-                  <th className="px-3 py-1.5">Direction</th>
-                  <th className="px-3 py-1.5">Size</th>
-                  <th className="px-3 py-1.5">Confidence</th>
-                  <th className="px-3 py-1.5"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {confidenceRanked.map(({ cell, confidence }) => {
-                  const key = `${cell.pair}-${cell.interval}`;
-                  const open = expandedContribution === key;
-                  const contributions = contributionCache[key];
-                  return (
-                    <>
-                      <tr key={key} className="border-t border-zinc-100 dark:border-zinc-800">
-                        <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
-                        <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
-                        <td className={`px-3 py-1.5 font-semibold ${cell.signal.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                          {cell.signal.direction}
-                        </td>
-                        <td className={`px-3 py-1.5 font-mono ${cell.signal.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>
-                          {cell.signal.size_tier ?? "—"}
-                        </td>
-                        <td className={`px-3 py-1.5 font-mono font-semibold ${confidence >= 60 ? "text-emerald-600 dark:text-emerald-400" : confidence >= 40 ? "text-amber-600 dark:text-amber-400" : "text-rose-600 dark:text-rose-400"}`}>
-                          {confidence.toFixed(0)}%
-                        </td>
-                        <td className="px-3 py-1.5">
-                          <button
-                            onClick={() => handleShowContribution(cell)}
-                            className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
-                          >
-                            {open ? "Hide" : "Show"} strategies
-                          </button>
-                        </td>
-                      </tr>
-                      {open && (
-                        <tr key={`${key}-contrib`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
-                          <td colSpan={6} className="px-3 py-2">
-                            {contributionLoading === key && <p className="text-xs text-zinc-500">Loading…</p>}
-                            {contributions && contributions.length === 0 && (
-                              <p className="text-xs text-zinc-500">No policy/state data available for this trade.</p>
-                            )}
-                            {contributions && contributions.length > 0 && (
-                              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs font-mono">
-                                {contributions.map(({ feature, contribution }) => (
-                                  <span key={feature}>
-                                    {feature}:{" "}
-                                    <span className={contribution >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}>
-                                      {contribution >= 0 ? "+" : ""}{contribution.toFixed(4)}
-                                    </span>
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </td>
-                        </tr>
-                      )}
-                    </>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        ))}
       </section>
 
       <section>
@@ -976,7 +824,7 @@ export default function RLPage() {
               </thead>
               <tbody>
                 {recentSignals.map((s) => {
-                  const confidence = actionConfidence(s.q_values, s.size_tier ? `${s.direction}_${s.size_tier}` : s.direction);
+                  const confidence = actionProbability(s.q_values, s.size_tier ? `${s.direction}_${s.size_tier}` : s.direction);
                   return (
                   <tr key={s._id ?? `${s.pair}-${s.timestamp}`} className="border-t border-zinc-100 dark:border-zinc-800">
                     <td className="px-4 py-2">{s.pair} · {s.interval}</td>
@@ -1007,6 +855,9 @@ export default function RLPage() {
           <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
             Read down a given pair/interval&apos;s rows over successive trainings to see whether
             hit rate/expectancy is actually improving, not just whichever number is newest.
+            Unlike the retired linear policy there's no weight table to show here — PPO's
+            policy network has no per-feature weight, see the action-probability distribution
+            in Generate signals/Recent RL signals instead.
           </p>
         )}
         {trainingHistoryOpen && policiesLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
@@ -1019,8 +870,7 @@ export default function RLPage() {
               <thead className="table-head text-xs uppercase">
                 <tr>
                   <th className="px-4 py-2">Pair</th>
-                  <th className="px-4 py-2">Episodes</th>
-                  <th className="px-4 py-2">Train fraction</th>
+                  <th className="px-4 py-2">Timesteps</th>
                   <th className="px-4 py-2">Test hit rate</th>
                   <th className="px-4 py-2">Test expectancy</th>
                   <th className="px-4 py-2">Ending balance</th>
@@ -1031,15 +881,13 @@ export default function RLPage() {
               <tbody>
                 {policies.map((p) => {
                   const evaluation = p.evaluation;
-                  const weightsOpen = expandedHistoryWeights === p.policy_id;
                   const tradesOpen = expandedHistoryTrades === p.policy_id;
                   const trades = tradeLogs[p.eval_run_id];
                   return (
                     <>
                       <tr key={p.policy_id} className="border-t border-zinc-100 dark:border-zinc-800">
                         <td className="px-4 py-2">{p.pair} · {p.interval}</td>
-                        <td className="px-4 py-2">{p.episodes}</td>
-                        <td className="px-4 py-2">{p.train_frac}</td>
+                        <td className="px-4 py-2">{p.total_timesteps.toLocaleString()}</td>
                         <td className="px-4 py-2">{evaluation?.hit_rate_pct != null ? `${evaluation.hit_rate_pct}%` : "—"}</td>
                         <td className={`px-4 py-2 ${evaluation?.expectancy_pct != null && evaluation.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                           {evaluation?.expectancy_pct != null ? `${evaluation.expectancy_pct >= 0 ? "+" : ""}${evaluation.expectancy_pct}%` : "—"}
@@ -1050,13 +898,6 @@ export default function RLPage() {
                         <td className="px-4 py-2 text-xs text-zinc-500">{new Date(p.created_at).toLocaleString()}</td>
                         <td className="px-4 py-2 text-xs whitespace-nowrap">
                           <button
-                            onClick={() => setExpandedHistoryWeights(weightsOpen ? null : p.policy_id)}
-                            className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
-                          >
-                            {weightsOpen ? "Hide" : "Show"} weights
-                          </button>
-                          {" · "}
-                          <button
                             onClick={() => handleShowTrades(p)}
                             className="text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
                           >
@@ -1064,16 +905,9 @@ export default function RLPage() {
                           </button>
                         </td>
                       </tr>
-                      {weightsOpen && (
-                        <tr key={`${p.policy_id}-weights`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
-                          <td colSpan={8} className="px-4 py-2">
-                            <WeightsTable policy={p} />
-                          </td>
-                        </tr>
-                      )}
                       {tradesOpen && (
                         <tr key={`${p.policy_id}-trades`} className="border-t border-zinc-100 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-800">
-                          <td colSpan={8} className="px-4 py-2">
+                          <td colSpan={7} className="px-4 py-2">
                             {tradeLogsLoading === p.eval_run_id && <p className="text-xs text-zinc-500">Loading…</p>}
                             {trades && trades.length === 0 && <p className="text-xs text-zinc-500">No test-slice trades (all HOLD).</p>}
                             {trades && trades.length > 0 && (
@@ -1127,79 +961,16 @@ export default function RLPage() {
   );
 }
 
-// Per-trade "confidence" -- a softmax over the stored q_values, read at the chosen action.
-// Q-values aren't probabilities (they're expected log-growth per trade, a reward scale that's
-// naturally tiny -- real observed values sit around +/-0.001 to 0.005), so a PLAIN softmax on
-// the raw values is useless: exp(0.002) vs exp(0.0005) are within a fraction of a percent of
-// each other regardless of which action actually "won" by a meaningful margin, which is
-// exactly why every trade was showing ~20% (1/5 actions, i.e. indistinguishable-from-uniform).
-// Z-score normalizing the q-values first (mean 0, unit variance) before softmax fixes this --
-// it's the *relative* spread between actions in units of their own standard deviation that
-// should drive confidence, not their absolute tiny scale. If every action is genuinely tied
-// (std ~0, real if a policy's weights haven't diverged from init yet), this correctly reports
-// a plain 1/n uniform split instead of blowing up dividing by ~zero.
-// Returns null if qValues is missing or doesn't contain the chosen action (e.g. a pre-v2
-// signal using the old BUY/SELL action names against q_values that were never restructured).
-function actionConfidence(qValues: Record<string, number> | null | undefined, action: string | null | undefined): number | null {
-  if (!qValues || !action || !(action in qValues)) return null;
-  const entries = Object.values(qValues);
-  const n = entries.length;
-  if (n === 0) return null;
-  const mean = entries.reduce((a, b) => a + b, 0) / n;
-  const variance = entries.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
-  const std = Math.sqrt(variance);
-  if (std < 1e-9) return 100 / n; // genuinely tied -- report the honest uniform split
-  const scaled = entries.map((v) => (v - mean) / std);
-  const max = Math.max(...scaled);
-  const exps = scaled.map((v) => Math.exp(v - max));
-  const sumExp = exps.reduce((a, b) => a + b, 0);
-  const chosenScaled = (qValues[action] - mean) / std;
-  const chosenExp = Math.exp(chosenScaled - max);
-  return sumExp > 0 ? (chosenExp / sumExp) * 100 : null;
-}
-
-// Covers both the current 5-action space and pre-v2 policies (plain BUY/SELL) still in the DB.
-const ACTION_DISPLAY_ORDER = ["BUY_LARGE", "BUY_SMALL", "BUY", "SELL_SMALL", "SELL_LARGE", "SELL", "HOLD"];
-
-function WeightsTable({ policy }: { policy: RLPolicy }) {
-  const actions = ACTION_DISPLAY_ORDER.filter((a) => a in policy.weights);
-  return (
-    <div className="mt-2 overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
-      <table className="w-full text-left text-xs">
-        <thead className="table-head uppercase">
-          <tr>
-            <th className="px-3 py-1.5">Feature</th>
-            {actions.map((a) => <th key={a} className="px-3 py-1.5">{a}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {policy.feature_names.map((feature, i) => (
-            <tr key={feature} className="border-t border-zinc-100 dark:border-zinc-800">
-              <td className="px-3 py-1.5 font-mono">{feature}</td>
-              {actions.map((a) => {
-                const value = policy.weights[a][i];
-                return (
-                  <td key={a} className={`px-3 py-1.5 font-mono ${value >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                    {value >= 0 ? "+" : ""}{value.toFixed(4)}
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 function QValueRow({ qValues }: { qValues: Record<string, number> }) {
   return (
     <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-zinc-50 px-3 py-2 text-xs font-mono dark:bg-zinc-800">
-      {Object.entries(qValues).map(([action, value]) => (
-        <span key={action}>
-          {action}: <span className={value >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}>{value.toFixed(4)}</span>
-        </span>
-      ))}
+      {Object.entries(qValues)
+        .sort(([, a], [, b]) => b - a)
+        .map(([action, value]) => (
+          <span key={action}>
+            {action}: <span className="text-sky-600 dark:text-sky-400">{(value * 100).toFixed(1)}%</span>
+          </span>
+        ))}
     </div>
   );
 }
@@ -1230,6 +1001,16 @@ function TrainTestCard({ run }: { run: BacktestRun }) {
           </span>
         </p>
       )}
+    </div>
+  );
+}
+
+function StatTile({ label, value, accent }: { label: string; value: string; accent?: "emerald" | "rose" }) {
+  const color = accent === "emerald" ? "text-emerald-600 dark:text-emerald-400" : accent === "rose" ? "text-rose-600 dark:text-rose-400" : "";
+  return (
+    <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-800">
+      <p className="text-xs text-zinc-500 dark:text-zinc-400">{label}</p>
+      <p className={`mt-1 text-xl font-semibold ${color}`}>{value}</p>
     </div>
   );
 }

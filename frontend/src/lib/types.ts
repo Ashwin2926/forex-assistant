@@ -153,34 +153,9 @@ export interface MLTrainResult {
   test_calibration: MLCalibrationBucket[];
 }
 
-export interface RLPolicy {
-  _id?: string;
-  policy_id: string;
-  pair: string;
-  interval: string;
-  created_at: string;
-  episodes: number;
-  train_frac: number;
-  weights: Record<string, number[]>;
-  feature_names: string[];
-  eval_run_id: string;
-  // The balance this policy was trained against -- predict-time needs this same reference
-  // point to compute the live balance_log_ratio feature correctly. Absent on policies trained
-  // before position sizing existed (GET /rl/policies returns raw Mongo docs, not validated
-  // through the RLPolicy Pydantic model, so an old doc really can be missing this key).
-  starting_balance?: number | null;
-  // Only present from GET /rl/policies (enriched server-side from the linked BacktestRun) --
-  // absent on the RLPolicy returned directly by POST /rl/train.
-  evaluation?: {
-    hit_rate_pct: number | null;
-    expectancy_pct: number | null;
-    directional_signals: number;
-    hold_signals: number;
-    starting_balance: number | null;
-    ending_balance: number | null;
-    total_return_pct: number | null;
-  } | null;
-}
+// NOTE: this project's RL agent was linear Q-learning before PPO (see PPOPolicy, below)
+// replaced it -- the old RLPolicy type (weights/episodes/sum_sq_grad) is retired along with
+// the algorithm itself. GET /rl/policies and POST /rl/train both return PPOPolicy now.
 
 // Signal Stack v2 phase 3 -- this project's second RL agent, PPO (stable-baselines3), trained
 // against the exact same replay mechanics RLPolicy's linear Q-learning uses. Separate model/
@@ -243,7 +218,7 @@ export interface RLTrainAllJob {
   status: "running" | "done" | "cancelled";
   created_at: string;
   finished_at?: string | null;
-  episodes: number;
+  total_timesteps: number;
   train_frac: number;
   starting_balance: number;
   total: number;

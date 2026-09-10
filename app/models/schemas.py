@@ -87,10 +87,10 @@ class Signal(BaseModel):
     stop_price: Optional[float] = None
     candles_to_outcome: Optional[int] = None
 
-    # RL sizing-aware trade log only (rl_engine.train_rl_policy's test-slice trades,
-    # persisted to backtest_signals_collection the same way regular backtest signals are) --
-    # None for every other Signal. Same "reuse the existing model, add optional fields"
-    # precedent as BacktestRun's starting_balance/ending_balance/total_return_pct.
+    # RL sizing-aware trade log only (ppo_engine.py's test-slice trades, persisted to
+    # backtest_signals_collection the same way regular backtest signals are) -- None for
+    # every other Signal. Same "reuse the existing model, add optional fields" precedent as
+    # BacktestRun's starting_balance/ending_balance/total_return_pct.
     size_tier: Optional[Literal["SMALL", "LARGE"]] = None
     risk_fraction: Optional[float] = None
     balance_at_signal: Optional[float] = None
@@ -210,8 +210,9 @@ class BacktestRun(BaseModel):
 
     rule_stats: list[RuleStat] = []
 
-    # RL sizing-aware runs only (profile="rl", see rl_engine.train_rl_policy) -- None for
-    # every other backtest type. expectancy_pct above is still a flat per-trade average;
+    # RL sizing-aware runs only (profile="rl_ppo", see ppo_engine.py; older documents may
+    # carry the retired linear policy's profile="rl") -- None for every other backtest type.
+    # expectancy_pct above is still a flat per-trade average;
     # these three track the actual compounding walk (starting_balance -> ending_balance),
     # since sizing makes growth path-dependent rather than reducible to a mean.
     starting_balance: Optional[float] = None
@@ -261,46 +262,11 @@ class MLTrainResult(BaseModel):
     skipped: bool = False
 
 
-class RLPolicy(BaseModel):
-    """
-    The learned brain of the linear Q-learning RL agent (app/services/rl_engine.py) -- a
-    linear Q-function, one weight vector per action (HOLD + BUY/SELL x SMALL/LARGE size
-    tiers), over the STRATEGIES votes, atr_pct, and a balance_log_ratio feature (how the
-    account is doing relative to where it started). See PPOPolicy below for this project's
-    second, PPO-based RL agent -- a separate model/collection, not a variant of this one, so
-    each keeps a shape (weight vectors vs. serialized neural-net bytes) native to its own
-    algorithm. Persisted because, unlike the ML classifier's sub-second
-    refit on ~270 rows, training (many epsilon-greedy episodes over thousands of candles)
-    isn't cheap enough to redo on every request -- predict-time just loads the latest one and
-    picks the greedy action.
-    """
-    policy_id: str
-    pair: str
-    interval: str
-    created_at: datetime
-    episodes: int
-    train_frac: float
-    weights: dict[str, list[float]]  # action -> weight vector, same order as feature_names
-    feature_names: list[str]
-    eval_run_id: str  # the BacktestRun (profile="rl") that evaluated this policy on the test slice
-    # The balance this policy was trained against -- predict-time needs the SAME reference
-    # point to compute the live balance_log_ratio feature, or that feature would mean
-    # something different at inference than it did during training.
-    starting_balance: float
-    # Adagrad's per-weight accumulated-squared-gradient state (see LinearQPolicy) -- persisted
-    # so a warm-started continuation (see train_rl_policy's warm_start param) resumes with the
-    # SAME adaptive per-feature step sizes the previous run had earned, instead of restarting
-    # every feature's accumulator at 0. Restarting it to 0 while keeping the warm-started
-    # weights would apply an artificially large first step to already-converged weights --
-    # actively undoing prior learning, not building on it. Empty dict for any policy trained
-    # before this field existed (pre-warm-start): train_rl_policy treats that the same as "no
-    # accumulator to resume," starting Adagrad fresh for that one warm start only.
-    sum_sq_grad: dict[str, list[float]] = {}
-    # policy_id of the prior policy this one continued from, or None if this was a fresh
-    # (non-warm-started) training run -- e.g. the very first run for a pair/interval, a run
-    # after RL_FEATURE_NAMES changed shape (old policy's features no longer match, so
-    # train_rl_policy falls back to fresh rather than guessing), or an explicit reset=True.
-    warm_started_from: Optional[str] = None
+# NOTE: this project's RL agent was linear Q-learning before PPO (see PPOPolicy, below)
+# replaced it -- that policy's schema (RLPolicy: a weight vector per action, Adagrad's
+# accumulated-squared-gradient state, warm-start lineage) is retired along with the algorithm
+# itself; see git history if it's ever needed for reference. rl_policies_collection may still
+# hold old documents shaped like it, but nothing in this codebase reads or writes them anymore.
 
 
 class PPOPolicy(BaseModel):
@@ -451,7 +417,7 @@ class RLTrainAllJob(BaseModel):
     status: Literal["running", "done", "cancelled"]
     created_at: datetime
     finished_at: Optional[datetime] = None
-    episodes: int
+    total_timesteps: int
     train_frac: float
     starting_balance: float
     total: int

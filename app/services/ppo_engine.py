@@ -1,29 +1,30 @@
 """
-Signal Stack v2, phase 3 -- this project's second RL agent, PPO (stable-baselines3) via a
-thin gymnasium.Env adapter, trained against the exact same replay mechanics
-rl_engine.train_rl_policy already uses for its LinearQPolicy: the same _take_action_sized
-reward logic, the same compute_strategy_vote_states/compute_ml_scores market-state features,
-the same chronological_train_test_split/frozen_ml_snapshot lookahead-bias discipline. This
-module reuses every one of those pieces rather than reimplementing them -- the env is an
-adapter, not a rewrite, per the plan this was built against.
+Signal Stack v2, phase 3 -- this project's RL agent, PPO (stable-baselines3) via a thin
+gymnasium.Env adapter, trained against the exact same replay mechanics this project's PRIOR
+linear Q-learning policy used (see rl_engine.py, and git history for the retired
+LinearQPolicy/train_rl_policy/choose_action): the same _take_action_sized reward logic, the
+same compute_strategy_vote_states/compute_ml_scores market-state features, the same
+chronological_train_test_split/frozen_ml_snapshot lookahead-bias discipline. This module
+reuses every one of those pieces rather than reimplementing them -- the env is an adapter,
+not a rewrite, per the plan this was built against.
 
-Phase 3a (train_and_evaluate_ppo_poc) was the proof-of-concept: does this train at all, does
-it beat random, is a saved model small/fast enough to serve live. Phase 3b
-(train_ppo_policy/choose_action_ppo, wired into main.py's POST /rl/train-ppo/{interval} and
-POST /rl/signal-ppo/{interval}) is the live path -- deliberately ADDITIVE, not a replacement:
-the linear Q-learning system (rl_engine.py, rl_policies_collection, POST /rl/train,
-POST /rl/signal) is untouched and still the one driving any existing live policy. A PPO
-policy only starts actually being used for a given pair/interval once POST /rl/train-ppo has
-been called for it AND POST /rl/signal-ppo is what a caller chooses to hit instead of
-POST /rl/signal -- nothing here auto-migrates or deletes an existing linear policy.
+PPO is now the ONLY RL algorithm in this project -- the linear Q-learning system was fully
+retired, not kept alongside this as a second option. POST /rl/train/{interval} and
+POST /rl/signal/{interval} (app/main.py) both call into this module; there is no separate
+"-ppo"-suffixed endpoint namespace. train_and_evaluate_ppo_poc remains from this module's
+original proof-of-concept phase (does this train at all, does it beat random, is a saved
+model small/fast enough to serve live) -- train_ppo_policy/choose_action_ppo are the live
+path built on top of it once that proof-of-concept cleared.
 
-STILL UNVERIFIED as of this module's own introduction: a real deploy of the PyTorch
-dependency this pulls in on FastAPI Cloud (build time, image size, cold-start latency -- see
-requirements.txt's own comment), and real-market-data validation (every check this module's
-own tests ran used synthetic OHLCV, since this development sandbox has no Twelve Data/Mongo
-access) -- treat a freshly-trained PPO policy as unproven until POST /rl/train-ppo has
-actually been run against real ingested candle history and its eval_run's hit_rate_pct/
-total_return_pct reviewed, the same skepticism any freshly-trained linear policy already gets.
+STILL UNVERIFIED as of this module's own introduction: real-market-data validation at the
+scale a full retrain-all needs (every check this module's own tests ran during development
+used synthetic OHLCV, since that development sandbox had no Twelve Data/Mongo access) --
+treat a freshly-trained PPO policy as unproven until POST /rl/train has actually been run
+against real ingested candle history and its eval_run's hit_rate_pct/total_return_pct
+reviewed. The PyTorch dependency itself (build time, image size, cold-start latency on
+FastAPI Cloud -- see requirements.txt's own comment) has since been confirmed to deploy and
+import successfully (other endpoints in the same process depend on it starting up cleanly),
+but was likewise unverified before that first real deploy.
 """
 import io
 import time
@@ -47,12 +48,11 @@ from app.services import rl_engine as rl
 class ForexTradingEnv(gym.Env):
     """
     Thin gymnasium adapter around rl_engine's existing sized-action replay mechanics -- NOT a
-    reimplementation. `step` delegates entirely to rl_engine._take_action_sized (the exact
-    same reward logic LinearQPolicy trains against: log-balance-growth reward, ruin handling,
-    real position sizing via RISK_FRACTION_BY_TIER); the observation at every step is
-    rl_engine.full_rl_state applied to a precomputed market_states row, the same state a
-    LinearQPolicy would see at that bar. This is what lets a PPO policy and the linear Q
-    policy be compared on identical footing -- only the learning algorithm differs.
+    reimplementation. `step` delegates entirely to rl_engine._take_action_sized (log-balance-
+    growth reward, ruin handling, real position sizing via RISK_FRACTION_BY_TIER -- the exact
+    reward logic this project's retired linear Q-learning policy trained against too, see git
+    history); the observation at every step is rl_engine.full_rl_state applied to a
+    precomputed market_states row.
 
     market_states/df/indicator_df are precomputed ONCE by the caller (train_and_evaluate_ppo_
     poc) and passed in already -- same "compute once, reuse across every episode" discipline
@@ -118,7 +118,7 @@ def _build_market_states(
     df: pd.DataFrame, config: RuleConfig, pair: str, interval: str,
     split_idx: int, ml_reference_signals: Optional[list[dict]],
 ) -> tuple[pd.DataFrame, list[list[float]]]:
-    """Same market-state construction train_rl_policy uses -- reused, not reimplemented."""
+    """Same market-state construction this project's RL training has always used -- reused, not reimplemented."""
     indicator_df = add_all_indicators(df, config)
     ml_model = rl.frozen_ml_snapshot(df, split_idx, ml_reference_signals)
     ml_scores = rl.compute_ml_scores(indicator_df, config, pair, interval, rl.rl_config_profile(interval), ml_model)
@@ -131,13 +131,14 @@ def _build_market_states(
 
 def _greedy_ppo_action(model: PPO, obs: np.ndarray) -> tuple[str, dict[str, float]]:
     """
-    Interpretability replacement for LinearQPolicy's per-feature weight table (see "Signal
-    Stack v2" phase 3, section 04's interpretability decision) -- PPO's policy network has no
-    per-feature weight to show, but it does expose an action-probability distribution at
-    every decision, which is the lighter-weight of the two options that plan raised (vs. a
-    heavier SHAP-based explainer). Returns the greedy (argmax-probability) action plus the
-    full action -> probability dict, deliberately shaped like rl_engine.choose_action's
-    (action, q_values) return so a caller can display it the same way.
+    Interpretability replacement for the retired linear policy's per-feature weight table
+    (see "Signal Stack v2" phase 3, section 04's interpretability decision) -- PPO's policy
+    network has no per-feature weight to show, but it does expose an action-probability
+    distribution at every decision, which is the lighter-weight of the two options that plan
+    raised (vs. a heavier SHAP-based explainer). Returns the greedy (argmax-probability)
+    action plus the full action -> probability dict, deliberately shaped like the retired
+    choose_action's (action, q_values) return so a caller can display it the same way --
+    RLSignal.q_values holds this dict now regardless of caller.
     """
     obs_tensor, _ = model.policy.obs_to_tensor(obs.reshape(1, -1))
     distribution = model.policy.get_distribution(obs_tensor)
@@ -154,7 +155,7 @@ def _evaluate_policy(
 ) -> tuple[BacktestRun, list[Signal]]:
     """
     Greedy evaluation on the untouched test slice -- same walk-forward, single-position-at-a-
-    time shape and same tallying as train_rl_policy's own eval loop, factored out so both the
+    time shape and tallying this project's RL eval has always used, factored out so both the
     PPO policy and the random baseline (train_and_evaluate_ppo_poc's "does it beat random"
     check) are scored by the exact same yardstick. action_fn(obs: np.ndarray) -> str picks
     the action for a given observation -- the only thing that differs between callers.
@@ -179,9 +180,8 @@ def _evaluate_policy(
         # _take_action_sized owns the actual reward/balance math (same log-balance-growth
         # formula and ruin handling every policy is judged by); label_outcome is called again
         # just below only to recover the raw status/outcome fields a Signal record needs,
-        # which _take_action_sized intentionally doesn't return -- same split train_rl_policy's
-        # own eval loop uses (see its docstring), kept here for the same reason: the trade log
-        # needs more detail than the training reward path does.
+        # which _take_action_sized intentionally doesn't return -- the trade log needs more
+        # detail than the training reward path does.
         _reward, advance, new_balance = rl._take_action_sized(
             df, indicator_df, i, action, pair, max_lookforward, balance, target_atr_mult, stop_atr_mult,
         )
@@ -265,10 +265,12 @@ def train_and_evaluate_ppo_poc(
 
     Returns a dict rather than a narrower type since this is explicitly POC-only, not a
     persisted/API-facing shape yet:
-      ppo_eval_run / ppo_trade_signals   -- PPO's own greedy test-slice evaluation, same
-                                             BacktestRun/Signal shape train_rl_policy produces
-                                             (profile="rl_ppo" so it's distinguishable from
-                                             the linear policy's "rl" in GET /backtest/runs).
+      ppo_eval_run / ppo_trade_signals   -- PPO's own greedy test-slice evaluation, the same
+                                             BacktestRun/Signal shape this project's RL eval
+                                             has always used (profile="rl_ppo" -- kept
+                                             distinct from the retired linear policy's "rl"
+                                             profile still sitting in old BacktestRun history,
+                                             see GET /backtest/runs).
       random_baseline_eval_run           -- a uniformly-random policy replayed over the exact
                                              same test slice via the exact same _evaluate_policy
                                              tallying -- the "beats random" check.
@@ -361,14 +363,14 @@ def train_ppo_policy(
     """
     The live-persistence wrapper around train_and_evaluate_ppo_poc -- same training/evaluation,
     plus serializing the trained model into a PPOPolicy ready for a caller (main.py's
-    POST /rl/train-ppo/{interval}) to insert into ppo_policies_collection. Kept as a thin
+    POST /rl/train/{interval}) to insert into ppo_policies_collection. Kept as a thin
     wrapper rather than folding serialization into train_and_evaluate_ppo_poc itself, since a
-    caller doing a quick POC check (persist=false equivalent) has no reason to pay for
-    serializing a model it's about to discard.
+    caller doing a quick POC check has no reason to pay for serializing a model it's about to
+    discard.
 
-    Unlike rl_engine.train_rl_policy, there is no warm_start here -- stable-baselines3's PPO
-    has no equivalent of LinearQPolicy's "continue from these exact weights and Adagrad
-    accumulators" resume; every training call starts a fresh PPO model. Repeated calls for the
+    Unlike this project's retired linear Q-learning policy, there is no warm_start here --
+    stable-baselines3's PPO has no equivalent of "continue from these exact weights and
+    Adagrad accumulators" resume; every training call starts a fresh PPO model. Repeated calls for the
     same pair/interval each train total_timesteps from scratch, they don't build on the
     previous run the way the linear policy's warm start does -- something a caller comparing
     the two algorithms' "keep training" behavior should know going in.
@@ -409,10 +411,10 @@ def train_ppo_policy(
 
 def choose_action_ppo(policy: PPOPolicy, state: list[float]) -> tuple[str, dict[str, float]]:
     """
-    Live-inference counterpart to rl_engine.choose_action, for a PPOPolicy instead of an
-    RLPolicy -- same staleness guard (a policy trained under an older/different state schema
-    raises rather than silently producing a meaningless result), same (action, action ->
-    float) return shape so a caller can display either algorithm's decision identically.
+    Live-inference for a persisted PPOPolicy -- called by main.py's POST /rl/signal/{interval}.
+    Same staleness guard this project's retired linear choose_action used (a policy trained
+    under an older/different state schema raises rather than silently producing a meaningless
+    result), same (action, action -> float) return shape.
 
     Loads the model fresh from policy.model_bytes on every call rather than caching a loaded
     model across requests -- see train_and_evaluate_ppo_poc's own save/load latency
@@ -425,7 +427,7 @@ def choose_action_ppo(policy: PPOPolicy, state: list[float]) -> tuple[str, dict[
             f"PPO policy {policy.policy_id} for {policy.pair}/{policy.interval} was trained "
             f"against a different state feature set ({len(policy.feature_names)} features, "
             f"current code produces {len(rl.RL_FEATURE_NAMES)}) -- stale after a feature-set "
-            f"change, retrain via POST /rl/train-ppo/{policy.interval}?pair={policy.pair} first."
+            f"change, retrain via POST /rl/train/{policy.interval}?pair={policy.pair} first."
         )
     model = PPO.load(io.BytesIO(policy.model_bytes), device="cpu")
     obs = np.asarray(state, dtype=np.float32)
