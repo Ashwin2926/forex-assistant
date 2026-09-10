@@ -2,10 +2,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type PPOPolicy, type PPOTrainDiagnostics, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type PPOPolicy, type PPOTrainDiagnostics, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLSignal, type RLTrainAllCell, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
-// How often to poll GET /rl/train-all/{job_id} while a batch run is in progress.
+// How long "Stop" stays disabled after a click, giving the client-side train-all loop (see
+// handleTrainAll) one iteration's worth of time to notice trainAllCancelRef and settle.
 const TRAIN_ALL_POLL_MS = 4000;
 
 interface GenerateAllCell {
@@ -121,7 +122,7 @@ export default function RLPage() {
 
   const [trainAllJob, setTrainAllJob] = useState<RLTrainAllJob | null>(null);
   const [trainAllStartError, setTrainAllStartError] = useState<string | null>(null);
-  const trainAllPollGuard = useRef<string | null>(null);
+  const trainAllCancelRef = useRef(false);
 
   const [expandedHistoryTrades, setExpandedHistoryTrades] = useState<string | null>(null);
   const [tradeLogs, setTradeLogs] = useState<Record<string, Signal[]>>({});
@@ -178,37 +179,12 @@ export default function RLPage() {
     }
   }
 
-  async function pollTrainAllJob(jobId: string) {
-    trainAllPollGuard.current = jobId;
-    let job: RLTrainAllJob;
-    try {
-      job = await api.getTrainAllRLJob(jobId);
-    } catch {
-      return; // transient network hiccup -- next mount or manual "Train all" click recovers
-    }
-    if (trainAllPollGuard.current !== jobId) return; // superseded by a newer job
-    setTrainAllJob(job);
-    if (job.status === "running") {
-      setTimeout(() => pollTrainAllJob(jobId), TRAIN_ALL_POLL_MS);
-    } else {
-      await loadPolicies();
-    }
-  }
-
   useEffect(() => {
     loadPolicies();
     loadRecentSignals();
     loadOverallAccuracy();
     loadLearningCurve();
     loadInsights();
-    api.getLatestTrainAllRLJob().then((job) => {
-      if (job && job.status === "running") {
-        setTrainAllJob(job);
-        pollTrainAllJob(job.job_id);
-      } else if (job) {
-        setTrainAllJob(job);
-      }
-    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -230,32 +206,56 @@ export default function RLPage() {
     }
   }
 
+  // Client-driven sequential loop, NOT the backend's POST /rl/train-all + BackgroundTasks job
+  // (still there server-side, unused from here) -- that mechanism relies on a background
+  // coroutine outliving the request that scheduled it, which this project has already been
+  // burned by once before (see keep-fresh.yml's own history: the in-process APScheduler died
+  // the same way whenever FastAPI Cloud recycled the instance right after a response went
+  // out). This mirrors handleGenerateAll below, which uses the same pattern for the same
+  // reason and is the one batch flow on this page that's never gotten stuck.
   async function handleTrainAll() {
     setTrainAllStartError(null);
-    try {
-      const job = await api.startTrainAllRL({ total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance });
-      setTrainAllJob(job);
-      pollTrainAllJob(job.job_id);
-    } catch (e) {
-      setTrainAllStartError(e instanceof ApiError ? e.message : "Couldn't start training.");
+    trainAllCancelRef.current = false;
+    const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
+    const results: RLTrainAllCell[] = [];
+    setTrainAllJob({
+      job_id: "client-local", status: "running", created_at: new Date().toISOString(),
+      total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance,
+      total: combos.length, completed: 0, results: [], cancel_requested: false,
+    });
+    for (const { pair: p, interval: i } of combos) {
+      if (trainAllCancelRef.current) break;
+      try {
+        const { policy, evaluation } = await api.trainRLPolicy(p, i, {
+          total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance,
+        });
+        results.push({
+          pair: p, interval: i, ok: true, policy_id: policy.policy_id,
+          hit_rate_pct: evaluation.hit_rate_pct, expectancy_pct: evaluation.expectancy_pct,
+          directional_signals: evaluation.directional_signals, hold_signals: evaluation.hold_signals,
+          starting_balance: evaluation.starting_balance, ending_balance: evaluation.ending_balance,
+          total_return_pct: evaluation.total_return_pct,
+        });
+      } catch (e) {
+        results.push({ pair: p, interval: i, ok: false, error: e instanceof ApiError ? e.message : "Failed" });
+      }
+      setTrainAllJob((prev) => prev && ({ ...prev, completed: results.length, results: [...results] }));
     }
+    setTrainAllJob((prev) => prev && ({
+      ...prev, status: trainAllCancelRef.current ? "cancelled" : "done", finished_at: new Date().toISOString(),
+    }));
+    await loadPolicies();
   }
 
   const [cancelling, setCancelling] = useState(false);
 
-  async function handleCancelTrainAll() {
-    if (!trainAllJob) return;
+  function handleCancelTrainAll() {
+    trainAllCancelRef.current = true;
     setCancelling(true);
-    try {
-      const job = await api.cancelTrainAllRLJob(trainAllJob.job_id);
-      trainAllPollGuard.current = null;
-      setTrainAllJob(job);
-      await loadPolicies();
-    } catch (e) {
-      setTrainAllStartError(e instanceof ApiError ? e.message : "Couldn't stop training.");
-    } finally {
-      setCancelling(false);
-    }
+    // The loop itself flips status to "cancelled" once it notices this flag between combos
+    // (a combo already in flight always finishes -- no PPO training call can be interrupted
+    // mid-run) -- clear the transient button state once that catches up.
+    setTimeout(() => setCancelling(false), TRAIN_ALL_POLL_MS);
   }
 
   const trainAllRunning = trainAllJob?.status === "running";
@@ -570,9 +570,9 @@ export default function RLPage() {
           <div className="flex items-center justify-between">
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Or train all 4 pairs &times; 5 intervals at once (using the settings above) —
-              same thing the cron does once daily, run on demand. Runs server-side once
-              started, so it&apos;s safe to close this tab — reopening the page picks the
-              same run back up.
+              same thing the cron does once daily, run on demand. Runs as a sequence of
+              requests from this tab (usually ~5-6 minutes total) — keep this tab open until
+              it finishes; closing it stops the run partway through.
             </p>
             <div className="flex shrink-0 items-center gap-2">
               <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">
