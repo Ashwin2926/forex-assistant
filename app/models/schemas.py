@@ -117,7 +117,7 @@ class StrategyCall(BaseModel):
     strategy stays explainable and ML-feature-ready the same way the trend strategy already
     is, not just a bare direction).
     """
-    strategy: str  # "trend" | "bollinger" | "support_resistance" | "candlestick" | "stoch_adx" | "volume_momentum" | "smart_money"
+    strategy: str  # "market_structure" | "order_blocks" | "fair_value_gap" | "liquidity_sweep" | "supply_demand"
     direction: Literal["BUY", "SELL", "HOLD"]
     entry_price: float
     target_price: Optional[float] = None  # None when direction == HOLD
@@ -236,9 +236,12 @@ class MLTrainResult(BaseModel):
     Result of training the supervised hit/miss classifier (app/services/ml_model.py) on the
     current set of resolved live signals -- a sibling to BacktestRun, not a reuse of it: the
     metrics are genuinely different (accuracy/precision/recall against a chronological
-    train/test split, not hit_rate/expectancy against a rule-config). feature_coefficients is
-    what a LogisticRegression actually leaned on, for the same interpretability every other
-    part of this project already treats as non-negotiable (SignalReason.detail, rule_stats).
+    train/test split, not hit_rate/expectancy against a rule-config). feature_importances is
+    what an XGBoost classifier actually leaned on, for the same interpretability every other
+    part of this project already treats as non-negotiable (SignalReason.detail, rule_stats) --
+    named honestly as gain-based IMPORTANCE, not signed coefficients: unlike the prior
+    LogisticRegression's coef_, XGBoost's feature_importances_ has no sign or "pushes toward
+    hit vs. away from it" direction, only "how much the model relied on this feature."
     """
     run_id: str
     created_at: datetime
@@ -248,7 +251,7 @@ class MLTrainResult(BaseModel):
     test_accuracy: float
     test_precision: Optional[float] = None
     test_recall: Optional[float] = None
-    feature_coefficients: dict[str, float] = {}
+    feature_importances: dict[str, float] = {}
     test_calibration: list[MLCalibrationBucket] = []
     # True when /ml/train found the resolved-signal count unchanged since the last run and
     # returned that prior result as-is instead of refitting on identical data (see
@@ -303,7 +306,7 @@ class RLSignal(BaseModel):
     alongside Signal (rule engine) and ConsensusSignal (fixed-threshold vote), same
     "separate, clearly-labeled, easy to remove" principle. q_values is this signal's
     interpretability surface (which action the policy favored and by how much), the same
-    role feature_coefficients/strategy_calls play elsewhere. HOLD never produces a stored
+    role feature_importances/strategy_calls play elsewhere. HOLD never produces a stored
     RLSignal, same as ConsensusSignal.
     """
     # A stable business key (uuid hex, same convention as policy_id/run_id/job_id elsewhere)
@@ -360,7 +363,7 @@ class RLInsightFinding(BaseModel):
     One deterministic, explainable "what to improve" finding from GET /rl/insights --
     synthesized from data this project already collects (trained-policy backtest evals, live
     resolution breakdowns, the learning-curve verdict), not an LLM call. Same "explainable,
-    not black-box" ethos as SignalReason/feature_coefficients elsewhere in this project.
+    not black-box" ethos as SignalReason/feature_importances elsewhere in this project.
     pair/interval are None for a system-wide finding (e.g. the overall learning verdict).
     """
     severity: Literal["good", "warning", "critical"]

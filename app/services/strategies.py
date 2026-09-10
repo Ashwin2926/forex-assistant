@@ -1,148 +1,73 @@
 import pandas as pd
-from typing import Callable
+from typing import Callable, Optional
 from app.models.schemas import RuleConfig, SignalReason, StrategyCall
-from app.services.signal_engine import apply_rules, decide, compute_atr_target_stop
-from app.services.patterns import find_swing_levels, detect_candlestick_pattern
+from app.services.signal_engine import compute_atr_target_stop
+from app.services.patterns import find_swing_levels
 
-# Patterns that imply a direction to trade. Doji is deliberately excluded -- it signals
-# indecision, not a direction, so it should read as HOLD like "no pattern" does.
-BULLISH_PATTERNS = {"bullish_engulfing", "hammer"}
-BEARISH_PATTERNS = {"bearish_engulfing", "shooting_star"}
-
-# Below this, ADX says there's no real trend underway -- a stochastic crossover in a
-# non-trending market is much more likely to be noise, so call_stoch_adx ignores it entirely
-# rather than trading it at reduced confidence.
-ADX_TREND_THRESHOLD = 20.0
-
-# call_volume_momentum: how large a 5-bar move needs to be (relative to ATR) to count as
-# "momentum" at all, and how far above its own 20-bar average volume has to be to "confirm"
-# that move rather than trust price alone. Both starting guesses, not backtested.
-MOMENTUM_ROC_ATR_MULT = 1.0
-VOLUME_CONFIRMATION_MULT = 1.5
-
-# call_smart_money: how much larger a rejection wick must be than the candle's own body to
-# count as an aggressive "liquidity sweep" rather than an ordinary bounce. Starting guess,
-# matches detect_candlestick_pattern's hammer/shooting-star wick-to-body convention, not
-# independently backtested.
-SMC_WICK_BODY_MULT = 2.0
-
-# How far beyond the sweep wick's own extreme the stop sits, as an ATR multiple -- a real
-# SMC stop goes just past the sweep itself (if price returns there, the liquidity-grab
-# thesis was wrong), not a flat multiple from entry the way most other strategies here do.
-SMC_STOP_BUFFER_ATR_MULT = 0.25
+# Full Smart Money Concepts (ICT) stack -- five independent strategies, replacing the single
+# call_smart_money liquidity-sweep approximation that used to be the only SMC voice in this
+# codebase. Each one is a mechanized, deliberately narrow reading of one SMC concept, not a
+# full discretionary implementation -- same "mechanize the trigger, not the whole judgment
+# call" philosophy every other strategy in this module already follows.
 
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(x, 1.0))
 
 
-def call_trend(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
-    """Wraps the existing, already-backtested EMA/RSI/MACD engine unmodified -- this strategy
-    IS today's live signal_engine.py, just reframed as one voice among five."""
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    reasons, bullish_votes, bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(latest, prev, config)
-    volatility_ok = next(r.passed for r in reasons if r.rule == "volatility_filter")
-    session_ok = next((r.passed for r in reasons if r.rule == "session_filter"), True)
-    direction, confidence = decide(
-        bullish_votes, bearish_votes, total_rules, volatility_ok and session_ok, rule_votes, rule_strengths
-    )
+# How much larger a candle's body needs to be than its own ATR to count as a "strong impulse"
+# move for call_order_blocks/call_supply_demand -- ATR-relative, never a fixed pip count, the
+# same convention every threshold in this module follows.
+IMPULSE_ATR_MULT = 1.5
 
-    entry_price = float(latest["close"])
-    target_price = stop_price = None
-    if direction in ("BUY", "SELL"):
-        atr_val = float(latest["atr"])
-        target_price, stop_price = compute_atr_target_stop(
-            entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
-        )
+# How many bars back of the evaluation window call_order_blocks/call_supply_demand will search
+# for the most recent qualifying impulse -- bounded so a zone that formed long ago (long since
+# irrelevant to current price) doesn't still fire a call; a real order block/demand zone is
+# either retested soon after forming or it isn't, in practice.
+SMC_ZONE_LOOKBACK_BARS = 15
 
-    return StrategyCall(
-        strategy="trend", direction=direction,
-        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons,
-        # confidence is already a 0-100 blend of rule_strengths -- the same "how strong was
-        # this reading" score this strategy's own reasons are built from, just reused instead
-        # of re-deriving a separate strength number.
-        strength=_clamp01(confidence / 100) if direction in ("BUY", "SELL") else None,
-    )
+# How far beyond a zone's own far edge a stop sits, as an ATR multiple -- a real SMC stop goes
+# just past the level itself (if price returns there, the zone's thesis was wrong), not a flat
+# multiple from entry the way most non-SMC strategies use. Shared by every SMC strategy below
+# that anchors its stop to a zone edge rather than entry price.
+SMC_STOP_BUFFER_ATR_MULT = 0.25
+
+# call_liquidity_sweep: how much larger a rejection wick must be than the candle's own body to
+# count as an aggressive "liquidity sweep" rather than an ordinary bounce. Starting guess,
+# matches detect_candlestick_pattern's hammer/shooting-star wick-to-body convention, not
+# independently backtested.
+SMC_WICK_BODY_MULT = 2.0
+
+# call_supply_demand: a bar's body below this ATR multiple counts as "small" enough to belong
+# to a consolidation range rather than being a directional move in its own right.
+CONSOLIDATION_BODY_ATR_MULT = 0.5
+
+# call_supply_demand needs at least this many consecutive small-bodied bars immediately before
+# an impulse to call it a genuine consolidation zone -- one bar alone is just an order block
+# (call_order_blocks), not "one level up" from it.
+CONSOLIDATION_MIN_BARS = 2
+
+# call_fair_value_gap: gap size (candle 1's edge to candle 3's edge) at this multiple of ATR is
+# treated as a maximally significant imbalance for strength-scoring purposes -- a self-
+# referential ceiling, same pattern as call_liquidity_sweep's own strength ceiling below.
+FVG_STRENGTH_ATR_CEILING_MULT = 2.0
+
+# call_market_structure: a reversal call (Change of Character -- a swing level taken out
+# AGAINST the prevailing EMA trend) is inherently less certain than a continuation call (Break
+# of Structure -- taken out WITH it), since it's arguing the trend is ending rather than
+# confirming it. Discounted, not dropped -- CHoCH is still a real, tradeable SMC concept.
+CHOCH_STRENGTH_DISCOUNT = 0.7
 
 
-def call_bollinger(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+def call_market_structure(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
     """
-    Mean-reversion: a close at/beyond a band is treated as an extreme due to revert back
-    toward the middle band, gated by band width so a touch during a tight, low-volatility
-    squeeze isn't trusted as a real extreme (reuses volatility_threshold_pct the same way the
-    trend strategy's volatility_filter does, just measured as band width instead of ATR%).
+    Break of Structure (BOS) vs Change of Character (CHoCH): a recent swing level -- the same
+    swing-pivot detection call_liquidity_sweep and (formerly) call_support_resistance already
+    used, see patterns.find_swing_levels -- taken out in the direction of the prevailing EMA
+    trend reads as continuation (BOS); taken out AGAINST it reads as an early reversal (CHoCH).
+    Trend context is ema_fast vs ema_slow, the same trend read this codebase already uses
+    elsewhere (signal_engine's own trend_ema rule) -- not re-derived independently.
 
-    Target is the middle band itself, not a generic ATR multiple -- that's the actual
-    mean-reversion thesis this strategy is built on, so forcing it into the same
-    entry ± target_atr_mult*ATR shape every other strategy uses would misrepresent what it's
-    actually predicting. Stop is still ATR-based, same risk-sizing convention as elsewhere.
-    """
-    latest = df.iloc[-1]
-    entry_price = float(latest["close"])
-    atr_val = float(latest["atr"])
-    band_width_pct = (
-        (latest["bb_upper"] - latest["bb_lower"]) / latest["bb_middle"] * 100
-        if latest["bb_middle"] else 0.0
-    )
-    bands_wide_enough = band_width_pct > config.volatility_threshold_pct
-
-    reasons = [SignalReason(
-        rule="bollinger_band_width", passed=bands_wide_enough, value=float(band_width_pct),
-        detail=f"Band width is {band_width_pct:.4f}% of price — "
-               f"{'sufficient' if bands_wide_enough else 'too narrow, likely ranging tightly'}"
-    )]
-
-    direction = "HOLD"
-    target_price = stop_price = None
-    if bands_wide_enough:
-        if latest["close"] <= latest["bb_lower"]:
-            direction = "BUY"
-            reasons.append(SignalReason(
-                rule="bollinger_touch", passed=True, value=float(latest["close"] - latest["bb_lower"]),
-                detail=f"Close ({latest['close']:.5f}) at/below lower band ({latest['bb_lower']:.5f}) "
-                       f"— oversold, reversion to mean expected"
-            ))
-        elif latest["close"] >= latest["bb_upper"]:
-            direction = "SELL"
-            reasons.append(SignalReason(
-                rule="bollinger_touch", passed=True, value=float(latest["close"] - latest["bb_upper"]),
-                detail=f"Close ({latest['close']:.5f}) at/above upper band ({latest['bb_upper']:.5f}) "
-                       f"— overbought, reversion to mean expected"
-            ))
-        else:
-            reasons.append(SignalReason(
-                rule="bollinger_touch", passed=False, value=float(latest["close"] - latest["bb_middle"]),
-                detail=f"Close ({latest['close']:.5f}) inside bands — no extreme"
-            ))
-    else:
-        reasons.append(SignalReason(rule="bollinger_touch", passed=False, detail="Skipped -- bands too narrow to trust a touch"))
-
-    strength = None
-    if direction in ("BUY", "SELL"):
-        target_price = float(latest["bb_middle"])
-        stop_price = (
-            entry_price - config.stop_atr_mult * atr_val if direction == "BUY"
-            else entry_price + config.stop_atr_mult * atr_val
-        )
-        # How far past the band, in ATR terms -- one full ATR beyond the band is already a
-        # sizeable extreme, so that's the "full strength" ceiling; a touch that's barely past
-        # the band reads as weak.
-        band_edge = latest["bb_lower"] if direction == "BUY" else latest["bb_upper"]
-        strength = _clamp01(abs(entry_price - band_edge) / atr_val) if atr_val > 0 else None
-
-    return StrategyCall(
-        strategy="bollinger", direction=direction,
-        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons, strength=strength,
-    )
-
-
-def call_support_resistance(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
-    """
-    Breakout (close clears a level it was previously inside of) or bounce (price touches a
-    level intrabar but closes back on the same side) off the nearest recent swing level.
     Levels are computed from history strictly before this bar (df.iloc[:-1]) -- using the
     current bar's own high/low to define "the level it just broke" would be circular.
     """
@@ -153,248 +78,256 @@ def call_support_resistance(df: pd.DataFrame, config: RuleConfig = RuleConfig())
     resistance_levels, support_levels = find_swing_levels(df.iloc[:-1])
     nearest_resistance = resistance_levels[0] if resistance_levels else None
     nearest_support = support_levels[0] if support_levels else None
+    uptrend = bool(pd.notna(latest["ema_fast"]) and pd.notna(latest["ema_slow"]) and latest["ema_fast"] > latest["ema_slow"])
 
     res_str = f"{nearest_resistance:.5f}" if nearest_resistance is not None else "n/a"
     sup_str = f"{nearest_support:.5f}" if nearest_support is not None else "n/a"
     reasons = [SignalReason(
-        rule="swing_levels", passed=nearest_resistance is not None and nearest_support is not None,
-        detail=f"Nearest resistance {res_str}, nearest support {sup_str}"
+        rule="structure_levels", passed=nearest_resistance is not None and nearest_support is not None,
+        detail=f"Nearest structural high {res_str}, nearest structural low {sup_str} -- "
+               f"{'uptrend' if uptrend else 'downtrend'} context (EMA{config.ema_fast} vs EMA{config.ema_slow})"
     )]
 
     direction = "HOLD"
     target_price = stop_price = None
+    is_choch = False
 
-    if nearest_resistance is not None and latest["close"] > nearest_resistance and prev["close"] <= nearest_resistance:
+    broke_high = nearest_resistance is not None and latest["close"] > nearest_resistance and prev["close"] <= nearest_resistance
+    broke_low = nearest_support is not None and latest["close"] < nearest_support and prev["close"] >= nearest_support
+
+    if broke_high:
         direction = "BUY"
+        is_choch = not uptrend
         reasons.append(SignalReason(
-            rule="resistance_breakout", passed=True, value=float(latest["close"] - nearest_resistance),
-            detail=f"Close ({latest['close']:.5f}) broke above resistance ({nearest_resistance:.5f})"
+            rule="change_of_character" if is_choch else "break_of_structure", passed=True,
+            value=float(latest["close"] - nearest_resistance),
+            detail=f"Close ({latest['close']:.5f}) broke above structural high ({nearest_resistance:.5f}) -- "
+                   f"{'reversal against the trend (CHoCH)' if is_choch else 'continuation with the trend (BOS)'}"
         ))
-    elif nearest_support is not None and latest["close"] < nearest_support and prev["close"] >= nearest_support:
+    elif broke_low:
         direction = "SELL"
+        is_choch = uptrend
         reasons.append(SignalReason(
-            rule="support_breakdown", passed=True, value=float(nearest_support - latest["close"]),
-            detail=f"Close ({latest['close']:.5f}) broke below support ({nearest_support:.5f})"
-        ))
-    elif nearest_support is not None and latest["low"] <= nearest_support and latest["close"] > nearest_support:
-        direction = "BUY"
-        reasons.append(SignalReason(
-            rule="support_bounce", passed=True, value=float(latest["close"] - nearest_support),
-            detail=f"Price touched support ({nearest_support:.5f}) and bounced, close ({latest['close']:.5f})"
-        ))
-    elif nearest_resistance is not None and latest["high"] >= nearest_resistance and latest["close"] < nearest_resistance:
-        direction = "SELL"
-        reasons.append(SignalReason(
-            rule="resistance_bounce", passed=True, value=float(nearest_resistance - latest["close"]),
-            detail=f"Price touched resistance ({nearest_resistance:.5f}) and rejected, close ({latest['close']:.5f})"
+            rule="change_of_character" if is_choch else "break_of_structure", passed=True,
+            value=float(nearest_support - latest["close"]),
+            detail=f"Close ({latest['close']:.5f}) broke below structural low ({nearest_support:.5f}) -- "
+                   f"{'reversal against the trend (CHoCH)' if is_choch else 'continuation with the trend (BOS)'}"
         ))
     else:
-        reasons.append(SignalReason(rule="swing_level_reaction", passed=False, detail="No breakout or bounce at a nearby level"))
+        reasons.append(SignalReason(rule="structure_break", passed=False, detail="No structural level broken this bar"))
 
     strength = None
     if direction in ("BUY", "SELL"):
         target_price, stop_price = compute_atr_target_stop(
             entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
         )
-        # reasons[-1] is whichever of the 4 breakout/bounce branches fired -- its value is
-        # already the distance past the level; one full ATR past it is a decisive move.
         strength = _clamp01(abs(reasons[-1].value) / atr_val) if atr_val > 0 else None
+        if strength is not None and is_choch:
+            strength = _clamp01(strength * CHOCH_STRENGTH_DISCOUNT)
 
     return StrategyCall(
-        strategy="support_resistance", direction=direction,
+        strategy="market_structure", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
         reasons=reasons, strength=strength,
     )
 
 
-def call_candlestick(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
-    """Engulfing/hammer/shooting-star/doji from patterns.py. Most bars have no pattern at
-    all -- that's expected, not a bug, and reads as HOLD like every other strategy's non-signal."""
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    entry_price = float(latest["close"])
-    atr_val = float(latest["atr"])
-    pattern = detect_candlestick_pattern(latest, prev)
-
-    direction = "HOLD"
-    if pattern in BULLISH_PATTERNS:
-        direction = "BUY"
-    elif pattern in BEARISH_PATTERNS:
-        direction = "SELL"
-
-    reasons = [SignalReason(
-        rule="candlestick_pattern", passed=direction != "HOLD",
-        detail=f"Pattern: {pattern}" if pattern else "No recognized pattern on this bar",
-    )]
-
-    target_price = stop_price = None
-    # Genuinely binary, unlike every other strategy here -- a pattern either matched this bar
-    # or it didn't, with no natural in-between reading to grade (detect_candlestick_pattern
-    # doesn't expose partial-match info). Full strength on a match rather than inventing a
-    # fake gradient; None means "no vote," same as everywhere else.
-    strength = None
-    if direction in ("BUY", "SELL"):
-        target_price, stop_price = compute_atr_target_stop(
-            entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
-        )
-        strength = 1.0
-
-    return StrategyCall(
-        strategy="candlestick", direction=direction,
-        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons, strength=strength,
-    )
-
-
-def call_stoch_adx(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+def _find_recent_impulse(window: pd.DataFrame, lookback: int) -> Optional[tuple[int, str, float, float]]:
     """
-    Direction from a %K/%D stochastic crossover (only when not already deep in overbought/
-    oversold territory, so it's a fresh cross rather than a stale one); ADX is a trend-STRENGTH
-    filter, not a direction source (it can't say which way a strong trend points), so a
-    crossover is only trusted when ADX confirms a real trend is underway.
+    Scans the last `lookback` bars of `window`, EXCLUDING its own final row (that's "now" --
+    an order block/demand zone needs at least one bar of reaction after the impulse that
+    formed it to mean anything), for the most recent single candle whose body is at least
+    IMPULSE_ATR_MULT times that bar's own ATR. Returns (positional index within window,
+    impulse direction, that bar's open, that bar's close) for the nearest qualifying bar, or
+    None if none of the last `lookback` bars qualify. Shared by call_order_blocks and
+    call_supply_demand -- both need "find the most recent strong move" as their first step,
+    differing only in what they treat as the zone that preceded it.
     """
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    entry_price = float(latest["close"])
-    atr_val = float(latest["atr"])
-    adx_val = float(latest["adx"]) if pd.notna(latest["adx"]) else 0.0
-    trending = adx_val > ADX_TREND_THRESHOLD
-
-    reasons = [SignalReason(
-        rule="adx_trend_strength", passed=trending, value=adx_val,
-        detail=f"ADX at {adx_val:.1f} — "
-               f"{'trending, stochastic signal trusted' if trending else 'no clear trend, stochastic signal ignored'}"
-    )]
-
-    direction = "HOLD"
-    target_price = stop_price = None
-    if trending:
-        stoch_cross_up = prev["stoch_k"] <= prev["stoch_d"] and latest["stoch_k"] > latest["stoch_d"] and latest["stoch_k"] < 80
-        stoch_cross_down = prev["stoch_k"] >= prev["stoch_d"] and latest["stoch_k"] < latest["stoch_d"] and latest["stoch_k"] > 20
-        if stoch_cross_up:
-            direction = "BUY"
-            reasons.append(SignalReason(
-                rule="stochastic_cross", passed=True, value=float(latest["stoch_k"]),
-                detail=f"%K ({latest['stoch_k']:.1f}) crossed above %D ({latest['stoch_d']:.1f})"
-            ))
-        elif stoch_cross_down:
-            direction = "SELL"
-            reasons.append(SignalReason(
-                rule="stochastic_cross", passed=True, value=float(latest["stoch_k"]),
-                detail=f"%K ({latest['stoch_k']:.1f}) crossed below %D ({latest['stoch_d']:.1f})"
-            ))
-        else:
-            reasons.append(SignalReason(
-                rule="stochastic_cross", passed=False, value=float(latest["stoch_k"]),
-                detail="No stochastic crossover this bar"
-            ))
-    else:
-        reasons.append(SignalReason(rule="stochastic_cross", passed=False, detail="Skipped -- ADX below trend threshold"))
-
-    strength = None
-    if direction in ("BUY", "SELL"):
-        target_price, stop_price = compute_atr_target_stop(
-            entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
-        )
-        # ADX 50+ is already a very strong trend by common technical-analysis convention, so
-        # that's the "full strength" ceiling -- not the crossover itself, since ADX is what
-        # this strategy actually gates on (the crossover only fires direction, not conviction).
-        strength = _clamp01(adx_val / 50)
-
-    return StrategyCall(
-        strategy="stoch_adx", direction=direction,
-        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
-        reasons=reasons, strength=strength,
-    )
+    start = max(0, len(window) - 1 - lookback)
+    for pos in range(len(window) - 2, start - 1, -1):
+        bar = window.iloc[pos]
+        atr_val = bar["atr"]
+        if pd.isna(atr_val) or atr_val <= 0:
+            continue
+        body = abs(bar["close"] - bar["open"])
+        if body >= IMPULSE_ATR_MULT * atr_val:
+            direction = "BUY" if bar["close"] > bar["open"] else "SELL"
+            return pos, direction, float(bar["open"]), float(bar["close"])
+    return None
 
 
-def call_volume_momentum(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+def call_order_blocks(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
     """
-    Momentum trading: a fast multi-bar price move (rate_of_change, not a single noisy candle),
-    confirmed by above-average volume rather than trusted on price alone -- the piece
-    call_stoch_adx's ADX-based trend-strength approximation doesn't cover, since ADX has
-    nothing to do with volume.
-
-    Forex caveat worth being upfront about: most forex data providers, Twelve Data included,
-    report *tick* volume -- how many price updates occurred, not literal traded volume, since
-    spot forex is decentralized with no single exchange tape the way a listed stock has. It's
-    a real, commonly-used proxy for market activity, just not the same thing a stock trader
-    would mean by "volume." Falls back to HOLD when volume data isn't available at all,
-    rather than guessing.
+    An order block is the last opposite-direction candle immediately before a strong impulse
+    move -- the last sellers (or buyers) absorbed right before price left them behind.
+    "Strong" is ATR-relative (IMPULSE_ATR_MULT), never a fixed pip count, matching every other
+    threshold in this codebase. Fires when price is currently trading back inside that
+    candle's own high/low range (a retest) without having closed through its far edge -- the
+    thesis is continuation in the impulse's original direction from the retest, not the
+    retest itself being a reversal.
     """
     latest = df.iloc[-1]
     entry_price = float(latest["close"])
     atr_val = float(latest["atr"])
 
-    volume_available = pd.notna(latest.get("volume")) and latest.get("volume", 0) > 0 and pd.notna(latest.get("volume_sma")) and latest["volume_sma"] > 0
-    if not volume_available:
+    impulse = _find_recent_impulse(df, SMC_ZONE_LOOKBACK_BARS)
+    if impulse is None:
         return StrategyCall(
-            strategy="volume_momentum", direction="HOLD",
-            entry_price=entry_price, target_price=None, stop_price=None,
-            reasons=[SignalReason(rule="volume_confirmation", passed=False, detail="No reliable volume data for this candle")],
+            strategy="order_blocks", direction="HOLD", entry_price=entry_price,
+            reasons=[SignalReason(rule="order_block_impulse", passed=False, detail="No qualifying impulse move in recent history")],
         )
 
-    volume_ratio = float(latest["volume"] / latest["volume_sma"])
-    volume_confirmed = volume_ratio >= VOLUME_CONFIRMATION_MULT
-    reasons = [SignalReason(
-        rule="volume_confirmation", passed=volume_confirmed, value=volume_ratio,
-        detail=f"Volume is {volume_ratio:.2f}x the 20-bar average — "
-               f"{'confirmed' if volume_confirmed else 'not elevated enough'}"
-    )]
+    impulse_pos, impulse_direction, impulse_open, impulse_close = impulse
+    if impulse_pos == 0:
+        return StrategyCall(
+            strategy="order_blocks", direction="HOLD", entry_price=entry_price,
+            reasons=[SignalReason(rule="order_block_impulse", passed=False, detail="Impulse candle has no preceding bar to form an order block from")],
+        )
 
-    roc = float(latest["roc"]) if pd.notna(latest["roc"]) else 0.0
-    roc_price_move = abs(roc) / 100 * entry_price
-    momentum_strong = atr_val > 0 and (roc_price_move / atr_val) >= MOMENTUM_ROC_ATR_MULT
-    reasons.append(SignalReason(
-        rule="momentum_strength", passed=momentum_strong, value=roc,
-        detail=f"5-bar rate of change is {roc:.3f}% — "
-               f"{'strong' if momentum_strong else 'not strong enough'} relative to ATR"
-    ))
+    ob_candle = df.iloc[impulse_pos - 1]
+    ob_bullish = bool(ob_candle["close"] > ob_candle["open"])
+    # A genuine order block is the OPPOSITE color of the impulse it precedes -- a bullish
+    # impulse should be preceded by the last bearish candle (the last sellers), not another
+    # bullish one (that would just be more of the same move, not a distinct absorption zone).
+    is_valid_ob = (impulse_direction == "BUY" and not ob_bullish) or (impulse_direction == "SELL" and ob_bullish)
+    ob_high = float(ob_candle["high"])
+    ob_low = float(ob_candle["low"])
+
+    reasons = [SignalReason(
+        rule="order_block_impulse", passed=is_valid_ob, value=float(abs(ob_candle["close"] - ob_candle["open"])),
+        detail=f"{impulse_direction} impulse {len(df) - 1 - impulse_pos} bar(s) ago, preceding candle "
+               f"[{ob_low:.5f}, {ob_high:.5f}] {'is' if is_valid_ob else 'is not'} an opposite-direction order block"
+    )]
 
     direction = "HOLD"
     target_price = stop_price = None
+    if is_valid_ob:
+        in_zone = bool(latest["low"] <= ob_high and latest["high"] >= ob_low)
+        if impulse_direction == "BUY" and in_zone and latest["close"] > ob_low:
+            direction = "BUY"
+            target_price = float(df.iloc[impulse_pos]["high"])
+            stop_price = ob_low - SMC_STOP_BUFFER_ATR_MULT * atr_val
+        elif impulse_direction == "SELL" and in_zone and latest["close"] < ob_high:
+            direction = "SELL"
+            target_price = float(df.iloc[impulse_pos]["low"])
+            stop_price = ob_high + SMC_STOP_BUFFER_ATR_MULT * atr_val
+
+        reasons.append(SignalReason(
+            rule="order_block_retest", passed=direction != "HOLD",
+            detail=(f"Price retesting the order block zone [{ob_low:.5f}, {ob_high:.5f}], "
+                    f"close {latest['close']:.5f} -- continuation {direction} expected")
+            if direction != "HOLD" else "Price not currently retesting the order block zone"
+        ))
+
     strength = None
-    if volume_confirmed and momentum_strong:
-        direction = "BUY" if roc > 0 else "SELL"
-        target_price, stop_price = compute_atr_target_stop(
-            entry_price, atr_val, direction, config.target_atr_mult, config.stop_atr_mult
-        )
-        # Averages two independently-normalized components -- volume ratio against 2x its own
-        # confirmation threshold, momentum against 2x its own ATR-relative threshold -- rather
-        # than either alone, since this strategy's whole thesis is that both need to agree
-        # (currently moot: volume_momentum is weighted 0 in consensus.STRATEGY_WEIGHTS since
-        # Twelve Data can't supply real forex volume, but this stays ready for if that changes).
-        volume_strength = _clamp01(volume_ratio / (VOLUME_CONFIRMATION_MULT * 2))
-        momentum_strength = _clamp01((roc_price_move / atr_val) / (MOMENTUM_ROC_ATR_MULT * 2)) if atr_val > 0 else 0.0
-        strength = (volume_strength + momentum_strength) / 2
+    if direction in ("BUY", "SELL"):
+        impulse_atr = float(df.iloc[impulse_pos]["atr"])
+        impulse_body = abs(impulse_close - impulse_open)
+        # Ceiling at 2x the qualifying threshold -- self-referential to this strategy's own
+        # trigger, same pattern as call_liquidity_sweep's wick-ratio ceiling below.
+        strength = _clamp01(impulse_body / (impulse_atr * IMPULSE_ATR_MULT * 2)) if impulse_atr > 0 else None
 
     return StrategyCall(
-        strategy="volume_momentum", direction=direction,
+        strategy="order_blocks", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
         reasons=reasons, strength=strength,
     )
 
 
-def call_smart_money(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+def call_fair_value_gap(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+    """
+    The standard 3-candle ICT imbalance: candle 1's range doesn't overlap candle 3's range,
+    leaving a gap the middle candle's impulse punched straight through. A bullish gap
+    (candle 1's high below candle 3's low) reads as an up-move that left support beneath
+    current price; a bearish gap (candle 1's low above candle 3's high) reads as a down-move
+    that left resistance above it. Target is the next opposing liquidity level
+    (find_swing_levels, same swing-pivot source every other strategy here uses), falling back
+    to the gap's own size projected forward when no such level exists yet -- never a generic
+    ATR multiple, since the gap's own geometry IS this strategy's thesis. Stop sits just
+    beyond the gap's near edge (where it formed) -- a full retrace back through the gap
+    invalidates the imbalance.
+    """
+    if len(df) < 3:
+        return StrategyCall(
+            strategy="fair_value_gap", direction="HOLD", entry_price=float(df.iloc[-1]["close"]),
+            reasons=[SignalReason(rule="fvg_geometry", passed=False, detail="Not enough history for a 3-candle gap")],
+        )
+
+    candle1 = df.iloc[-3]
+    candle3 = df.iloc[-1]
+    latest = candle3
+    entry_price = float(latest["close"])
+    atr_val = float(latest["atr"])
+
+    bullish_gap = bool(candle1["high"] < candle3["low"])
+    bearish_gap = bool(candle1["low"] > candle3["high"])
+
+    reasons = [SignalReason(
+        rule="fvg_geometry", passed=bullish_gap or bearish_gap,
+        detail=(f"3-candle imbalance: candle1 high {candle1['high']:.5f} vs candle3 low {candle3['low']:.5f}"
+                if bullish_gap else
+                f"3-candle imbalance: candle1 low {candle1['low']:.5f} vs candle3 high {candle3['high']:.5f}"
+                if bearish_gap else "No imbalance -- candle1 and candle3 ranges overlap")
+    )]
+
+    direction = "HOLD"
+    target_price = stop_price = None
+    gap_size = 0.0
+
+    if bullish_gap:
+        direction = "BUY"
+        gap_low, gap_high = float(candle1["high"]), float(candle3["low"])
+        gap_size = gap_high - gap_low
+        resistance_levels, _ = find_swing_levels(df.iloc[:-1])
+        next_liquidity = next((r for r in resistance_levels if r > entry_price), None)
+        target_price = next_liquidity if next_liquidity is not None else gap_high + gap_size
+        stop_price = gap_low - SMC_STOP_BUFFER_ATR_MULT * atr_val
+        reasons.append(SignalReason(
+            rule="fair_value_gap", passed=True, value=gap_size,
+            detail=f"Bullish gap [{gap_low:.5f}, {gap_high:.5f}] acts as support beneath price"
+        ))
+    elif bearish_gap:
+        direction = "SELL"
+        gap_high, gap_low = float(candle1["low"]), float(candle3["high"])
+        gap_size = gap_high - gap_low
+        _, support_levels = find_swing_levels(df.iloc[:-1])
+        next_liquidity = next((s for s in support_levels if s < entry_price), None)
+        target_price = next_liquidity if next_liquidity is not None else gap_low - gap_size
+        stop_price = gap_high + SMC_STOP_BUFFER_ATR_MULT * atr_val
+        reasons.append(SignalReason(
+            rule="fair_value_gap", passed=True, value=gap_size,
+            detail=f"Bearish gap [{gap_low:.5f}, {gap_high:.5f}] acts as resistance above price"
+        ))
+    else:
+        reasons.append(SignalReason(rule="fair_value_gap", passed=False, detail="No fair value gap on this 3-candle sequence"))
+
+    strength = _clamp01(gap_size / (atr_val * FVG_STRENGTH_ATR_CEILING_MULT)) if direction in ("BUY", "SELL") and atr_val > 0 else None
+
+    return StrategyCall(
+        strategy="fair_value_gap", direction=direction,
+        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
+        reasons=reasons, strength=strength,
+    )
+
+
+def call_liquidity_sweep(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
     """
     A mechanized, deliberately narrow approximation of one piece of ICT/"Smart Money
-    Concepts": a liquidity sweep -- price wicks through a recent swing level (where
-    stop-losses are assumed to cluster) with a wick disproportionately larger than its own
-    body, then closes back on the original side. This differs from
-    call_support_resistance's bounce case specifically by requiring that wick dominance
-    (support_resistance fires on any close-back-inside touch, regardless of wick size) --
-    the actual visual signature SMC traders look for ("stop hunt"), not just "price touched
-    a level."
+    Concepts": price wicks through a recent swing level (where stop-losses are assumed to
+    cluster) with a wick disproportionately larger than its own body, then closes back on the
+    original side -- the actual visual signature SMC traders look for ("stop hunt"), not just
+    "price touched a level" (the plain swing-level bounce this codebase used to cover via
+    call_support_resistance, before that strategy was retired in favor of this SMC lineup).
 
     Target is the opposite recent swing level (the next liquidity pool), not a generic ATR
-    multiple -- same precedent as call_bollinger using its middle band, since that's what
-    this strategy's actual thesis predicts price will travel to. Stop sits just beyond the
-    sweep wick's own extreme (plus a small ATR buffer), not a flat multiple from entry --
-    that's where a real SMC stop goes, since a return past the sweep means the liquidity-grab
-    read was wrong.
+    multiple -- that's what this strategy's actual thesis predicts price will travel to. Stop
+    sits just beyond the sweep wick's own extreme (plus a small ATR buffer), not a flat
+    multiple from entry -- that's where a real SMC stop goes, since a return past the sweep
+    means the liquidity-grab read was wrong.
 
-    Full SMC also covers market structure (BOS/CHoCH), order blocks, and fair value gaps --
-    none of that is modeled here. This mechanizes the liquidity-sweep trigger only.
+    Formerly named call_smart_money, when it was this module's only SMC strategy; extracted
+    under its own name now that market structure, order blocks, fair value gaps, and
+    supply/demand zones are each modeled separately.
     """
     latest = df.iloc[-1]
     entry_price = float(latest["close"])
@@ -445,17 +378,105 @@ def call_smart_money(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> Str
 
     # reasons[-1].value is the wick/body ratio when a sweep fired -- 3x the minimum threshold
     # (SMC_WICK_BODY_MULT) is treated as a maximally decisive rejection, self-referential to
-    # this strategy's own trigger the same way stoch_adx's ceiling relates to its own gate.
+    # this strategy's own trigger the same way call_stoch_adx's ceiling used to relate to ADX.
     strength = _clamp01(reasons[-1].value / (SMC_WICK_BODY_MULT * 3)) if direction in ("BUY", "SELL") else None
 
     return StrategyCall(
-        strategy="smart_money", direction=direction,
+        strategy="liquidity_sweep", direction=direction,
+        entry_price=entry_price, target_price=target_price, stop_price=stop_price,
+        reasons=reasons, strength=strength,
+    )
+
+
+def call_supply_demand(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> StrategyCall:
+    """
+    One level up from an order block: instead of just the single last opposite-direction
+    candle before a strong impulse (call_order_blocks), this looks for a genuine
+    consolidation -- CONSOLIDATION_MIN_BARS+ consecutive small-bodied bars (body under
+    CONSOLIDATION_BODY_ATR_MULT * that bar's own ATR each) immediately preceding the impulse
+    -- and treats the whole consolidation's high/low range as the demand/supply zone, not
+    just one candle's. Fires the same way call_order_blocks does: price back inside that
+    zone without having broken through its far edge, continuation in the impulse's original
+    direction expected.
+    """
+    latest = df.iloc[-1]
+    entry_price = float(latest["close"])
+    atr_val = float(latest["atr"])
+
+    impulse = _find_recent_impulse(df, SMC_ZONE_LOOKBACK_BARS)
+    if impulse is None:
+        return StrategyCall(
+            strategy="supply_demand", direction="HOLD", entry_price=entry_price,
+            reasons=[SignalReason(rule="supply_demand_impulse", passed=False, detail="No qualifying impulse move in recent history")],
+        )
+
+    impulse_pos, impulse_direction, impulse_open, impulse_close = impulse
+
+    # Walk backward from just before the impulse, collecting consecutive small-bodied bars.
+    zone_bars = []
+    pos = impulse_pos - 1
+    while pos >= 0:
+        bar = df.iloc[pos]
+        bar_atr = bar["atr"]
+        if pd.isna(bar_atr) or bar_atr <= 0:
+            break
+        body = abs(bar["close"] - bar["open"])
+        if body > CONSOLIDATION_BODY_ATR_MULT * bar_atr:
+            break
+        zone_bars.append(bar)
+        pos -= 1
+
+    if len(zone_bars) < CONSOLIDATION_MIN_BARS:
+        return StrategyCall(
+            strategy="supply_demand", direction="HOLD", entry_price=entry_price,
+            reasons=[SignalReason(
+                rule="supply_demand_impulse", passed=False, value=float(len(zone_bars)),
+                detail=f"Only {len(zone_bars)} consolidating bar(s) before the {impulse_direction} impulse -- "
+                       f"need {CONSOLIDATION_MIN_BARS}+ for a genuine zone, not just an order block"
+            )],
+        )
+
+    zone_high = max(float(b["high"]) for b in zone_bars)
+    zone_low = min(float(b["low"]) for b in zone_bars)
+
+    reasons = [SignalReason(
+        rule="supply_demand_impulse", passed=True, value=float(len(zone_bars)),
+        detail=f"{impulse_direction} impulse preceded by a {len(zone_bars)}-bar consolidation "
+               f"[{zone_low:.5f}, {zone_high:.5f}]"
+    )]
+
+    direction = "HOLD"
+    target_price = stop_price = None
+    in_zone = bool(latest["low"] <= zone_high and latest["high"] >= zone_low)
+    if impulse_direction == "BUY" and in_zone and latest["close"] > zone_low:
+        direction = "BUY"
+        target_price = float(df.iloc[impulse_pos]["high"])
+        stop_price = zone_low - SMC_STOP_BUFFER_ATR_MULT * atr_val
+    elif impulse_direction == "SELL" and in_zone and latest["close"] < zone_high:
+        direction = "SELL"
+        target_price = float(df.iloc[impulse_pos]["low"])
+        stop_price = zone_high + SMC_STOP_BUFFER_ATR_MULT * atr_val
+
+    reasons.append(SignalReason(
+        rule="supply_demand_retest", passed=direction != "HOLD",
+        detail=(f"Price retesting the {'demand' if impulse_direction == 'BUY' else 'supply'} zone "
+                f"[{zone_low:.5f}, {zone_high:.5f}], continuation {direction} expected")
+        if direction != "HOLD" else "Price not currently retesting the consolidation zone"
+    ))
+
+    strength = None
+    if direction in ("BUY", "SELL"):
+        impulse_atr = float(df.iloc[impulse_pos]["atr"])
+        impulse_body = abs(impulse_close - impulse_open)
+        strength = _clamp01(impulse_body / (impulse_atr * IMPULSE_ATR_MULT * 2)) if impulse_atr > 0 else None
+
+    return StrategyCall(
+        strategy="supply_demand", direction=direction,
         entry_price=entry_price, target_price=target_price, stop_price=stop_price,
         reasons=reasons, strength=strength,
     )
 
 
 STRATEGIES: list[Callable[..., StrategyCall]] = [
-    call_trend, call_bollinger, call_support_resistance, call_candlestick, call_stoch_adx,
-    call_volume_momentum, call_smart_money,
+    call_market_structure, call_order_blocks, call_fair_value_gap, call_liquidity_sweep, call_supply_demand,
 ]

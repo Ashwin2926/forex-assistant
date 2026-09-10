@@ -4,7 +4,7 @@ import uuid
 import pandas as pd
 from datetime import datetime
 from typing import Optional
-from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
 from app.models.schemas import BacktestRun, RLPolicy, RuleConfig, Signal
 from app.services.indicators import add_all_indicators
 from app.services.signal_engine import compute_atr_target_stop, label_outcome, spread_cost_pct, apply_rules
@@ -33,11 +33,11 @@ STRATEGY_NAMES = [fn.__name__.removeprefix("call_") for fn in STRATEGIES]
 # balance (see compute_strategy_vote_states). balance_log_ratio is appended separately per
 # decision (full_rl_state) since it changes trade-to-trade and can't be precomputed the same way.
 #
-# The 6 raw_* features were added alongside the 7 *_vote features (not instead of -- both are
+# The raw_* features were added alongside the *_vote features (not instead of -- both are
 # kept) because every vote is already a lossy [0,1] "strength" ratio each strategy computes
 # against its own gating threshold (see strategies.py), collapsing e.g. a raw ADX of 45 and a
 # raw ADX of 90 to whatever fraction of ADX_TREND_THRESHOLD*2.5 they happen to land at, or
-# discarding which of 4 branches a support/resistance call fired from entirely. Since
+# discarding which of several branches a market-structure call fired from entirely. Since
 # LinearQPolicy is a strictly linear function of the state (see its own docstring), it can
 # only ever combine whatever's actually present in the vector -- it can't reconstruct
 # information a vote already threw away. These give the linear policy direct access to a few
@@ -61,8 +61,8 @@ RL_RAW_FEATURE_NAMES = [
     "raw_macd_hist_pct", "raw_bb_width_pct", "raw_volume_ratio",
     "raw_roc_pct", "raw_stoch_k_norm",
 ]
-# ml_hit_probability_buy/sell -- what the ML classifier (app/services/ml_model.py, a
-# LogisticRegression trained on ALL resolved rule-based signals pooled across every
+# ml_hit_probability_buy/sell -- what the ML classifier (app/services/ml_model.py, an
+# XGBoost classifier trained on ALL resolved rule-based signals pooled across every
 # pair/interval) would estimate for a hypothetical BUY, and separately a hypothetical SELL,
 # at this bar. Added because ML's own calibration is demonstrably better than any single RL
 # policy's (GET /ml/runs' calibration table is genuinely monotonic; each RL policy trains on
@@ -234,8 +234,8 @@ def position_size_units(balance: float, risk_fraction: float, entry_price: float
 
 def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig) -> list[list[float]]:
     """
-    One market-state vector per bar (RL_MARKET_FEATURE_NAMES, 8 features): each of the 7
-    strategies' current direction, encoded as direction x strength (e.g. -0.8 for a strong
+    One market-state vector per bar (RL_MARKET_FEATURE_NAMES): each of the STRATEGIES'
+    current direction, encoded as direction x strength (e.g. -0.8 for a strong
     SELL, -0.2 for a barely-there one, 0.0 for HOLD) instead of a flat +-1, plus atr_pct for
     volatility context. `strength` (see StrategyCall.strength / strategies.py) is each
     strategy's own normalized [0, 1] "how strong was THIS bar's reading" -- a strategy that's
@@ -312,7 +312,7 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
 
 def compute_ml_scores(
     indicator_df: pd.DataFrame, config: RuleConfig, pair: str, interval: str, profile: str,
-    model: Optional[LogisticRegression],
+    model: Optional[XGBClassifier],
 ) -> list[tuple[float, float]]:
     """
     One (ml_hit_probability_buy, ml_hit_probability_sell) pair per bar -- see
@@ -334,8 +334,10 @@ def compute_ml_scores(
     checks there), apply_rules was only ever written to run on an already-warmed-up bar --
     every existing caller (generate_signal, live inference) checks a warmup floor first. Bars
     this early have NaN EMA/RSI/ADX/etc. values, which would otherwise flow through as NaN
-    features straight into LogisticRegression.predict_proba and crash it (scikit-learn doesn't
-    accept NaN input). train_rl_policy's own episode/eval loops never visit these bars as
+    features straight into XGBClassifier.predict_proba -- XGBoost tolerates NaN inputs
+    natively (unlike scikit-learn's LogisticRegression, which this replaced), but a NaN-laden
+    warmup bar still isn't a meaningful read to hand the model, real tolerance or not.
+    train_rl_policy's own episode/eval loops never visit these bars as
     decision points anyway (they start from that same min_warmup), so this isn't losing any
     real information -- these bars were always going to be placeholder-only.
 
@@ -405,13 +407,13 @@ class LinearQPolicy:
     """
     q(state, action) = dot(weights[action], state). One weight vector per action, same
     length/order as RL_FEATURE_NAMES -- as interpretable as the ML page's
-    feature_coefficients table, and simple enough that pure numpy-free Python is plenty fast
-    for a 9-feature state.
+    feature_importances table, and simple enough that pure numpy-free Python is plenty fast
+    for this state size.
 
     Updates use Adagrad (per-weight adaptive learning rate, accumulated sum of squared past
     gradients) instead of one flat alpha for every feature -- the strategies here fire at very
-    different rates by design (trend votes on ~68% of bars, smart_money on ~4%, see
-    PROGRESS.md), so a flat learning rate lets frequently-firing strategies dominate the
+    different rates by design (see PROGRESS.md for per-strategy fire rates), so a flat
+    learning rate lets frequently-firing strategies dominate the
     learned weights mostly through sheer repetition, not necessarily through being more
     predictive per occurrence. A feature that's 0 on every bar a strategy doesn't fire (which
     is most bars, for the rare ones) contributes 0 to its own gradient on those steps, so its
@@ -511,6 +513,51 @@ def _take_action_sized(
     return reward, candles_to_outcome, new_balance
 
 
+def chronological_train_test_split(
+    df: pd.DataFrame, train_frac: float, max_lookforward: int, min_warmup: int,
+) -> tuple[int, int, int]:
+    """
+    Shared by train_rl_policy (LinearQPolicy) and train_ppo_policy_poc (PPO, see
+    ppo_engine.py) -- both need the exact same chronological train/test boundary and the same
+    "too short to be meaningful" guardrails, and a PPO proof-of-concept comparing itself
+    against the linear policy's own numbers is only a fair comparison if both trained/evaluated
+    on identical slices. Extracted rather than duplicated so the two can never drift apart.
+    Returns (train_last, test_start, test_last), all inclusive positional indices into df.
+    """
+    split_idx = int(len(df) * train_frac)
+    last_evaluable = len(df) - 1 - max_lookforward
+
+    train_last = min(split_idx - 1, last_evaluable)
+    if train_last < min_warmup:
+        raise ValueError(
+            f"Train slice too short for RL's warmup needs: have up to index {train_last}, "
+            f"need at least {min_warmup}. Ingest more history or lower train_frac."
+        )
+    test_start = split_idx
+    test_last = last_evaluable
+    if test_last < test_start:
+        raise ValueError(
+            f"Test slice too short ({max(0, test_last - test_start + 1)} candles) for "
+            f"max_lookforward={max_lookforward}. Ingest more history or raise train_frac."
+        )
+    return train_last, test_start, test_last
+
+
+def frozen_ml_snapshot(df: pd.DataFrame, split_idx: int, ml_reference_signals: Optional[list[dict]]):
+    """
+    Shared by train_rl_policy and train_ppo_policy_poc -- fits the same lookahead-bias-safe
+    "only signals resolved strictly before this run's own split boundary" ML snapshot (see
+    train_rl_policy's own docstring for why) so both training paths score
+    ml_hit_probability_buy/sell against an identically-frozen classifier, not two subtly
+    different ones.
+    """
+    split_timestamp = df.loc[split_idx, "timestamp"]
+    ml_training_signals = [
+        s for s in (ml_reference_signals or []) if s.get("timestamp") is not None and s["timestamp"] < split_timestamp
+    ]
+    return fit_hit_classifier(ml_training_signals)
+
+
 def train_rl_policy(
     df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
     episodes: int = DEFAULT_EPISODES, train_frac: float = 0.7, max_lookforward: int = 20,
@@ -608,21 +655,7 @@ def train_rl_policy(
 
     min_warmup = max(config.ema_slow, MIN_WARMUP_BARS)
     split_idx = int(len(df) * train_frac)
-    last_evaluable = len(df) - 1 - max_lookforward
-
-    train_last = min(split_idx - 1, last_evaluable)
-    if train_last < min_warmup:
-        raise ValueError(
-            f"Train slice too short for RL's warmup needs: have up to index {train_last}, "
-            f"need at least {min_warmup}. Ingest more history or lower train_frac."
-        )
-    test_start = split_idx
-    test_last = last_evaluable
-    if test_last < test_start:
-        raise ValueError(
-            f"Test slice too short ({max(0, test_last - test_start + 1)} candles) for "
-            f"max_lookforward={max_lookforward}. Ingest more history or raise train_frac."
-        )
+    train_last, test_start, test_last = chronological_train_test_split(df, train_frac, max_lookforward, min_warmup)
 
     # Lookahead-bias-safe ML snapshot: only signals resolved strictly before this run's own
     # split boundary are allowed to inform the classifier -- everything from split_idx onward
@@ -633,11 +666,7 @@ def train_rl_policy(
     # informs a bar early in that same window) -- a softer, accepted imperfection, same
     # "chronological, not perfectly walk-forward" pragmatism ml_model.py's own train/test
     # split already uses, and much less severe than leaking into the eval slice itself.
-    split_timestamp = df.loc[split_idx, "timestamp"]
-    ml_training_signals = [
-        s for s in (ml_reference_signals or []) if s.get("timestamp") is not None and s["timestamp"] < split_timestamp
-    ]
-    ml_model = fit_hit_classifier(ml_training_signals)
+    ml_model = frozen_ml_snapshot(df, split_idx, ml_reference_signals)
     ml_scores = compute_ml_scores(indicator_df, config, pair, interval, rl_config_profile(interval), ml_model)
     market_states = [
         ms + [buy_score, sell_score]

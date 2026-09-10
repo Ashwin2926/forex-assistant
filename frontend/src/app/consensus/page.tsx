@@ -128,10 +128,10 @@ export default function ConsensusPage() {
       <section>
         <h1 className="text-xl font-semibold tracking-tight">Multi-strategy consensus</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Seven independent strategies (trend, Bollinger mean-reversion, support/resistance,
-          candlestick patterns, stochastic+ADX, volume-confirmed momentum, and a liquidity-sweep
-          approximation of Smart Money Concepts) each analyze the same candles independently —
-          no shared state between them. A consensus only fires when a weighted majority agree on
+          Five independent Smart Money Concepts strategies (market structure, order blocks,
+          fair value gaps, liquidity sweeps, and supply/demand zones) each analyze the same
+          candles independently — no shared state between them. A consensus only fires when a
+          weighted majority agree on
           direction <em>and</em> their entry/exit prices land within half an ATR of each other.
           Additive to the existing rule-based engine, not a replacement — run the backtest
           below before trusting anything it says.

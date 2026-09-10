@@ -4,38 +4,23 @@ from app.models.schemas import ConsensusSignal, StrategyCall
 from app.services.strategies import STRATEGIES
 
 # Per-strategy vote weight -- equal by default, NOT tuned from real data (that would be
-# overfitting an 8-13 signal backtest sample). Weighting exists so a strategy that's shown it
-# doesn't belong in the majority can be dialed down later by editing one number here, instead
-# of hand-coding exceptions into check_consensus itself. Derived from function name
+# overfitting a small backtest sample). Weighting exists so a strategy that's shown it doesn't
+# belong in the majority can be dialed down later by editing one number here, instead of
+# hand-coding exceptions into check_consensus itself. Derived from function name
 # (call_X -> "X") so it can't drift out of sync with STRATEGIES/StrategyCall.strategy.
 STRATEGY_WEIGHTS: dict[str, float] = {fn.__name__.removeprefix("call_"): 1.0 for fn in STRATEGIES}
 
-# volume_momentum is the one exception to "equal by default, unweighted until proven
-# otherwise" -- confirmed (not just suspected) that Twelve Data structurally can't supply
-# forex volume (their own docs: "available not for all instrument types" -- spot FX has no
-# centralized tape to report it from, so no plan tier fixes this), so every call it makes is
-# HOLD, permanently. Weighting it 0 means it can't dilute the other strategies' threshold by
-# sitting in the denominator doing nothing -- the remaining active strategies land at
-# whatever bar REQUIRED_WEIGHT_FRACTION below sets as if it didn't exist at all, instead of
-# an unreachable bar. If a real volume source (OANDA/MT5 tick volume, see PROGRESS.md) ever
-# replaces Twelve Data for ingestion, raise this back to 1.0 -- the strategy itself doesn't
-# need to change, only this number.
-STRATEGY_WEIGHTS["volume_momentum"] = 0.0
-
-# Fraction of total vote weight that must agree on one direction. With volume_momentum at 0
-# and the other 6 (as of smart_money, added 2026-08-24) equal at 1.0, total_weight is
-# effectively 6.0, so 0.6 needs 4 of 6 to agree (0.6 * 6.0 = 3.6, rounds up). This is a
-# proportional bar, not a fixed headcount -- adding a real, functioning strategy is expected
-# to shift the raw number needed, unlike volume_momentum's permanent-HOLD case which would
-# have silently tightened the bar for a voice that can never actually vote. Originally set to
-# 0.6 (3-of-5) on 2026-08-24 after 0.8 (4-of-5, before smart_money existed) made consensus
-# fire so rarely across 5 philosophically different techniques it was closer to "wait for a
-# near-miracle" than "wait for a real majority" (the 2026-08-21 backtest found Bollinger
-# never once agreed with the pack, for context on how divergent these techniques can be).
-# Re-backtest across all pairs/intervals after any further change here, including strategy
-# count changes -- more signals at a lower effective bar trades agreement-strength for
-# frequency, so this needs the same train/test validation as everything else, not just a
-# vibe check.
+# Fraction of total vote weight that must agree on one direction. Re-derived when the SMC
+# strategy lineup (market_structure/order_blocks/fair_value_gap/liquidity_sweep/supply_demand)
+# replaced the prior 7-strategy mix (trend/bollinger/support_resistance/candlestick/stoch_adx/
+# volume_momentum/smart_money) -- all 5 current strategies are equally weighted at 1.0 (no
+# volume_momentum-style permanent-HOLD exception left to zero out), so 0.6 needs 3 of 5 to
+# agree (0.6 * 5.0 = 3.0). This is a proportional bar, not a fixed headcount -- kept at the
+# prior 0.6 fraction as a starting point rather than re-derived from scratch, since the
+# original 0.6 was itself chosen (2026-08-24) to avoid an unreachably rare consensus across a
+# philosophically diverse strategy mix, which is equally true of this all-SMC lineup.
+# UNVALIDATED against the new strategies -- re-backtest across all pairs/intervals
+# (backtester.run_consensus_backtest) before trusting this bar, not just a vibe check.
 REQUIRED_WEIGHT_FRACTION = 0.6
 
 # How close (in ATR multiples) agreeing strategies' entry/exit prices must be to count as

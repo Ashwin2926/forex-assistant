@@ -9,6 +9,18 @@ httpx==0.27.2
 pandas==2.2.3
 numpy==2.1.1
 scikit-learn==1.5.2
+xgboost==3.2.0
+# PPO proof-of-concept (Signal Stack v2, phase 3a) -- pulls in PyTorch, a dependency category
+# nothing else in this project uses. Pinned to plain PyPI's torch build (the CUDA-capable one,
+# not a CPU-only wheel) because this sandbox's outbound proxy can't reach
+# download.pytorch.org (the usual --extra-index-url source for a much smaller CPU-only
+# wheel) to verify that path installs cleanly -- build time, resulting image size, and
+# cold-start latency on FastAPI Cloud are UNVERIFIED as of this commit. This is exactly the
+# gate the "Signal Stack v2" plan calls for before any live rollout; don't treat this
+# dependency addition alone as that gate having passed.
+gymnasium==1.3.0
+stable-baselines3==2.9.0
+torch==2.14.0
 python-dotenv==1.0.1
 python_deriv_api==0.1.6
 bcrypt==4.2.0

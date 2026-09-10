@@ -43,7 +43,7 @@ export interface Signal {
 }
 
 export interface StrategyCall {
-  strategy: string; // "trend" | "bollinger" | "support_resistance" | "candlestick" | "stoch_adx"
+  strategy: string; // "market_structure" | "order_blocks" | "fair_value_gap" | "liquidity_sweep" | "supply_demand"
   direction: Direction;
   entry_price: number;
   target_price: number | null;
@@ -149,7 +149,7 @@ export interface MLTrainResult {
   test_accuracy: number;
   test_precision: number | null;
   test_recall: number | null;
-  feature_coefficients: Record<string, number>;
+  feature_importances: Record<string, number>;
   test_calibration: MLCalibrationBucket[];
 }
 

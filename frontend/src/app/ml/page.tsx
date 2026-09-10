@@ -138,19 +138,20 @@ export default function MLPage() {
               />
             </div>
             <div>
-              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Feature coefficients</p>
+              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Feature importances</p>
               <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
-                What the model actually weighted — positive pushes toward &quot;hit,&quot; negative toward &quot;not hit.&quot;
+                How much the model (XGBoost) relied on each feature to split its trees — magnitude only,
+                not direction. Unlike the prior linear model&apos;s coefficients, this can&apos;t say
+                whether a feature pushed toward &quot;hit&quot; or away from it, only how much it mattered.
               </p>
               <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-zinc-50 px-3 py-2 text-xs font-mono dark:bg-zinc-800">
-                {Object.entries(trainResult.feature_coefficients).map(([name, value]) => (
-                  <span key={name}>
-                    {name}:{" "}
-                    <span className={value >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}>
-                      {value >= 0 ? "+" : ""}{value.toFixed(3)}
+                {Object.entries(trainResult.feature_importances)
+                  .sort(([, a], [, b]) => b - a)
+                  .map(([name, value]) => (
+                    <span key={name}>
+                      {name}: <span className="text-sky-600 dark:text-sky-400">{value.toFixed(3)}</span>
                     </span>
-                  </span>
-                ))}
+                  ))}
               </div>
             </div>
             <div>

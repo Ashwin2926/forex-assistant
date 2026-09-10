@@ -232,8 +232,8 @@ def run_consensus_backtest(
     df = df.reset_index(drop=True)
     indicator_df = add_all_indicators(df, config)
 
-    # 30 covers Bollinger(20)/stochastic(14+3)/ADX(~2x14)/support-resistance(lookback=20)'s
-    # own warmup needs, none of which are tied to config.ema_slow the way the trend strategy is.
+    # 30 covers find_swing_levels' own 20-bar lookback (used by market_structure and
+    # liquidity_sweep) plus a buffer, none of which are tied to config.ema_slow.
     min_warmup = max(config.ema_slow, 30, eval_start_index or 0)
     last_evaluable = len(df) - 1 - max_lookforward
     if last_evaluable < min_warmup:

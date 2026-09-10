@@ -116,7 +116,7 @@ def explain_divergence(
     "diff": signed difference}. Not a claim of causation (a linear-distance-ranked feature
     list isn't a causal attribution method) -- it's the same "make the reasoning
     inspectable, don't just trust a bare number" principle as this project's SignalReason.
-    detail on every rule-based signal and feature_coefficients on the ML classifier: a human
+    detail on every rule-based signal and feature_importances on the ML classifier: a human
     reviewing a surprising outcome gets a concrete starting point ("volume_ratio was way
     higher this time") instead of an opaque "the model was wrong."
     """

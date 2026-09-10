@@ -776,7 +776,7 @@ async def get_backtest_run_signals(run_id: str, status: str | None = None, limit
 @app.post("/ml/train")
 async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     """
-    Trains the supervised hit/miss classifier (app/services/ml_model.py, LogisticRegression --
+    Trains the supervised hit/miss classifier (app/services/ml_model.py, XGBoost --
     NOT reinforcement learning) on every resolved live signal across all pairs/profiles. One
     shared model, not per-pair -- splitting the current ~238 resolved signals further would
     leave too few examples per model to mean anything. Chronological train/test split, not
@@ -1538,7 +1538,7 @@ async def explain_rl_signal(signal_id: str, k: int = 10):
     or a miss's nearest hit), and reports the top feature differences between the two states,
     largest first. Not causal attribution -- a distance-ranked feature list, same
     "inspectable, not a fabricated explanation" spirit as this project's other interpretability
-    surfaces (SignalReason.detail, ML's feature_coefficients). Meant for reviewing a specific
+    surfaces (SignalReason.detail, ML's feature_importances). Meant for reviewing a specific
     surprising outcome after the fact, not for live decision-making (see /rl/signal/{interval}
     for the live `memory` summary instead).
 
@@ -1881,7 +1881,7 @@ async def rl_insights():
     (hit/miss/expired/superseded), and the overall learning-curve verdict (see
     _half_split_verdict above, reused directly so this doesn't duplicate that logic or drift
     out of sync with it). Same "explainable, not black-box" ethos as the rule engine's
-    SignalReason and the ML classifier's feature_coefficients -- every finding here traces
+    SignalReason and the ML classifier's feature_importances -- every finding here traces
     back to a specific number, not a model's opaque judgment call.
 
     Findings are sorted critical-first, then warning, then good -- what needs attention
