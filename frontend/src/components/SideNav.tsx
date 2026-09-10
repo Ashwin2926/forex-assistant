@@ -11,7 +11,7 @@ const LINKS = [
   { href: "/consensus", label: "Consensus" },
   { href: "/paper-trade", label: "Paper Trading" },
   { href: "/ml", label: "ML" },
-  { href: "/rl", label: "RL Agent" },
+  { href: "/rl", label: "PPO Agent" },
 ];
 
 export function SideNav() {

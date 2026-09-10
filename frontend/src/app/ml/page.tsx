@@ -107,7 +107,7 @@ export default function MLPage() {
       <section>
         <h1 className="text-xl font-semibold tracking-tight">ML (v1)</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          A supervised classifier (logistic regression, <strong>not</strong> reinforcement
+          A supervised classifier (XGBoost, <strong>not</strong> reinforcement
           learning) trained on every resolved live signal to predict hit vs. not-hit. Trains
           automatically every cron cycle on whatever has resolved so far — with the current
           sample size, treat every prediction as a rough, evolving estimate, not a validated
