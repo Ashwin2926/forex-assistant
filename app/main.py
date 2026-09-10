@@ -25,7 +25,7 @@ from app.core.database import (
 )
 from app.models.schemas import (
     LoginRequest, RuleConfig, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
-    PPOPolicy,
+    PPOPolicy, MLTrainResult,
 )
 from app.services.data_fetcher import fetch_and_store
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
@@ -803,9 +803,20 @@ async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     if not force:
         last_run = await ml_runs_collection.find_one(sort=[("created_at", -1)])
         if last_run is not None and last_run["train_samples"] + last_run["test_samples"] == resolved_count:
-            last_run["_id"] = str(last_run["_id"])
-            last_run["skipped"] = True
-            return last_run
+            last_run.pop("_id", None)
+            # A stored run from before feature_coefficients was renamed to feature_importances
+            # (the LogisticRegression -> XGBoost switch) still has the old key under this exact
+            # shortcut path -- everywhere else routes through MLTrainResult and would have
+            # already 500'd loudly on such a document, but this branch used to return the raw
+            # Mongo doc as-is, silently handing the frontend a payload with no
+            # feature_importances key at all (Object.entries(undefined) then throws client-side).
+            # Validating through the model instead both migrates that one renamed field and
+            # supplies real defaults ({}, [], False) for any other field an old document predates.
+            if "feature_importances" not in last_run and "feature_coefficients" in last_run:
+                last_run["feature_importances"] = last_run.pop("feature_coefficients")
+            result = MLTrainResult(**last_run)
+            result.skipped = True
+            return result
 
     signals = await signals_collection.find(query).to_list(length=None)
 
