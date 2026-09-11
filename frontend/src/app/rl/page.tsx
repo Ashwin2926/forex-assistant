@@ -594,8 +594,9 @@ export default function RLPage() {
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Or train all 4 pairs &times; 5 intervals at once (using the settings above) —
               same thing the cron does once daily, run on demand. Runs server-side on GitHub
-              Actions (usually ~5-6 minutes total) — safe to close this tab or navigate away;
-              reopening this page picks the run back up.
+              Actions (usually ~30-35 minutes total — that runner's CPU is slower for this
+              than the backend's own) — safe to close this tab or navigate away; reopening
+              this page picks the run back up.
             </p>
             <div className="flex shrink-0 items-center gap-2">
               <button onClick={handleTrainAll} disabled={trainAllRunning} className="btn-primary shrink-0">

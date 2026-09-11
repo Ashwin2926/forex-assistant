@@ -42,9 +42,11 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
-    # Training every pair x interval can take ~20-30 minutes (same duration the old
-    # in-process /rl/train-all job documented) -- default 6h job timeout is more than
-    # enough headroom, no override needed.
+    # Training every pair x interval takes ~30-35 minutes here (verified live: run
+    # 34515863705, ~99s/combo x 20 -- this runner's CPU is markedly slower for PPO training
+    # than whatever FastAPI Cloud allocates the backend process, which averaged ~16s/combo
+    # over the same 20 combos per SIGNAL_STACK_V2.md). Default 6h job timeout is still more
+    # than enough headroom, no override needed.
     env:
       MONGODB_URI: ${{ secrets.MONGODB_URI }}
       MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}

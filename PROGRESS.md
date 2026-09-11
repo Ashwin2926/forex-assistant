@@ -27,7 +27,31 @@ design in the plan file this session used (`scripts/train_rl.py` reusing
 `ppo_engine.train_ppo_policy` directly via a sync `pymongo` client, a new
 `.github/workflows/train-rl.yml` on its own daily schedule + `workflow_dispatch`, and
 `POST /rl/train-all` changed to trigger that workflow via GitHub's REST API instead of
-`BackgroundTasks`). Implementation in progress — see git log for what actually landed.
+`BackgroundTasks`). Landed in `d947691`.
+
+**Correction found mid-implementation**: the premise above overstated the symptom.
+`SIGNAL_STACK_V2.md` (same-session log, already on `master`) shows `keep-fresh.yml`'s
+20-combo curl loop against `/rl/train/{interval}` was actually verified working twice live
+(run `34448785277`: ~5.5 min for all 20 combos, no 524) — the "documented 524" traced to a
+*different*, earlier incident (the original in-process `/rl/train-all` button, not
+`keep-fresh.yml`'s loop). That bug was already fixed client-side (`d3a81ad`, earlier the
+same day): the RL page's "Train all" button loops client-side over `/rl/train/{interval}`
+instead of depending on `/rl/train-all`. Proceeded with the GitHub Actions move anyway (per
+explicit direction) since `/rl/train-all` and `_run_all_flows_job` ("Sync now") still had
+the real in-process risk — then wired the frontend button back onto the now-fixed
+`/rl/train-all` (`986f74b`), since the reason it had been moved client-side no longer
+applies.
+
+**Verified live** (workflow_dispatch, single combo then a full sweep): the single-combo
+run and the full 20-combo run both completed successfully end-to-end (job doc created,
+`ppo_policies`/`backtest_runs`/`backtest_signals` populated). One real surprise: the full
+sweep took **~35.5 minutes** (Train step alone: 33m10s, ~99s/combo), not the ~5-6 min this
+same 20-combo set took via `keep-fresh.yml`'s curl loop against the live backend. The
+GitHub Actions runner's CPU is markedly slower for this CPU-bound PPO training than
+whatever FastAPI Cloud allocates the backend process — a real trade-off of this move
+(durability against instance recycling, at the cost of ~6x wall-clock time for a full
+sweep), not a bug. UI copy and `train-rl.yml`'s own comment updated to state ~30-35 min
+rather than the earlier ~5-6/~20-30 min guesses.
 
 ## 2026-09-07 (cont.)
 
