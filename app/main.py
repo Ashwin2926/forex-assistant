@@ -1113,8 +1113,23 @@ async def _trigger_rl_train_workflow(job_id: str, total_timesteps: int, train_fr
         },
     }
     headers = {"Authorization": f"Bearer {settings.github_pat}", "Accept": "application/vnd.github+json"}
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+    # Wrapped specifically because an unhandled exception here (vs. a clean HTTPException)
+    # produces a response with no CORS headers -- Starlette's ServerErrorMiddleware sits
+    # OUTSIDE CORSMiddleware in the stack, so an uncaught exception's resulting 500 never
+    # passes back through CORSMiddleware to get Access-Control-Allow-Origin attached. The
+    # browser then reports "blocked by CORS" for what is actually a connection failure to
+    # GitHub's API -- this project already hit this exact false-CORS-diagnosis once before
+    # for an unrelated endpoint (see SIGNAL_STACK_V2.md). Catching it here and re-raising as
+    # HTTPException keeps the response inside normal exception-handling middleware (and
+    # therefore CORSMiddleware), so the frontend sees the real error instead of a generic
+    # network failure.
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502, detail=f"Couldn't reach GitHub's API ({type(e).__name__}): {e}",
+        )
     if resp.status_code != 204:
         raise HTTPException(
             status_code=502, detail=f"GitHub workflow_dispatch failed ({resp.status_code}): {resp.text[:300]}",
