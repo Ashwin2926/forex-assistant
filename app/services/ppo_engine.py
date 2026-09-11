@@ -255,6 +255,7 @@ def train_and_evaluate_ppo_poc(
     starting_balance: float = rl.DEFAULT_STARTING_BALANCE,
     ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = 0,
     ppo_kwargs: Optional[dict] = None,
+    target_atr_mult: Optional[float] = None, stop_atr_mult: Optional[float] = None,
 ) -> dict:
     """
     The four-check proof-of-concept "Signal Stack v2" phase 3a calls for, steps 2-3 (step 1,
@@ -287,7 +288,14 @@ def train_and_evaluate_ppo_poc(
     if random_seed is not None:
         np.random.seed(random_seed)
 
-    target_atr_mult, stop_atr_mult = rl.rl_atr_mults(interval, pair)
+    # target_atr_mult/stop_atr_mult: explicit override, applied instead of rl.rl_atr_mults'
+    # interval/pair default -- same "explicit override for sweeping a candidate value" pattern
+    # main.py's POST /backtest/optimize already uses for RuleConfig's own target/stop. Omit
+    # (recommended for real training) to use rl_atr_mults(interval, pair) as normal; pass both
+    # only when comparing a candidate (target, stop) pair against the current default, e.g.
+    # investigating a high-expired-rate interval/pair via GET /rl/resolution-stats first.
+    if target_atr_mult is None or stop_atr_mult is None:
+        target_atr_mult, stop_atr_mult = rl.rl_atr_mults(interval, pair)
     df = df.reset_index(drop=True)
     min_warmup = max(config.ema_slow, rl.MIN_WARMUP_BARS)
     split_idx = int(len(df) * train_frac)
@@ -359,6 +367,7 @@ def train_ppo_policy(
     starting_balance: float = rl.DEFAULT_STARTING_BALANCE,
     ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = None,
     ppo_kwargs: Optional[dict] = None,
+    target_atr_mult: Optional[float] = None, stop_atr_mult: Optional[float] = None,
 ) -> tuple[PPOPolicy, BacktestRun, list[Signal], dict]:
     """
     The live-persistence wrapper around train_and_evaluate_ppo_poc -- same training/evaluation,
@@ -379,11 +388,15 @@ def train_ppo_policy(
     beats_random/model_size_bytes/save_load_latency_ms forward from
     train_and_evaluate_ppo_poc so a caller (or the API response) can still see them even
     though the model itself is now serialized into `policy` rather than returned raw.
+
+    target_atr_mult/stop_atr_mult: see train_and_evaluate_ppo_poc's own comment -- passed
+    straight through, omit for normal training.
     """
     result = train_and_evaluate_ppo_poc(
         df, pair, interval, config, total_timesteps=total_timesteps, train_frac=train_frac,
         max_lookforward=max_lookforward, starting_balance=starting_balance,
         ml_reference_signals=ml_reference_signals, random_seed=random_seed, ppo_kwargs=ppo_kwargs,
+        target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
     )
     model: PPO = result["model"]
     buffer = io.BytesIO()

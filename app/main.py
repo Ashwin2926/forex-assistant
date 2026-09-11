@@ -947,7 +947,7 @@ RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 async def _run_rl_training(
     pair: str, interval: str, total_timesteps: int, train_frac: float, max_lookforward: int, starting_balance: float,
-    random_seed: int | None = None,
+    random_seed: int | None = None, target_atr_mult: float | None = None, stop_atr_mult: float | None = None,
 ):
     """
     Shared by POST /rl/train and the /rl/train-all background job below -- fetches candle
@@ -964,6 +964,13 @@ async def _run_rl_training(
     No warm-start here -- PPO has no equivalent of the retired linear policy's "continue from
     these exact weights" resume (see ppo_engine.train_ppo_policy's own docstring); every call
     trains a fresh model from total_timesteps.
+
+    target_atr_mult/stop_atr_mult: explicit override passed straight through to
+    train_ppo_policy/train_and_evaluate_ppo_poc -- omit (recommended) to use
+    rl_engine.rl_atr_mults(interval, pair)'s configured default. Exists for sweeping a
+    candidate (target, stop) pair against a high-expired-rate interval/pair (see
+    GET /rl/resolution-stats) before committing it to RL_ATR_MULT_PAIR_OVERRIDES -- this
+    still persists a real policy/eval run like any other call, it's not a dry run.
     """
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1 (exclusive).")
@@ -991,6 +998,7 @@ async def _run_rl_training(
         train_ppo_policy, df, pair, interval, config, total_timesteps=total_timesteps,
         train_frac=train_frac, max_lookforward=max_lookforward, starting_balance=starting_balance,
         ml_reference_signals=ml_reference_signals, random_seed=random_seed,
+        target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
     )
 
     # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
@@ -1007,6 +1015,7 @@ async def _run_rl_training(
 async def train_rl(
     interval: str, pair: str, total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: int = 20,
     starting_balance: float = DEFAULT_STARTING_BALANCE, random_seed: int | None = None,
+    target_atr_mult: float | None = None, stop_atr_mult: float | None = None,
 ):
     """
     Trains a PPO policy (app/services/ppo_engine.py) for this pair/interval against
@@ -1046,11 +1055,21 @@ async def train_rl(
     random_seed: omit for normal training (stays genuinely exploratory). Pass an explicit int
     only when comparing two runs against each other and you need a reproducible baseline to
     isolate a real parameter effect from ordinary training-run variance.
+
+    target_atr_mult/stop_atr_mult: omit (recommended) to use rl_engine.rl_atr_mults'
+    interval/pair default. Pass both together to override it for this one call -- for
+    sweeping a candidate value against a high-expired-rate combo (see
+    GET /rl/resolution-stats) before adding it to RL_ATR_MULT_PAIR_OVERRIDES. This still
+    persists a real policy/eval run like any other call; GET /backtest/runs?pair=X&
+    profile=rl_ppo (filter the response to this interval yourself -- no server-side
+    interval filter exists on that endpoint) lists every past run including these, so
+    compare candidates there rather than trusting only this response if running several
+    back to back.
     """
     try:
         policy, eval_run, poc_diagnostics = await _run_rl_training(
             pair, interval, total_timesteps, train_frac, max_lookforward, starting_balance,
-            random_seed=random_seed,
+            random_seed=random_seed, target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
