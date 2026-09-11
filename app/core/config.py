@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -43,6 +44,16 @@ class Settings(BaseSettings):
     # reusing an existing one). github_repo is "owner/repo", e.g. "someuser/forex-assistant".
     github_pat: str = ""
     github_repo: str = ""
+
+    # A stray leading/trailing space from pasting into a dashboard's env var field (seen
+    # live: " Ashwin2926/forex-assistant" with a leading space) makes the constructed GitHub
+    # API URL invalid -> a 404 that looks exactly like "wrong repo" or "no access" and is
+    # genuinely hard to spot by eyeballing a dashboard field. Stripped here so both fields
+    # are robust to that regardless of how the value was entered.
+    @field_validator("github_pat", "github_repo")
+    @classmethod
+    def _strip_whitespace(cls, v: str) -> str:
+        return v.strip()
 
     @property
     def pairs_list(self) -> list[str]:

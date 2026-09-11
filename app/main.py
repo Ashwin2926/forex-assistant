@@ -1157,7 +1157,7 @@ async def debug_egress_check():
     # own router just didn't know about it, even though the dashboard showed the commit that
     # added it as the live deployment) -- a value baked into the running code itself is the
     # only way to be sure which build is actually answering requests.
-    DEPLOY_MARKER = "2026-09-11-d"
+    DEPLOY_MARKER = "2026-09-11-e"
 
     results: dict = {"deploy_marker": DEPLOY_MARKER}
     for name, url in [("github", "https://api.github.com"), ("twelvedata", "https://api.twelvedata.com")]:
