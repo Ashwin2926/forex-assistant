@@ -1157,7 +1157,7 @@ async def debug_egress_check():
     # own router just didn't know about it, even though the dashboard showed the commit that
     # added it as the live deployment) -- a value baked into the running code itself is the
     # only way to be sure which build is actually answering requests.
-    DEPLOY_MARKER = "2026-09-11-c"
+    DEPLOY_MARKER = "2026-09-11-d"
 
     results: dict = {"deploy_marker": DEPLOY_MARKER}
     for name, url in [("github", "https://api.github.com"), ("twelvedata", "https://api.twelvedata.com")]:
@@ -1184,13 +1184,22 @@ async def debug_dispatch_check():
     something else in that endpoint's body. This isolates exactly which.
     """
     job_id = f"debug-{uuid.uuid4().hex[:8]}"
+    # github_repo isn't a secret (it's a public repo path) -- included so a 404 from GitHub
+    # can be diagnosed as "wrong repo string" vs "PAT lacks access" without guessing. Only
+    # the PAT's length/prefix are shown (never the value itself) as a "did it even load"
+    # sanity check.
+    config_snapshot = {
+        "github_repo": settings.github_repo,
+        "github_pat_len": len(settings.github_pat or ""),
+        "github_pat_prefix": (settings.github_pat or "")[:12],
+    }
     try:
         await _trigger_rl_train_workflow(job_id, 50_000, 0.7, DEFAULT_STARTING_BALANCE)
-        return {"ok": True, "job_id": job_id}
+        return {"ok": True, "job_id": job_id, **config_snapshot}
     except HTTPException as e:
-        return {"ok": False, "kind": "HTTPException", "status_code": e.status_code, "detail": e.detail}
+        return {"ok": False, "kind": "HTTPException", "status_code": e.status_code, "detail": e.detail, **config_snapshot}
     except Exception as e:
-        return {"ok": False, "kind": type(e).__name__, "detail": str(e)}
+        return {"ok": False, "kind": type(e).__name__, "detail": str(e), **config_snapshot}
 
 
 @app.post("/rl/train-all")
