@@ -38,6 +38,12 @@ on:
         description: "Starting account balance for the compounding-reward eval."
         required: false
         default: "50"
+      target_atr_mult:
+        description: "Override rl_atr_mults(interval, pair)'s target ATR multiple -- leave blank (with stop_atr_mult) to use the configured default. Must be given together with stop_atr_mult and pair/interval (single combo only)."
+        required: false
+      stop_atr_mult:
+        description: "Override rl_atr_mults(interval, pair)'s stop ATR multiple -- see target_atr_mult."
+        required: false
 
 jobs:
   train:
@@ -70,8 +76,13 @@ jobs:
           TOTAL_TIMESTEPS: ${{ inputs.total_timesteps || '50000' }}
           TRAIN_FRAC: ${{ inputs.train_frac || '0.7' }}
           STARTING_BALANCE: ${{ inputs.starting_balance || '50' }}
+          TARGET_ATR_MULT: ${{ inputs.target_atr_mult }}
+          STOP_ATR_MULT: ${{ inputs.stop_atr_mult }}
         run: |
           args=(--total-timesteps "$TOTAL_TIMESTEPS" --train-frac "$TRAIN_FRAC" --starting-balance "$STARTING_BALANCE")
           if [ -n "$JOB_ID" ]; then args+=(--job-id "$JOB_ID"); fi
           if [ -n "$PAIR" ] && [ -n "$INTERVAL" ]; then args+=(--pair "$PAIR" --interval "$INTERVAL"); fi
+          if [ -n "$TARGET_ATR_MULT" ] && [ -n "$STOP_ATR_MULT" ]; then
+            args+=(--target-atr-mult "$TARGET_ATR_MULT" --stop-atr-mult "$STOP_ATR_MULT")
+          fi
           python scripts/train_rl.py "${args[@]}"

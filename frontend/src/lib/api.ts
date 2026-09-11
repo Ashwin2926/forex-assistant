@@ -199,7 +199,10 @@ export const api = {
   trainRLPolicy(
     pair: string,
     interval: string,
-    opts: { total_timesteps?: number; train_frac?: number; max_lookforward?: number; starting_balance?: number; random_seed?: number } = {},
+    opts: {
+      total_timesteps?: number; train_frac?: number; max_lookforward?: number; starting_balance?: number;
+      random_seed?: number; target_atr_mult?: number; stop_atr_mult?: number;
+    } = {},
   ) {
     const qs = new URLSearchParams({ pair });
     if (opts.total_timesteps !== undefined) qs.set("total_timesteps", String(opts.total_timesteps));
@@ -207,6 +210,9 @@ export const api = {
     if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
     if (opts.starting_balance !== undefined) qs.set("starting_balance", String(opts.starting_balance));
     if (opts.random_seed !== undefined) qs.set("random_seed", String(opts.random_seed));
+    // Both required together -- see POST /rl/train/{interval}'s own docstring.
+    if (opts.target_atr_mult !== undefined) qs.set("target_atr_mult", String(opts.target_atr_mult));
+    if (opts.stop_atr_mult !== undefined) qs.set("stop_atr_mult", String(opts.stop_atr_mult));
     return request<{ policy: PPOPolicy; evaluation: BacktestRun; poc_diagnostics: PPOTrainDiagnostics }>(
       `/rl/train/${interval}?${qs.toString()}`,
       { method: "POST" },

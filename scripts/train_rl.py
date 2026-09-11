@@ -52,9 +52,15 @@ def pairs_list() -> list[str]:
 
 
 def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: float,
-            max_lookforward: int, starting_balance: float, random_seed: int | None):
+            max_lookforward: int, starting_balance: float, random_seed: int | None,
+            target_atr_mult: float | None = None, stop_atr_mult: float | None = None):
     """Mirrors app/main.py's _run_rl_training exactly (same query, same training call, same
-    persistence) but against a sync pymongo db instead of the app's async motor collections."""
+    persistence) but against a sync pymongo db instead of the app's async motor collections.
+
+    target_atr_mult/stop_atr_mult: same override _run_rl_training/POST /rl/train/{interval}
+    accept -- omit (both None) to use rl_engine.rl_atr_mults(interval, pair)'s configured
+    default. Lets a candidate value be swept via this (reliable, GitHub-Actions-backed) path
+    instead of the direct endpoint, which has been seen to 524 on a slow combo."""
     config = default_config_for(rl_config_profile(interval), pair)
     docs = list(db["candles"].find({"pair": pair, "interval": interval}).sort("timestamp", 1))
     if not docs:
@@ -69,6 +75,7 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
         df, pair, interval, config, total_timesteps=total_timesteps, train_frac=train_frac,
         max_lookforward=max_lookforward, starting_balance=starting_balance,
         ml_reference_signals=ml_reference_signals, random_seed=random_seed,
+        target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
     )
 
     if trade_signals:
@@ -88,6 +95,8 @@ def main():
     parser.add_argument("--max-lookforward", type=int, default=20)
     parser.add_argument("--starting-balance", type=float, default=DEFAULT_STARTING_BALANCE)
     parser.add_argument("--random-seed", type=int, default=None)
+    parser.add_argument("--target-atr-mult", type=float, default=None, help="Override rl_atr_mults(interval, pair)'s target ATR multiple -- must be given with --stop-atr-mult and a single --pair/--interval combo, see main.py's POST /rl/train/{interval} for the same override.")
+    parser.add_argument("--stop-atr-mult", type=float, default=None, help="Override rl_atr_mults(interval, pair)'s stop ATR multiple -- see --target-atr-mult.")
     args = parser.parse_args()
 
     mongodb_uri = os.environ["MONGODB_URI"]
@@ -97,6 +106,10 @@ def main():
 
     if bool(args.pair) != bool(args.interval):
         parser.error("--pair and --interval must be given together, or both omitted for a full sweep.")
+    if (args.target_atr_mult is not None) != (args.stop_atr_mult is not None):
+        parser.error("--target-atr-mult and --stop-atr-mult must be given together.")
+    if args.target_atr_mult is not None and not args.pair:
+        parser.error("--target-atr-mult/--stop-atr-mult require a single --pair/--interval combo, not a full sweep.")
     combos = [(args.pair, args.interval)] if args.pair else [
         (pair, interval) for pair in pairs_list() for interval in RL_INTERVALS
     ]
@@ -124,6 +137,7 @@ def main():
             policy, eval_run = run_one(
                 db, pair, interval, args.total_timesteps, args.train_frac, args.max_lookforward,
                 args.starting_balance, args.random_seed,
+                target_atr_mult=args.target_atr_mult, stop_atr_mult=args.stop_atr_mult,
             )
             cell = {
                 "pair": pair, "interval": interval, "ok": True, "policy_id": policy.policy_id,

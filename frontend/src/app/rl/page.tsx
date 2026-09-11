@@ -97,6 +97,13 @@ export default function RLPage() {
   const [totalTimesteps, setTotalTimesteps] = useState(50_000);
   const [trainFrac, setTrainFrac] = useState(0.7);
   const [startingBalance, setStartingBalance] = useState(50);
+  // Advanced/optional -- override rl_engine.rl_atr_mults(interval, pair)'s configured
+  // default for this one training run. Blank (the normal case) means "use the default";
+  // both fields must be filled to send an override (see api.trainRLPolicy). Exists for
+  // sweeping a candidate (target, stop) pair against a high-expired-rate combo (see
+  // GET /rl/resolution-stats) before adding it to RL_ATR_MULT_PAIR_OVERRIDES.
+  const [targetAtrMult, setTargetAtrMult] = useState("");
+  const [stopAtrMult, setStopAtrMult] = useState("");
   const [training, setTraining] = useState(false);
   const [trainError, setTrainError] = useState<string | null>(null);
   const [trainResult, setTrainResult] = useState<{ policy: PPOPolicy; evaluation: BacktestRun; poc_diagnostics: PPOTrainDiagnostics } | null>(null);
@@ -218,7 +225,12 @@ export default function RLPage() {
     setTraining(true);
     setTrainError(null);
     try {
-      const result = await api.trainRLPolicy(pair, interval, { total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance });
+      const atrOverride = targetAtrMult !== "" && stopAtrMult !== ""
+        ? { target_atr_mult: Number(targetAtrMult), stop_atr_mult: Number(stopAtrMult) }
+        : {};
+      const result = await api.trainRLPolicy(pair, interval, {
+        total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance, ...atrOverride,
+      });
       setTrainResult(result);
       await loadPolicies();
     } catch (e) {
@@ -541,6 +553,20 @@ export default function RLPage() {
               className="select w-24"
             />
           </Field>
+          <Field label="Target ATR mult (optional)">
+            <input
+              type="number" step="0.05" min="0" placeholder="default" value={targetAtrMult}
+              onChange={(e) => setTargetAtrMult(e.target.value)}
+              className="select w-28"
+            />
+          </Field>
+          <Field label="Stop ATR mult (optional)">
+            <input
+              type="number" step="0.05" min="0" placeholder="default" value={stopAtrMult}
+              onChange={(e) => setStopAtrMult(e.target.value)}
+              className="select w-28"
+            />
+          </Field>
           <button onClick={handleTrain} disabled={training} className="btn-primary">
             {training ? "Training…" : "Train"}
           </button>
@@ -548,6 +574,10 @@ export default function RLPage() {
         <p className="mt-2 text-xs text-zinc-400">
           No warm start — every training run starts a fresh PPO model from total_timesteps
           real environment steps, it doesn&apos;t continue a prior run&apos;s weights.
+          Target/stop ATR mult: leave both blank to use the configured default for this
+          pair/interval — fill in both to override it for this one run, e.g. testing a
+          tighter target/stop against a high-expired-rate combo (see the insights above)
+          before making it a permanent default.
         </p>
         {trainError && (
           <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
