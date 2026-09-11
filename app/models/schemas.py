@@ -302,6 +302,12 @@ class PPOPolicy(BaseModel):
     starting_balance: float
     total_timesteps: int
     model_bytes: bytes
+    # policy_id of the prior policy this one continued training from (stable-baselines3's
+    # PPO.load + .learn(reset_num_timesteps=False)), or None if this one started from a fresh
+    # randomly-initialized model -- same concept RLPolicy's own (now-retired) warm_started_from
+    # tracked for the linear policy, re-added here once PPO gained the same capability. See
+    # ppo_engine.train_ppo_policy's own docstring for when each path is taken.
+    warm_started_from: Optional[str] = None
 
 
 class RLSignal(BaseModel):

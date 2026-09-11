@@ -385,8 +385,10 @@ export default function RLPage() {
           balance (default $50) — not live signal outcomes. Every trade still uses a fixed
           1.5:1 target:stop ATR ratio regardless of size tier, so it can never risk more than
           it stands to gain. This project&apos;s RL agent was linear Q-learning before PPO
-          replaced it — every policy here is a fresh PPO model, with no warm-start carried
-          over from that prior algorithm. Additive and separate from the regular signal feed,
+          replaced it — the very first PPO policy for each pair/interval started fresh, with
+          no weights carried over from that retired algorithm (every retrain since then can
+          warm-start from PPO&apos;s own prior policy, see Train a policy below). Additive
+          and separate from the regular signal feed,
           consensus, and the ML classifier — doesn&apos;t touch any of them. No broker
           execution here — signals are sized against your real balance (below) and traded
           manually on whatever broker you actually have.
@@ -448,10 +450,11 @@ export default function RLPage() {
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Is it getting smarter?</h2>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Compares the earlier half of the last 30 days against the later half, pooling real
-          counts within each half rather than averaging daily percentages. Unlike the retired
-          linear policy, PPO has no warm start — each retrain is an independent from-scratch
-          run, so a rising trend here reflects genuinely improving training data/setup, not
-          accumulated weight refinement.
+          counts within each half rather than averaging daily percentages. Each retrain now
+          warm-starts from the prior usable policy for that pair/interval when one exists, so
+          a rising trend here can reflect genuine accumulated weight refinement — not just
+          improving training data/setup — though a policy that went stale or degenerated to
+          always-HOLD gets a fresh restart automatically, so the mix isn&apos;t uniform.
         </p>
         {!learningCurve ? (
           <p className="mt-4 text-sm text-zinc-400">Loading…</p>
@@ -572,8 +575,10 @@ export default function RLPage() {
           </button>
         </div>
         <p className="mt-2 text-xs text-zinc-400">
-          No warm start — every training run starts a fresh PPO model from total_timesteps
-          real environment steps, it doesn&apos;t continue a prior run&apos;s weights.
+          Continues training the most recent usable policy for this pair/interval when one
+          exists, rather than always starting fresh — unless there&apos;s no prior policy,
+          its feature schema is stale, or it degenerated to always-HOLD, in which case a
+          fresh model is used automatically.
           Target/stop ATR mult: leave both blank to use the configured default for this
           pair/interval — fill in both to override it for this one run, e.g. testing a
           tighter target/stop against a high-expired-rate combo (see the insights above)

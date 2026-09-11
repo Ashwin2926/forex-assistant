@@ -256,6 +256,7 @@ def train_and_evaluate_ppo_poc(
     ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = 0,
     ppo_kwargs: Optional[dict] = None,
     target_atr_mult: Optional[float] = None, stop_atr_mult: Optional[float] = None,
+    warm_start_model_bytes: Optional[bytes] = None,
 ) -> dict:
     """
     The four-check proof-of-concept "Signal Stack v2" phase 3a calls for, steps 2-3 (step 1,
@@ -311,8 +312,21 @@ def train_and_evaluate_ppo_poc(
 
     vec_env = DummyVecEnv([make_env])
     kwargs = dict(ppo_kwargs or {})
-    model = PPO("MlpPolicy", vec_env, seed=random_seed, verbose=0, **kwargs)
-    model.learn(total_timesteps=total_timesteps)
+    # warm_start_model_bytes: continue training an existing policy instead of starting a
+    # fresh randomly-initialized one every call -- stable-baselines3's documented resume
+    # pattern (PPO.load then .learn(reset_num_timesteps=False)), the "real analog to the
+    # retired linear policy's warm start" the original Signal Stack v2 plan called out.
+    # Re-attaches THIS call's env (fresh candle data, possibly a different target/stop) to
+    # the loaded model rather than reusing whatever env it was saved with. Falls back to a
+    # fresh model exactly like before when omitted (e.g. no prior policy exists yet, or the
+    # caller decided the prior one's feature schema is stale -- see main.py's caller).
+    warm_started = warm_start_model_bytes is not None
+    if warm_started:
+        model = PPO.load(io.BytesIO(warm_start_model_bytes), env=vec_env, device="cpu", **kwargs)
+        model.learn(total_timesteps=total_timesteps, reset_num_timesteps=False)
+    else:
+        model = PPO("MlpPolicy", vec_env, seed=random_seed, verbose=0, **kwargs)
+        model.learn(total_timesteps=total_timesteps)
 
     # Greedy (deterministic) PPO evaluation on the untouched test slice.
     def ppo_action_fn(obs: np.ndarray) -> str:
@@ -358,6 +372,7 @@ def train_and_evaluate_ppo_poc(
         "model_size_bytes": model_size_bytes,
         "save_load_latency_ms": round(save_ms + load_ms, 2),
         "model": model,
+        "warm_started": warm_started,
     }
 
 
@@ -368,6 +383,7 @@ def train_ppo_policy(
     ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = None,
     ppo_kwargs: Optional[dict] = None,
     target_atr_mult: Optional[float] = None, stop_atr_mult: Optional[float] = None,
+    warm_start_policy_id: Optional[str] = None, warm_start_model_bytes: Optional[bytes] = None,
 ) -> tuple[PPOPolicy, BacktestRun, list[Signal], dict]:
     """
     The live-persistence wrapper around train_and_evaluate_ppo_poc -- same training/evaluation,
@@ -377,15 +393,20 @@ def train_ppo_policy(
     caller doing a quick POC check has no reason to pay for serializing a model it's about to
     discard.
 
-    Unlike this project's retired linear Q-learning policy, there is no warm_start here --
-    stable-baselines3's PPO has no equivalent of "continue from these exact weights and
-    Adagrad accumulators" resume; every training call starts a fresh PPO model. Repeated calls for the
-    same pair/interval each train total_timesteps from scratch, they don't build on the
-    previous run the way the linear policy's warm start does -- something a caller comparing
-    the two algorithms' "keep training" behavior should know going in.
+    warm_start_policy_id/warm_start_model_bytes: pass both together (the caller's job -- fetch
+    the most recent PPOPolicy for this pair/interval, check its feature_names still match
+    rl.RL_FEATURE_NAMES, same staleness guard choose_action_ppo already uses for live
+    inference) to continue training that policy (stable-baselines3's PPO.load +
+    .learn(reset_num_timesteps=False)) instead of starting a fresh randomly-initialized model
+    -- a real analog to the retired linear policy's warm start. Omit both (the caller has no
+    usable prior policy) for a fresh model, same as every training call before this existed.
+    Caution: warm-starting FROM a policy that's degenerated to always-HOLD continues learning
+    from that same stuck point rather than escaping it via a fresh random initialization --
+    if a pair/interval's policy is currently all-HOLD, a deliberate fresh retrain (omit both
+    args, or POST /rl/reset) may be needed before warm-starting is safe to rely on again.
 
     Returns (policy, eval_run, trade_signals, poc_diagnostics) -- poc_diagnostics carries
-    beats_random/model_size_bytes/save_load_latency_ms forward from
+    beats_random/model_size_bytes/save_load_latency_ms/warm_started forward from
     train_and_evaluate_ppo_poc so a caller (or the API response) can still see them even
     though the model itself is now serialized into `policy` rather than returned raw.
 
@@ -397,6 +418,7 @@ def train_ppo_policy(
         max_lookforward=max_lookforward, starting_balance=starting_balance,
         ml_reference_signals=ml_reference_signals, random_seed=random_seed, ppo_kwargs=ppo_kwargs,
         target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
+        warm_start_model_bytes=warm_start_model_bytes,
     )
     model: PPO = result["model"]
     buffer = io.BytesIO()
@@ -412,12 +434,14 @@ def train_ppo_policy(
         starting_balance=starting_balance,
         total_timesteps=total_timesteps,
         model_bytes=buffer.getvalue(),
+        warm_started_from=warm_start_policy_id if result["warm_started"] else None,
     )
     poc_diagnostics = {
         "beats_random": result["beats_random"],
         "model_size_bytes": result["model_size_bytes"],
         "save_load_latency_ms": result["save_load_latency_ms"],
         "random_baseline_total_return_pct": result["random_baseline_eval_run"].total_return_pct,
+        "warm_started": result["warm_started"],
     }
     return policy, result["ppo_eval_run"], result["ppo_trade_signals"], poc_diagnostics
 

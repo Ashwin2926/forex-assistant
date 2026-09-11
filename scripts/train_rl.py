@@ -32,7 +32,7 @@ from pymongo import MongoClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.ppo_engine import train_ppo_policy
-from app.services.rl_engine import rl_config_profile
+from app.services.rl_engine import rl_config_profile, RL_FEATURE_NAMES
 from app.services.signal_engine import default_config_for
 
 # Same default set app/core/config.py's Settings.forex_pairs and app/main.py's
@@ -51,11 +51,25 @@ def pairs_list() -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, bytes | None]:
+    """Mirrors app/main.py's _find_warm_start_policy exactly (same two conditions: feature
+    schema still current, prior policy's own eval wasn't a degenerate all-HOLD result) but
+    against a sync pymongo db. See that function's own docstring for the full reasoning."""
+    prev = db["ppo_policies"].find_one({"pair": pair, "interval": interval}, sort=[("created_at", -1)])
+    if not prev or prev.get("feature_names") != RL_FEATURE_NAMES:
+        return None, None
+    eval_run = db["backtest_runs"].find_one({"run_id": prev.get("eval_run_id")})
+    if not eval_run or not eval_run.get("directional_signals"):
+        return None, None
+    return prev["policy_id"], prev["model_bytes"]
+
+
 def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: float,
             max_lookforward: int, starting_balance: float, random_seed: int | None,
             target_atr_mult: float | None = None, stop_atr_mult: float | None = None):
     """Mirrors app/main.py's _run_rl_training exactly (same query, same training call, same
-    persistence) but against a sync pymongo db instead of the app's async motor collections.
+    warm-start selection, same persistence) but against a sync pymongo db instead of the
+    app's async motor collections.
 
     target_atr_mult/stop_atr_mult: same override _run_rl_training/POST /rl/train/{interval}
     accept -- omit (both None) to use rl_engine.rl_atr_mults(interval, pair)'s configured
@@ -70,12 +84,15 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
         {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
     ))
 
+    warm_start_policy_id, warm_start_model_bytes = find_warm_start_policy(db, pair, interval)
+
     df = pd.DataFrame(docs)
     policy, eval_run, trade_signals, _poc_diagnostics = train_ppo_policy(
         df, pair, interval, config, total_timesteps=total_timesteps, train_frac=train_frac,
         max_lookforward=max_lookforward, starting_balance=starting_balance,
         ml_reference_signals=ml_reference_signals, random_seed=random_seed,
         target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
+        warm_start_policy_id=warm_start_policy_id, warm_start_model_bytes=warm_start_model_bytes,
     )
 
     if trade_signals:

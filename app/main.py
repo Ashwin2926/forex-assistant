@@ -946,6 +946,32 @@ def _rl_state_from_candles(
 RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 
+async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None, bytes | None]:
+    """
+    Finds the most recent usable PPOPolicy for this pair/interval to continue training from,
+    or (None, None) if there isn't one. "Usable" means both:
+      1. feature_names still matches RL_FEATURE_NAMES -- same staleness guard
+         choose_action_ppo already applies for live inference; a policy trained against an
+         older/different state schema can't have its weights meaningfully continued.
+      2. its OWN test-slice evaluation (the linked BacktestRun) shows at least one
+         directional_signals -- otherwise it's a policy that converged to always-HOLD, and
+         warm-starting from it would continue training from that same stuck point rather
+         than giving this combo a fresh random initialization's chance to find a real
+         trading policy. This is the fix for training runs landing on an all-HOLD policy
+         for some pair/interval combos (which one varies run to run -- see PROGRESS.md) --
+         skip it here rather than perpetuating it.
+    Returns (policy_id, model_bytes) on success so the caller can pass both through to
+    train_ppo_policy for warm_started_from tracking.
+    """
+    prev = await ppo_policies_collection.find_one({"pair": pair, "interval": interval}, sort=[("created_at", -1)])
+    if not prev or prev.get("feature_names") != RL_FEATURE_NAMES:
+        return None, None
+    eval_run = await backtest_runs_collection.find_one({"run_id": prev.get("eval_run_id")})
+    if not eval_run or not eval_run.get("directional_signals"):
+        return None, None
+    return prev["policy_id"], prev["model_bytes"]
+
+
 async def _run_rl_training(
     pair: str, interval: str, total_timesteps: int, train_frac: float, max_lookforward: int, starting_balance: float,
     random_seed: int | None = None, target_atr_mult: float | None = None, stop_atr_mult: float | None = None,
@@ -962,9 +988,11 @@ async def _run_rl_training(
     single call, since the batch job below calls this 20 times in a row and other requests
     (status polling, live signal generation, the cron) still need to get through while it runs.
 
-    No warm-start here -- PPO has no equivalent of the retired linear policy's "continue from
-    these exact weights" resume (see ppo_engine.train_ppo_policy's own docstring); every call
-    trains a fresh model from total_timesteps.
+    Warm-starts from the most usable prior policy for this pair/interval when one exists (see
+    _find_warm_start_policy) -- continues training instead of starting from a fresh randomly-
+    initialized model every call, so a policy that's already learned something builds on that
+    rather than re-rolling the dice each time. Falls back to a fresh model automatically when
+    there's no prior policy, its feature schema is stale, or it degenerated to always-HOLD.
 
     target_atr_mult/stop_atr_mult: explicit override passed straight through to
     train_ppo_policy/train_and_evaluate_ppo_poc -- omit (recommended) to use
@@ -994,12 +1022,15 @@ async def _run_rl_training(
         {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
     ).to_list(length=None)
 
+    warm_start_policy_id, warm_start_model_bytes = await _find_warm_start_policy(pair, interval)
+
     df = pd.DataFrame(docs)
     policy, eval_run, trade_signals, poc_diagnostics = await run_in_threadpool(
         train_ppo_policy, df, pair, interval, config, total_timesteps=total_timesteps,
         train_frac=train_frac, max_lookforward=max_lookforward, starting_balance=starting_balance,
         ml_reference_signals=ml_reference_signals, random_seed=random_seed,
         target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
+        warm_start_policy_id=warm_start_policy_id, warm_start_model_bytes=warm_start_model_bytes,
     )
 
     # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
@@ -1050,8 +1081,10 @@ async def train_rl(
     instead) -- kept only as a manual/dev escape hatch, expect it to be slow and treat an
     occasional timeout as a known risk, not a bug to chase here.
 
-    No warm start (unlike the retired linear policy) -- every call trains a fresh PPO model
-    from total_timesteps real environment steps, it doesn't continue a prior run's weights.
+    Warm-starts from the most recent usable policy for this pair/interval when one exists
+    (see _find_warm_start_policy) -- continues training rather than starting fresh every
+    call, unless there's no prior policy, its feature schema is stale, or it degenerated to
+    always-HOLD (in which case a fresh model is used automatically, no action needed).
 
     random_seed: omit for normal training (stays genuinely exploratory). Pass an explicit int
     only when comparing two runs against each other and you need a reproducible baseline to
@@ -1819,10 +1852,14 @@ async def rl_learning_curve(days: int = 30):
     - avg_training_hit_rate_pct / avg_training_return_pct: every RL training run
       (BacktestRun, profile="rl_ppo"), grouped by the day it was trained, averaged across
       whichever pair/interval combos got (re)trained that day -- "how good did the agent's
-      own test-slice evaluation look on the policies produced this day." Unlike this
-      project's retired linear policy, PPO has no warm start -- each retrain is an
-      independent from-scratch run, so a rising trend here reflects genuinely improving
-      training data/setup over time, not accumulated weight refinement.
+      own test-slice evaluation look on the policies produced this day." Each PPO retrain
+      now warm-starts from the prior usable policy for that pair/interval when one exists
+      (see _find_warm_start_policy) -- a rising trend here can reflect genuine accumulated
+      weight refinement, not just improving training data/setup, so don't read this as
+      "the underlying setup got better" the way the retired linear policy's version of this
+      trend could be read; a fresh (non-warm-started) run happens automatically whenever the
+      prior policy was stale or degenerated to always-HOLD, so the mix isn't uniform day to
+      day either.
 
     Aggregated in Python, not a Mongo pipeline -- data volume here (signals/training runs
     over `days` days) is small enough that this is simpler to read and maintain, consistent
