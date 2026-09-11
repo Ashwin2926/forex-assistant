@@ -1157,7 +1157,7 @@ async def debug_egress_check():
     # own router just didn't know about it, even though the dashboard showed the commit that
     # added it as the live deployment) -- a value baked into the running code itself is the
     # only way to be sure which build is actually answering requests.
-    DEPLOY_MARKER = "2026-09-11-b"
+    DEPLOY_MARKER = "2026-09-11-c"
 
     results: dict = {"deploy_marker": DEPLOY_MARKER}
     for name, url in [("github", "https://api.github.com"), ("twelvedata", "https://api.twelvedata.com")]:
@@ -1169,6 +1169,28 @@ async def debug_egress_check():
         except httpx.RequestError as e:
             results[name] = {"ok": False, "error": f"{type(e).__name__}: {e}", "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
     return results
+
+
+@app.get("/debug/dispatch-check")
+async def debug_dispatch_check():
+    """
+    Diagnostic only -- calls _trigger_rl_train_workflow directly with a throwaway job_id
+    (real dispatch, will actually queue a train-rl.yml run -- harmless, same as any other
+    manual/dev training trigger) wrapped in a bare except so ANY failure mode is reported
+    back instead of producing an unhandled 500/CORS-masking response. Added because
+    GET /debug/egress-check showed clean, fast (30ms) connectivity to api.github.com, yet
+    POST /rl/train-all still 502s with no CORS headers -- meaning the failure isn't a generic
+    GitHub-unreachable problem, and must be something specific to the real dispatch call or
+    something else in that endpoint's body. This isolates exactly which.
+    """
+    job_id = f"debug-{uuid.uuid4().hex[:8]}"
+    try:
+        await _trigger_rl_train_workflow(job_id, 50_000, 0.7, DEFAULT_STARTING_BALANCE)
+        return {"ok": True, "job_id": job_id}
+    except HTTPException as e:
+        return {"ok": False, "kind": "HTTPException", "status_code": e.status_code, "detail": e.detail}
+    except Exception as e:
+        return {"ok": False, "kind": type(e).__name__, "detail": str(e)}
 
 
 @app.post("/rl/train-all")
