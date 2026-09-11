@@ -1151,7 +1151,15 @@ async def debug_egress_check():
     specifically, not a bug in the exception handling itself. Read-only, no side effects --
     safe to leave in place as a general ops diagnostic, not just for this one investigation.
     """
-    results = {}
+    # Bumped by hand on each deploy meant to verify itself this way -- FastAPI Cloud's
+    # dashboard "live" label has been observed NOT to match what's actually serving requests
+    # (this route 404'd with a clean FastAPI-shaped 404, meaning auth passed and Starlette's
+    # own router just didn't know about it, even though the dashboard showed the commit that
+    # added it as the live deployment) -- a value baked into the running code itself is the
+    # only way to be sure which build is actually answering requests.
+    DEPLOY_MARKER = "2026-09-11-b"
+
+    results: dict = {"deploy_marker": DEPLOY_MARKER}
     for name, url in [("github", "https://api.github.com"), ("twelvedata", "https://api.twelvedata.com")]:
         t0 = time.perf_counter()
         try:
