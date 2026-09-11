@@ -114,8 +114,25 @@ RL_ATR_MULTS_BY_INTERVAL: dict[str, tuple[float, float]] = {
 # linear policy (see RL_ATR_MULTS_BY_INTERVAL's own note on why these are inherited, not
 # PPO-validated), so it was kept at the original value rather than forced onto a default that
 # didn't actually help it.
+#
+# GBP/USD 15min -- added 2026-09-11 after GET /rl/resolution-stats showed GBP/USD resolving
+# to hit/miss far less often than EUR/USD at 5min/15min (63%/50% expired for EUR/USD vs
+# 82%/88% for GBP/USD) despite an identical lookforward window, pointing at the fixed 1.5:1.0
+# target:stop being too wide for GBP/USD's actual 15min movement rather than "not waiting long
+# enough." Swept two tighter candidates (keeping the same 1.5:1 ratio) via
+# POST /rl/train/15min?pair=GBP%2FUSD: (0.75, 0.5) produced ZERO directional signals on the
+# test slice (tight enough that spread cost apparently makes every setup net-negative, so the
+# trained policy just learned to hold instead of trade) -- worse than the default, not
+# better, and the reason this isn't simply "tighter is always better." (1.0, 0.667) produced
+# 111 directional signals at 60.4% hit rate / +0.0057% expectancy, a real sample, clearly
+# better than the near-total-expiry status quo -- adopted here. GBP/USD 5min was swept the
+# same way but only produced 4 directional signals for (1.0, 0.667) -- too small a sample to
+# act on (same "don't tune on a handful of trades" floor as case_memory.MIN_CASES_FOR_GATING
+# elsewhere in this project) -- left at the interval default pending more data, not silently
+# dropped.
 RL_ATR_MULT_PAIR_OVERRIDES: dict[tuple[str, str], tuple[float, float]] = {
     ("4h", "GBP/USD"): (1.5, 1.0),
+    ("15min", "GBP/USD"): (1.0, 0.667),
 }
 
 
