@@ -130,9 +130,26 @@ RL_ATR_MULTS_BY_INTERVAL: dict[str, tuple[float, float]] = {
 # act on (same "don't tune on a handful of trades" floor as case_memory.MIN_CASES_FOR_GATING
 # elsewhere in this project) -- left at the interval default pending more data, not silently
 # dropped.
+#
+# USD/JPY and AUD/USD -- same 2026-09-11 sweep extended to the other two pairs GET
+# /rl/insights flagged as expired-heavy at 5min/15min. Results did NOT generalize from
+# GBP/USD's "tighter is better" pattern -- each pair/interval needed checking on its own:
+#   - USD/JPY 5min: (1.0, 0.667) only 2 signals (discard); (0.75, 0.5) gave 101 signals at
+#     54.5% hit / +0.005% expectancy -- real sample, modest positive edge. Adopted.
+#   - USD/JPY 15min: (1.0, 0.667) gave a well-sampled 122 signals but -0.0165% expectancy
+#     (net losing); (0.75, 0.5) looked great (66.7% hit / +0.0582%) but was only 3 signals --
+#     noise, not a real edge. Neither candidate is usable -- left at the interval default,
+#     unresolved (not "fixed," a genuinely open problem for this combo).
+#   - AUD/USD 5min: both candidates produced ZERO directional signals -- left at default.
+#   - AUD/USD 15min: (1.0, 0.667) zero signals; (0.75, 0.5) had a real sample (10 signals)
+#     but -0.0322% expectancy, i.e. worse than default, not better. Left at default.
+# Same lesson as GBP/USD's own (0.75, 0.5) failure above: this is a per-(interval, pair)
+# empirical question, not a formula -- don't extrapolate one pair's working override to
+# another without sweeping it separately.
 RL_ATR_MULT_PAIR_OVERRIDES: dict[tuple[str, str], tuple[float, float]] = {
     ("4h", "GBP/USD"): (1.5, 1.0),
     ("15min", "GBP/USD"): (1.0, 0.667),
+    ("5min", "USD/JPY"): (0.75, 0.5),
 }
 
 
