@@ -2357,40 +2357,41 @@ async def rl_insights():
                     # A computation bug/edge-case for one combo replaying real market data
                     # shouldn't take down every other combo's findings -- same "best-effort,
                     # don't crash noisily" reasoning as _retrain_degraded_policy_background.
+                    # Wraps the counterfactual call AND the result-processing below it (not
+                    # just the call) -- a bug in the latter is just as able to take down every
+                    # other combo's findings as one in the former.
+                    detail = None
                     try:
                         counterfactual = await counterfactual_target_stop(pair, interval, candidates)
+                        if counterfactual is not None:
+                            baseline = counterfactual["by_mults"][current_mults]
+                            best_mults, best = min(
+                                ((m, r) for m, r in counterfactual["by_mults"].items() if m != current_mults),
+                                key=lambda mr: mr[1]["expired_fraction_pct"] if mr[1]["expired_fraction_pct"] is not None else 100.0,
+                            )
+                            if (
+                                baseline["expired_fraction_pct"] is not None and best["expired_fraction_pct"] is not None
+                                and baseline["expired_fraction_pct"] - best["expired_fraction_pct"] >= COUNTERFACTUAL_MEANINGFUL_IMPROVEMENT_PCT
+                            ):
+                                detail = (
+                                    f"{expired_pct}% of resolved signals timed out without hitting target or "
+                                    f"stop. Replaying the same {counterfactual['replayed_signals']} signals' "
+                                    f"actual price paths with a tighter {best_mults[0]}x/{best_mults[1]}x "
+                                    f"target/stop (vs the current {current_mults[0]}x/{current_mults[1]}x) "
+                                    f"would have cut the expired share to {best['expired_fraction_pct']}% "
+                                    f"(hit rate {best['hit_rate_pct']}% vs {baseline['hit_rate_pct']}% now) -- "
+                                    f"doesn't account for spread cost on the tighter band, but a real "
+                                    f"reduction in signals that never resolve."
+                                )
+                            else:
+                                detail = (
+                                    f"{expired_pct}% of resolved signals timed out without hitting target or "
+                                    f"stop. Replayed the same signals' actual price paths with tighter "
+                                    f"target/stop bands and none meaningfully reduced it -- points at a "
+                                    f"window problem (see GET /rl/resolution-stats), not a sizing one."
+                                )
                     except Exception as e:
-                        counterfactual = None
                         print(f"counterfactual_target_stop failed for {label}: {type(e).__name__}: {e}")
-
-                    detail = None
-                    if counterfactual is not None:
-                        baseline = counterfactual["by_mults"][current_mults]
-                        best_mults, best = min(
-                            ((m, r) for m, r in counterfactual["by_mults"].items() if m != current_mults),
-                            key=lambda mr: mr[1]["expired_fraction_pct"] if mr[1]["expired_fraction_pct"] is not None else 100.0,
-                        )
-                        if (
-                            baseline["expired_fraction_pct"] is not None and best["expired_fraction_pct"] is not None
-                            and baseline["expired_fraction_pct"] - best["expired_fraction_pct"] >= COUNTERFACTUAL_MEANINGFUL_IMPROVEMENT_PCT
-                        ):
-                            detail = (
-                                f"{expired_pct}% of resolved signals timed out without hitting target or "
-                                f"stop. Replaying the same {counterfactual['replayed_signals']} signals' "
-                                f"actual price paths with a tighter {best_mults[0]}x/{best_mults[1]}x "
-                                f"target/stop (vs the current {current_mults[0]}x/{current_mults[1]}x) "
-                                f"would have cut the expired share to {best['expired_fraction_pct']}% "
-                                f"(hit rate {best['hit_rate_pct']}% vs {baseline['hit_rate_pct']}% now) -- "
-                                f"doesn't account for spread cost on the tighter band, but a real "
-                                f"reduction in signals that never resolve."
-                            )
-                        else:
-                            detail = (
-                                f"{expired_pct}% of resolved signals timed out without hitting target or "
-                                f"stop. Replayed the same signals' actual price paths with tighter "
-                                f"target/stop bands and none meaningfully reduced it -- points at a "
-                                f"window problem (see GET /rl/resolution-stats), not a sizing one."
-                            )
                     if detail is None:
                         detail = (
                             f"{expired_pct}% of resolved signals timed out without hitting target or "
