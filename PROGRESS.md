@@ -4,6 +4,42 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-12 (cont., latest)
+
+**Real data-loss bug: export_candles.py overwriting the archive instead of merging with it
+-- caught, recovered, and fixed. Also switched the archive from gzip-CSV to Parquet.**
+
+`scripts/export_candles.py` fully replaced each `data/candles/*.csv.gz` file with whatever
+`candles_collection` currently held -- no merge with the file's existing content. Ran it
+right after `/candles/prune-history` had already trimmed `15min`/`1h`/`4h`/`1day` back to
+2000 candles/pair (but before `5min`'s trim), so that export silently replaced those four
+intervals' full 2020/2007-onward archives with just the trimmed 2000-2016 row window, for
+all 4 pairs (16 files). Caught it by spot-checking file sizes after a routine git pull
+showed them shrink from ~1.5MB to ~19KB.
+
+**Fully recovered**: git history had the pre-trim commit (`2aff416`) with full depth intact
+for all 16 files, restored from there (`8ac734d`). `5min`'s 4 files were correctly left at
+their current state (`aa7a70a`) since that backfill run had made them deeper than
+`2aff416`'s partial 5min data. Verified every file's row count and date range after
+recovery before committing.
+
+**Root cause fixed**: `export_candles.py` now reads the existing archive file first (if
+any), concatenates it with whatever's currently in Mongo, and writes the union back --
+coverage can only grow, never shrink, regardless of Mongo's trim state or how many times
+the export runs. This is the actual fix; the recovery above only restored data that was
+already lost once.
+
+**Also switched the archive format to Parquet** (brotli-compressed), prompted by the user
+asking whether Parquet would work here. Measured before committing to it: on this project's
+own EUR/USD 5min file (502k rows), brotli-parquet is ~27% LARGER on disk than gzip-CSV
+(5.2MB vs 4.1MB -- the initial assumption that Parquet would also be smaller was wrong,
+verified and corrected before telling the user) but reads ~15-20x FASTER in pandas (0.024s
+vs 0.50s). Worth the size tradeoff here specifically because slow archive reads already
+caused two separate gateway-timeout incidents this same session (the `counterfactual_target_stop`
+scale bug, and the trim endpoint's own timeouts) -- faster parsing directly reduces that
+risk going forward. `app/services/candle_archive.py` and `/debug/archive-check` updated to
+match; `pyarrow` added to requirements.txt as pandas' Parquet engine.
+
 ## 2026-09-12 (cont.)
 
 **Made GET /rl/insights' "signals rarely reach a real outcome" finding computed instead of

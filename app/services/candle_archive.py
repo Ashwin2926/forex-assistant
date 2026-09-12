@@ -15,15 +15,20 @@ def _slug(pair: str) -> str:
 
 def load_archived_candles(pair: str, interval: str) -> pd.DataFrame:
     """
-    Reads the committed CSV export for this pair/interval, or an empty frame (same columns)
-    if none exists yet -- callers should treat a missing archive as "no older history",
-    not an error, since not every pair/interval has been backfilled/exported.
+    Reads the committed Parquet export for this pair/interval, or an empty frame (same
+    columns) if none exists yet -- callers should treat a missing archive as "no older
+    history", not an error, since not every pair/interval has been backfilled/exported.
+
+    Parquet over gzip-CSV: ~15-20x faster to read in pandas (measured on this project's own
+    502k-row EUR/USD 5min file: 0.024s vs 0.50s), at the cost of ~27% more disk space -- worth
+    it since slow archive reads have already caused gateway timeouts on the endpoints that
+    call this (see scripts/export_candles.py's own docstring for the numbers).
     """
-    path = ARCHIVE_DIR / f"{_slug(pair)}_{interval}.csv.gz"
+    path = ARCHIVE_DIR / f"{_slug(pair)}_{interval}.parquet"
     columns = ["timestamp", "open", "high", "low", "close", "volume"]
     if not path.exists():
         return pd.DataFrame(columns=columns)
-    return pd.read_csv(path, compression="gzip", parse_dates=["timestamp"])
+    return pd.read_parquet(path)
 
 
 async def load_full_candle_history(pair: str, interval: str) -> list[dict]:

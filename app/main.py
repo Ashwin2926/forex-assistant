@@ -175,7 +175,7 @@ CANDLES_TRIM_KEEP_DEFAULT = 2000
 async def prune_candle_history(confirm: bool = False, keep_latest_n: int = CANDLES_TRIM_KEEP_DEFAULT):
     """
     Trims candles_collection down to the keep_latest_n most recent candles per pair/interval,
-    now that scripts/export_candles.py + data/candles/*.csv.gz (see /debug/archive-check,
+    now that scripts/export_candles.py + data/candles/*.parquet (see /debug/archive-check,
     confirmed the deployed backend can actually read them) means older candles aren't lost --
     load_full_candle_history already merges the archive back in for anything that needs deep
     history (/backtest*, /consensus/backtest, RL training). Nothing that reads Mongo directly
@@ -1345,7 +1345,7 @@ async def debug_egress_check():
 async def debug_archive_check(pair: str, interval: str):
     """
     Diagnostic only, read-only -- proves whether THIS deployed backend can actually read the
-    committed data/candles/*.csv.gz archive files (FastAPI Cloud deploys from this same repo,
+    committed data/candles/*.parquet archive files (FastAPI Cloud deploys from this same repo,
     but that's an assumption, not something confirmed before /candles/prune-history relies on
     it). Reports row count and min/max timestamp found in the archive file, separate from
     whatever's in Mongo -- a row count of 0 here means either no archive file exists for this
@@ -1353,7 +1353,7 @@ async def debug_archive_check(pair: str, interval: str):
     """
     from app.services.candle_archive import load_archived_candles, ARCHIVE_DIR, _slug
 
-    path = ARCHIVE_DIR / f"{_slug(pair)}_{interval}.csv.gz"
+    path = ARCHIVE_DIR / f"{_slug(pair)}_{interval}.parquet"
     df = load_archived_candles(pair, interval)
     return {
         "archive_dir": str(ARCHIVE_DIR),
