@@ -4,6 +4,42 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-12 (cont., latest x5)
+
+**Redesigned the ML training-data gap-fix to never touch Mongo for backtest signals at all --
+the actual fix for the outage above, not just a bandage on it.**
+
+The whole outage traced back to one decision: writing per-signal backtest detail into
+`backtest_signals_collection`. Rather than keep capping/trimming that after the fact
+(`MAX_BACKTEST_SIGNALS`, `trim_backtest_signals.py`), applied the exact pattern already
+proven for candle history (`scripts/backfill_to_archive.py` writing straight to
+`data/candles/*.parquet`, bypassing Mongo entirely): `scripts/rebuild_backtests.py` now writes
+per-signal detail straight to `data/backtest_signals_archive/*.parquet` (one file per
+pair/interval, overwritten each run -- not merged, since a rebuild is always "the complete
+current-config replay," unlike candles' incrementally-growing history) and commits it to git.
+`backtest_runs_collection` still gets the lightweight summary insert (hit-rate, expectancy --
+no per-signal detail, stays under 1MB for 800+ docs, powers the existing `/backtest/runs`
+listing).
+
+`app/services/ml_training_data.py` simplified accordingly: `is_qualifying_backtest_run`/
+`QUALIFYING_BACKTEST_PROFILE` and the whole Mongo-run-matching dance are gone entirely --
+every file in the archive is, by construction, always "today's live default config" (the
+rebuild script only ever writes it that way), so there's no separate "is this still current"
+check needed the way there was when matching against arbitrary `/backtest`/`/backtest/sweep`/
+`/backtest/optimize` runs in Mongo. `get_ml_reference_signals` is now just live-Mongo-signals
+UNION `load_backtest_signals_archive()` (a plain local-file read, same "fast enough to call
+synchronously" precedent as `candle_archive.load_archived_candles`). `MAX_BACKTEST_SIGNALS`
+(random-sample cap, still 5,000) stays -- storage is no longer the constraint, but the live
+per-request Python feature-extraction + XGBoost-fit cost still needs a ceiling regardless of
+where the data lives.
+
+`rebuild-backtests.yml` gained a "Commit archive" step (`permissions: contents: write`,
+same git-config-add-commit-push pattern `export-candles.yml` already uses) between the
+rebuild and the chained retrain -- committing triggers FastAPI Cloud's own git-triggered
+redeploy the same way `data/candles/*.parquet` already does, so the running app actually picks
+up the new archive files (they're read from the deployed filesystem snapshot, not fetched live
+from git).
+
 ## 2026-09-12 (cont., latest x4)
 
 **Outage: Atlas went over its 512MB quota, which crashed the app on startup entirely.**

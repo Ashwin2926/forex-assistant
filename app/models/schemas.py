@@ -248,7 +248,7 @@ class MLTrainResult(BaseModel):
     created_at: datetime
     train_samples: int
     test_samples: int
-    # How many of train_samples/test_samples came from a qualifying backtest signal rather
+    # How many of train_samples/test_samples came from the archived backtest signals rather
     # than a live one (see app/services/ml_training_data.py) -- live counts are derivable as
     # train_samples - train_samples_backtest, so no redundant "live" field. Defaulted to 0 so
     # documents stored before this field existed still validate.

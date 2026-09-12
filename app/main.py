@@ -292,9 +292,7 @@ async def create_signal(
     signal = generate_signal(df, pair, interval, profile, config)
 
     if signal.direction in ("BUY", "SELL"):
-        resolved_signals = await get_ml_reference_signals(
-            signals_collection, backtest_signals_collection, backtest_runs_collection
-        )
+        resolved_signals = await get_ml_reference_signals(signals_collection)
         features = extract_features(signal.model_dump())
         signal.ml_hit_probability = predict_hit_probability(resolved_signals, features)
         if signal.ml_hit_probability is not None and signal.ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
@@ -921,8 +919,8 @@ async def get_backtest_run_signals(run_id: str, status: str | None = None, limit
 async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     """
     Trains the supervised hit/miss classifier (app/services/ml_model.py, XGBoost --
-    NOT reinforcement learning) on every resolved live signal PLUS every qualifying backtest
-    signal (see ml_training_data.get_ml_reference_signals) across all pairs/profiles. One
+    NOT reinforcement learning) on every resolved live signal PLUS the archived backtest
+    signals (see ml_training_data.get_ml_reference_signals) across all pairs/profiles. One
     shared model, not per-pair -- splitting even the widened sample further would leave too
     few examples per model to mean anything. Chronological train/test split, not random (see
     train_hit_classifier's own docstring) -- the same lookahead-bias discipline already
@@ -941,7 +939,7 @@ async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
-    signals = await get_ml_reference_signals(signals_collection, backtest_signals_collection, backtest_runs_collection)
+    signals = await get_ml_reference_signals(signals_collection)
 
     if not force:
         last_run = await ml_runs_collection.find_one(sort=[("created_at", -1)])
@@ -1024,9 +1022,7 @@ async def predict_signal(interval: str, profile: str, pair: str):
     # score a HOLD as if it were a SELL that never happened).
     ml_hit_probability = None
     if signal.direction in ("BUY", "SELL"):
-        resolved_signals = await get_ml_reference_signals(
-            signals_collection, backtest_signals_collection, backtest_runs_collection
-        )
+        resolved_signals = await get_ml_reference_signals(signals_collection)
         features = extract_features(signal.model_dump())
         ml_hit_probability = predict_hit_probability(resolved_signals, features)
 
@@ -1157,9 +1153,7 @@ async def _run_rl_training(
     # query /ml/predict already uses -- train_ppo_policy filters this down to only the subset
     # resolved before ITS OWN train/test split boundary once it knows where that falls (see
     # rl_engine.frozen_ml_snapshot for why that filtering can't happen here).
-    ml_reference_signals = await get_ml_reference_signals(
-        signals_collection, backtest_signals_collection, backtest_runs_collection
-    )
+    ml_reference_signals = await get_ml_reference_signals(signals_collection)
 
     warm_start_policy_id, warm_start_model_bytes = await _find_warm_start_policy(pair, interval)
 
@@ -1348,11 +1342,11 @@ async def rebuild_all_backtests(max_lookforward: int = 20):
     job_id -- poll GET /backtest/rebuild-all/{job_id} for progress, same pattern as
     POST /rl/train-all.
 
-    This is what actually populates data for app/services/ml_training_data.py's qualifying-
-    backtest-signal filter to draw on: that filter only accepts backtest signals whose run
-    used a rule_config/target_atr_mult/stop_atr_mult byte-identical to today's default, so any
-    time PROFILE_DEFAULTS["intraday"] changes, every previously-qualifying run stops
-    qualifying and this needs to be re-run. The workflow itself chains
+    This is what actually populates app/services/ml_training_data.py's Parquet archive
+    (data/backtest_signals_archive/*.parquet, git-committed, NOT written to Mongo -- see
+    PROGRESS.md's 2026-09-12 outage entry for why): every file there is always "today's live
+    default config" by construction, so any time PROFILE_DEFAULTS["intraday"] changes, this
+    needs to be re-run to keep the archive current. The workflow itself chains
     POST /ml/train?force=true onto the end of its run, so this job's completion also means
     the classifier has already been retrained on the fresh data.
     """
@@ -1861,9 +1855,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
                     f"Run /ingest/{interval} first."
         )
 
-    resolved_signals = await get_ml_reference_signals(
-        signals_collection, backtest_signals_collection, backtest_runs_collection
-    )
+    resolved_signals = await get_ml_reference_signals(signals_collection)
     market_state, df, ml_buy_score, ml_sell_score = _rl_state_from_candles(
         docs, config, pair, interval, rl_config_profile(interval), resolved_signals,
     )

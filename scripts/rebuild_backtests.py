@@ -8,27 +8,39 @@ similarly slow endpoints (see PROGRESS.md's 2026-09-12 storage-crisis/candle-arc
 Doing it here removes that timeout entirely.
 
 Why this script exists (separate from just calling POST /backtest per combo): the ML
-classifier's training data (see app/services/ml_training_data.py) only accepts backtest
-signals from a run whose rule_config/target_atr_mult/stop_atr_mult are BYTE-IDENTICAL to
-today's live default (see that module's is_qualifying_backtest_run) -- deliberately, so the
-classifier never learns from a superseded ruleset. Checked live on 2026-09-12: every existing
-backtest_signals run with real directional signals predates the 2026-09-07 EMA 9/21 default
-(they used the older EMA 12/26), so none of them qualify. This script re-runs the CURRENT
-default config across the full archive for every pair/interval, producing fresh qualifying
-data for the ML classifier to actually use. Re-run it any time PROFILE_DEFAULTS["intraday"]
-changes, for the same reason.
+classifier's training data (see app/services/ml_training_data.py) needs a large pool of
+resolved signals generated under today's live default config -- deliberately, so the
+classifier never learns from a superseded ruleset. Checked live on 2026-09-12: every backtest
+run that existed before this script did predates the 2026-09-07 EMA 9/21 default (they used
+the older EMA 12/26), so none of them were usable. This script re-runs the CURRENT default
+config across the full archive for every pair/interval, producing fresh training data. Re-run
+it any time PROFILE_DEFAULTS["intraday"] changes, for the same reason.
+
+Per-signal detail is written straight to a git-committed Parquet archive
+(data/backtest_signals_archive/*.parquet, one file per pair/interval, overwritten each run --
+NOT merged/appended, since a rebuild always represents "the complete current-config replay,"
+not incremental new history the way candle data is), NOT into
+backtest_signals_collection -- see PROGRESS.md's 2026-09-12 outage entry: writing ~90,000+
+signals into Mongo pushed Atlas over its 512MB M0 quota and crashed the entire app (writes
+are blocked cluster-wide once over quota, including the index-creation call in app startup).
+The Parquet archive has no comparable size cap (same reasoning as data/candles/*.parquet
+already uses), so this can't repeat that outage regardless of how much history it replays.
+Each run's lightweight summary (hit-rate, expectancy, etc. -- no per-signal detail) still goes
+into backtest_runs_collection, which stays small (under 1MB for 800+ docs) and is what powers
+the existing GET /backtest/runs listing.
 
 Deliberately does NOT import app.core.config or app.core.database, same as train_rl.py --
 reads only the two Mongo env vars it needs directly from the environment and talks to Mongo
-via a plain sync pymongo client. Persists into the exact same collections/shapes app/main.py's
-POST /backtest already uses (backtest_signals_collection, backtest_runs_collection) so nothing
-downstream needs to know this ran here instead of through the API.
+via a plain sync pymongo client for backtest_runs/backtest_rebuild_jobs only.
 """
 import argparse
+import json
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
+import pandas as pd
 from pymongo import MongoClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,12 +54,28 @@ INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 PROFILE = "intraday"
 
+ARCHIVE_DIR = Path(__file__).resolve().parent.parent / "data" / "backtest_signals_archive"
+
 
 def pairs_list() -> list[str]:
     raw = os.environ.get("FOREX_PAIRS")
     if not raw:
         return DEFAULT_PAIRS
     return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _write_signals_parquet(pair: str, interval: str, signals: list) -> None:
+    """Overwrites data/backtest_signals_archive/{pair}_{interval}.parquet with this run's
+    signals -- see module docstring for why overwrite, not merge. reasons is JSON-stringified
+    (a list[dict] doesn't round-trip through Parquet as cleanly as a plain column);
+    ml_training_data.load_backtest_signals_archive() restores it on read."""
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    rows = [s.model_dump() for s in signals]
+    for r in rows:
+        r["reasons"] = json.dumps(r["reasons"], default=str)
+    df = pd.DataFrame(rows)
+    slug = pair.replace("/", "_")
+    df.to_parquet(ARCHIVE_DIR / f"{slug}_{interval}.parquet", compression="brotli", index=False)
 
 
 def run_one(db, pair: str, interval: str, max_lookforward: int) -> tuple[int, int]:
@@ -62,7 +90,7 @@ def run_one(db, pair: str, interval: str, max_lookforward: int) -> tuple[int, in
     run, signals = run_backtest(df, pair, interval, PROFILE, config=config, max_lookforward=max_lookforward)
 
     if signals:
-        db["backtest_signals"].insert_many([s.model_dump() for s in signals])
+        _write_signals_parquet(pair, interval, signals)
     db["backtest_runs"].insert_one(run.model_dump())
     return run.directional_signals, run.hits
 

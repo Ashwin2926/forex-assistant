@@ -7,11 +7,20 @@ name: Rebuild intraday backtests (ML training data)
 # thousands of candles, and FastAPI Cloud's ~125s gateway timeout has already caused
 # documented failures on similarly slow endpoints. No per-request timeout here at all.
 #
-# Also the actual fix for app/services/ml_training_data.py's qualifying-backtest-signal gate
-# having nothing to draw on: checked live on 2026-09-12, every existing backtest_signals run
-# with real directional signals predates the 2026-09-07 EMA 9/21 default and so doesn't
-# qualify. Run this manually now, and again any time PROFILE_DEFAULTS["intraday"] changes --
-# it's dispatch-only (not scheduled), since the default config changes rarely, not daily.
+# Also the actual fix for app/services/ml_training_data.py having nothing usable to draw on:
+# checked live on 2026-09-12, every backtest run that existed before this workflow did
+# predates the 2026-09-07 EMA 9/21 default and so wasn't usable. Run this manually now, and
+# again any time PROFILE_DEFAULTS["intraday"] changes -- it's dispatch-only (not scheduled),
+# since the default config changes rarely, not daily.
+#
+# Per-signal detail is written to data/backtest_signals_archive/*.parquet and committed to
+# git, NOT to Mongo -- see scripts/rebuild_backtests.py's own docstring and PROGRESS.md's
+# 2026-09-12 outage entry: writing ~90,000+ signals into backtest_signals_collection pushed
+# Atlas over its 512MB M0 quota and crashed the entire app. Committing here triggers FastAPI
+# Cloud's own git-triggered redeploy, same as data/candles/*.parquet already does -- the
+# "Retrain ML model" step below may occasionally race a redeploy still in progress and read
+# the previous archive; harmless, since keep-fresh.yml's own cron retrains again regularly
+# anyway.
 on:
   workflow_dispatch:
     inputs:
@@ -32,14 +41,16 @@ on:
 jobs:
   rebuild:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       MONGODB_URI: ${{ secrets.MONGODB_URI }}
       MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
       FOREX_PAIRS: ${{ secrets.FOREX_PAIRS }}
       # Same API_BASE/AUTOMATION_TOKEN keep-fresh.yml already uses for its own "Retrain ML
-      # model" step (X-Service-Token auth, see app/core/auth.py) -- reused here so the new
-      # backtest_signals this job just wrote get picked up in the same run, rather than
-      # waiting for keep-fresh.yml's own cron cycle to notice them.
+      # model" step (X-Service-Token auth, see app/core/auth.py) -- reused here so the fresh
+      # archive this job just committed gets picked up in the same run, rather than waiting
+      # for keep-fresh.yml's own cron cycle to notice it.
       API_BASE: https://forex-assistant.fastapicloud.dev
       AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
     steps:
@@ -60,6 +71,17 @@ jobs:
           if [ -n "$JOB_ID" ]; then args+=(--job-id "$JOB_ID"); fi
           if [ -n "$PAIR" ] && [ -n "$INTERVAL" ]; then args+=(--pair "$PAIR" --interval "$INTERVAL"); fi
           python scripts/rebuild_backtests.py "${args[@]}"
+      - name: Commit archive
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/backtest_signals_archive/
+          if git diff --cached --quiet; then
+            echo "No changes to the archive."
+          else
+            git commit -m "Update backtest signals archive ($(date -u +%Y-%m-%d))"
+            git push
+          fi
       # force=true because the resolved-signal COUNT can be unchanged from the last run while
       # the underlying rows are entirely different (fresh qualifying backtest signals
       # replacing what were previously all non-qualifying) -- see /ml/train's own docstring
