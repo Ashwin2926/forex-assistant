@@ -5,6 +5,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 import asyncio
 import time
+import traceback
 import uuid
 import httpx
 import pandas as pd
@@ -1422,6 +1423,30 @@ async def debug_dispatch_check():
         return {"ok": False, "kind": type(e).__name__, "detail": str(e), **config_snapshot}
 
 
+@app.get("/debug/counterfactual-check")
+async def debug_counterfactual_check(pair: str, interval: str):
+    """
+    Diagnostic only -- calls counterfactual_target_stop directly with a bare except (same
+    reasoning as GET /debug/dispatch-check) so a failure inside GET /rl/insights' new
+    computed-recommendation path (which itself swallows this exception to avoid taking down
+    every other combo's findings) can actually be seen, full traceback included.
+    """
+    current_mults = rl_atr_mults(interval, pair)
+    candidates = [current_mults] + [
+        (round(current_mults[0] * f, 3), round(current_mults[1] * f, 3))
+        for f in COUNTERFACTUAL_SCALE_FACTORS
+    ]
+    try:
+        result = await counterfactual_target_stop(pair, interval, candidates)
+        return {"ok": True, "current_mults": current_mults, "candidates": candidates, "result": result}
+    except Exception as e:
+        return {
+            "ok": False, "kind": type(e).__name__, "detail": str(e),
+            "traceback": traceback.format_exc(),
+            "current_mults": current_mults, "candidates": candidates,
+        }
+
+
 @app.post("/rl/train-all")
 async def train_rl_all(
     total_timesteps: int = 50_000, train_frac: float = 0.7, starting_balance: float = DEFAULT_STARTING_BALANCE,
@@ -2329,7 +2354,14 @@ async def rl_insights():
                         (round(current_mults[0] * f, 3), round(current_mults[1] * f, 3))
                         for f in COUNTERFACTUAL_SCALE_FACTORS
                     ]
-                    counterfactual = await counterfactual_target_stop(pair, interval, candidates)
+                    # A computation bug/edge-case for one combo replaying real market data
+                    # shouldn't take down every other combo's findings -- same "best-effort,
+                    # don't crash noisily" reasoning as _retrain_degraded_policy_background.
+                    try:
+                        counterfactual = await counterfactual_target_stop(pair, interval, candidates)
+                    except Exception as e:
+                        counterfactual = None
+                        print(f"counterfactual_target_stop failed for {label}: {type(e).__name__}: {e}")
 
                     detail = None
                     if counterfactual is not None:
