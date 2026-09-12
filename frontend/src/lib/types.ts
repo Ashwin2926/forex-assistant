@@ -247,7 +247,7 @@ export interface BacktestRebuildCell {
 // (app/services/ml_training_data.py) -- see the /ml page for where this gets triggered.
 export interface BacktestRebuildJob {
   job_id: string;
-  status: "running" | "done";
+  status: "running" | "done" | "cancelled";
   created_at: string;
   finished_at?: string | null;
   max_lookforward: number;

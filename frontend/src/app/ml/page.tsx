@@ -101,6 +101,23 @@ export default function MLPage() {
     }
   }
 
+  const [cancellingRebuild, setCancellingRebuild] = useState(false);
+
+  async function handleCancelRebuild() {
+    if (!rebuildJob) return;
+    setCancellingRebuild(true);
+    try {
+      const job = await api.cancelRebuildBacktestsJob(rebuildJob.job_id);
+      setRebuildJob(job);
+      if (rebuildPollRef.current) clearInterval(rebuildPollRef.current);
+      rebuildPollRef.current = null;
+    } catch (e) {
+      setRebuildStartError(e instanceof ApiError ? e.message : "Failed to cancel.");
+    } finally {
+      setCancellingRebuild(false);
+    }
+  }
+
   const rebuildRunning = rebuildJob?.status === "running";
 
   async function handleTrain() {
@@ -178,11 +195,22 @@ export default function MLPage() {
       <section className="card p-4">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Rebuild backtest training data</h2>
-          <button onClick={handleRebuild} disabled={rebuildRunning} className="btn-primary shrink-0">
-            {rebuildRunning
-              ? `Rebuilding ${rebuildJob?.completed ?? 0}/${rebuildJob?.total ?? 20}…`
-              : "Rebuild & retrain"}
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={handleRebuild} disabled={rebuildRunning} className="btn-primary shrink-0">
+              {rebuildRunning
+                ? `Rebuilding ${rebuildJob?.completed ?? 0}/${rebuildJob?.total ?? 20}…`
+                : "Rebuild & retrain"}
+            </button>
+            {rebuildRunning && (
+              <button
+                onClick={handleCancelRebuild}
+                disabled={cancellingRebuild}
+                className="rounded-md border border-rose-300 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-800 dark:text-rose-300 dark:hover:bg-rose-950"
+              >
+                {cancellingRebuild ? "Stopping…" : "Stop"}
+              </button>
+            )}
+          </div>
         </div>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
           Re-runs the rule engine against the full historical archive with today&apos;s live default

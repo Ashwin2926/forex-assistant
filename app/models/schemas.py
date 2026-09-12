@@ -460,7 +460,7 @@ class BacktestRebuildJob(BaseModel):
     run, so this job's completion also means a fresh classifier retrain already happened.
     """
     job_id: str
-    status: Literal["running", "done"]
+    status: Literal["running", "done", "cancelled"]
     created_at: datetime
     finished_at: Optional[datetime] = None
     max_lookforward: int

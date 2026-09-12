@@ -201,6 +201,10 @@ export const api = {
     return request<BacktestRebuildJob | null>(`/backtest/rebuild-all-latest`);
   },
 
+  cancelRebuildBacktestsJob(jobId: string) {
+    return request<BacktestRebuildJob>(`/backtest/rebuild-all/${jobId}/cancel`, { method: "POST" });
+  },
+
   predictML(pair: string, interval: string, profile: string) {
     // pair goes in the query string, not the path — a literal '/' in a path segment
     // breaks Starlette's routing even when percent-encoded.

@@ -126,6 +126,11 @@ def main():
 
     exit_code = 0
     for pair, interval in combos:
+        if job_id:
+            job_doc = db["backtest_rebuild_jobs"].find_one({"job_id": job_id}, {"status": 1})
+            if not job_doc or job_doc.get("status") != "running":
+                print(f"Job {job_id} is no longer running (cancelled) -- stopping before {pair}/{interval}.")
+                break
         print(f"Backtesting {pair}/{interval} (today's live default config)...")
         try:
             directional, hits = run_one(db, pair, interval, args.max_lookforward)

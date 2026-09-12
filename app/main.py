@@ -1376,6 +1376,30 @@ async def get_latest_rebuild_all_backtests_job():
     return BacktestRebuildJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 
+@app.post("/backtest/rebuild-all/{job_id}/cancel")
+async def cancel_rebuild_all_backtests_job(job_id: str):
+    """
+    Same immediate-mark-cancelled approach as POST /rl/train-all/{job_id}/cancel -- see that
+    endpoint's own docstring for why (the runner only checks this doc's status BETWEEN
+    combos, so a stuck run needs the doc itself updated directly, not just a flag it might
+    never get around to reading). Also the fix for a job that's stuck "running" forever
+    because its GitHub Actions run itself died/was cancelled without reaching
+    scripts/rebuild_backtests.py's own "mark done" step -- confirmed live 2026-09-12
+    (job 3f22c139f8fc stuck at 16/20 for hours after its Actions run ended).
+    """
+    doc = await backtest_rebuild_jobs_collection.find_one({"job_id": job_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No backtest rebuild job {job_id}.")
+    if doc["status"] != "running":
+        raise HTTPException(status_code=400, detail=f"Job {job_id} is already {doc['status']}, nothing to cancel.")
+    await backtest_rebuild_jobs_collection.update_one(
+        {"job_id": job_id, "status": "running"},
+        {"$set": {"status": "cancelled", "finished_at": datetime.utcnow()}},
+    )
+    doc = await backtest_rebuild_jobs_collection.find_one({"job_id": job_id})
+    return BacktestRebuildJob(**{k: v for k, v in doc.items() if k != "_id"})
+
+
 @app.get("/debug/egress-check")
 async def debug_egress_check():
     """
