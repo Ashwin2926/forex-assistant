@@ -31,7 +31,7 @@ from app.models.schemas import (
     PPOPolicy, MLTrainResult,
 )
 from app.services.data_fetcher import fetch_and_store, backfill_batch
-from app.services.candle_archive import load_full_candle_history
+from app.services.candle_archive import load_full_candle_history, load_archived_candles
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, apply_rules
 from app.services.backtester import run_backtest, run_consensus_backtest
@@ -160,6 +160,75 @@ async def ingest_backfill(interval: str, start_date: str = "2010-01-01", max_cal
         isinstance(r, dict) and r.get("reached_start_date") for r in results.values()
     )
     return results
+
+
+# Every live read of candles_collection (signal generation, RL inference, GET /candles) caps
+# out at 500 most-recent candles -- see e.g. POST /rl/signal/{interval}'s own cursor.limit(500).
+# 2000 is a deliberate 4x margin over that, not a value derived from any specific indicator's
+# lookback, so a future feature needing more trailing history than 500 still has headroom
+# without this needing to change.
+CANDLES_TRIM_KEEP_DEFAULT = 2000
+
+
+@app.post("/candles/prune-history")
+async def prune_candle_history(confirm: bool = False, keep_latest_n: int = CANDLES_TRIM_KEEP_DEFAULT):
+    """
+    Trims candles_collection down to the keep_latest_n most recent candles per pair/interval,
+    now that scripts/export_candles.py + data/candles/*.csv.gz (see /debug/archive-check,
+    confirmed the deployed backend can actually read them) means older candles aren't lost --
+    load_full_candle_history already merges the archive back in for anything that needs deep
+    history (/backtest*, /consensus/backtest, RL training). Nothing that reads Mongo directly
+    for live use needs more than 500 candles (see CANDLES_TRIM_KEEP_DEFAULT's comment), so this
+    is the other side of "keep it free, split by purpose, not by time" -- Mongo goes back to
+    holding just what live serving needs.
+
+    Only trims a pair/interval whose archive file both exists AND has at least keep_latest_n
+    rows already at or before the cutoff being trimmed to -- i.e. the archive must actually
+    cover everything about to be deleted, not just exist. Anything that doesn't clear that bar
+    is skipped and reported, never silently trimmed.
+
+    confirm: defaults to False, a dry run that returns exactly what WOULD be deleted.
+    """
+    results = {}
+    for pair in settings.pairs_list:
+        for interval in RL_INTERVALS:
+            key = f"{pair} {interval}"
+            total = await candles_collection.count_documents({"pair": pair, "interval": interval})
+            if total <= keep_latest_n:
+                results[key] = {"skipped": "fewer candles than keep_latest_n, nothing to trim", "total": total}
+                continue
+
+            cutoff_doc = await candles_collection.find(
+                {"pair": pair, "interval": interval}, {"timestamp": 1}
+            ).sort("timestamp", -1).skip(keep_latest_n - 1).limit(1).to_list(length=1)
+            cutoff = cutoff_doc[0]["timestamp"]
+
+            archive_df = load_archived_candles(pair, interval)
+            if archive_df.empty or archive_df["timestamp"].max() < cutoff:
+                results[key] = {
+                    "skipped": "archive missing or doesn't cover up to the trim cutoff",
+                    "archive_rows": len(archive_df),
+                }
+                continue
+
+            to_delete = await candles_collection.count_documents(
+                {"pair": pair, "interval": interval, "timestamp": {"$lt": cutoff}}
+            )
+            results[key] = {"total": total, "cutoff": cutoff.isoformat(), "to_delete": to_delete}
+
+    if confirm:
+        for pair in settings.pairs_list:
+            for interval in RL_INTERVALS:
+                key = f"{pair} {interval}"
+                if "to_delete" not in results.get(key, {}):
+                    continue
+                cutoff = datetime.fromisoformat(results[key]["cutoff"])
+                deleted = await candles_collection.delete_many(
+                    {"pair": pair, "interval": interval, "timestamp": {"$lt": cutoff}}
+                )
+                results[key]["deleted"] = deleted.deleted_count
+
+    return {"confirmed": confirm, "keep_latest_n": keep_latest_n, "results": results}
 
 
 # "Good ones only" bar for GENERATING a live signal (create_signal, create_rl_signal) --
