@@ -1,0 +1,24 @@
+name: Debug endpoint call
+
+# One-off manual GET against any auth-protected /debug/* (or other read-only) endpoint,
+# since this deployment isn't reachable by plain curl from outside GitHub Actions/the
+# frontend -- see backfill-history.yml for the same reasoning. Output lands in this run's
+# job log.
+on:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "Path to GET, e.g. /debug/db-stats"
+        required: true
+        default: "/debug/db-stats"
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    env:
+      API_BASE: https://forex-assistant.fastapicloud.dev
+      AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+    steps:
+      - name: GET the path
+        run: |
+          curl -s -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE${{ inputs.path }}" | python3 -m json.tool
