@@ -31,7 +31,7 @@ from pymongo import MongoClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.candle_archive import load_archived_candles
+from app.services.candle_archive import load_full_candle_history_sync
 from app.services.case_memory import RESOLVED_STATUSES
 from app.services.ml_training_data import is_qualifying_backtest_run, QUALIFYING_BACKTEST_PROFILE
 from app.services.ppo_engine import train_ppo_policy
@@ -44,29 +44,6 @@ from app.services.signal_engine import default_config_for
 DEFAULT_PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"]
 RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
-
-def load_full_candle_history_sync(db, pair: str, interval: str) -> pd.DataFrame:
-    """
-    Sync-pymongo counterpart of app/services/candle_archive.load_full_candle_history --
-    merges the committed CSV export (deep history, see scripts/export_candles.py) with
-    whatever's currently live in Mongo (ingestion always covers at least "recent", see
-    data_fetcher.fetch_and_store's gap-fill logic), so PPO trains against the full
-    2020-onward (or 2007-onward for 1day) history instead of only what still fits in
-    Atlas's free-tier storage cap. Overlap resolves in Mongo's favor (it's always at least
-    as fresh as the archive).
-    """
-    mongo_docs = list(
-        db["candles"].find(
-            {"pair": pair, "interval": interval}, {"_id": 0, "pair": 0, "interval": 0}
-        ).sort("timestamp", 1)
-    )
-    archive_df = load_archived_candles(pair, interval)
-    mongo_df = pd.DataFrame(mongo_docs, columns=["timestamp", "open", "high", "low", "close", "volume"])
-
-    combined = pd.concat([archive_df, mongo_df], ignore_index=True)
-    if combined.empty:
-        return combined
-    return combined.drop_duplicates(subset="timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
 
 DEFAULT_STARTING_BALANCE = 50.0
 

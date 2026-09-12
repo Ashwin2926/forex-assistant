@@ -35,11 +35,26 @@ boundaries that currently have little/no live history to fit on.
 old stored docs) so the `/ml` page can show the live/backtest split rather than a bigger
 `train_samples` number being the only sign the fix worked.
 
-**Not yet deployed or verified**: still need to (1) compute the exact qualifying-signal count
-against production data before assuming a specific multiplier, (2) confirm `POST
-/ml/train?force=true` actually picks up the wider sample post-deploy, (3) spot-check
-`frozen_ml_snapshot` on a sparse-live-history pair/interval returns a fitted model now instead
-of `None`. See the plan file (`misty-noodling-wand.md`) for the full verification checklist.
+**Deployed and verified live** (2026-09-12): `POST /ml/train?force=true` confirmed the new
+code path (`train_samples_backtest`/`test_samples_backtest` present) but found **zero
+qualifying backtest signals** -- not a bug. Every existing `backtest_signals` run with real
+directional signals predates the 2026-09-07 EMA 9/21 default (checked `809683ad2f0a` directly:
+`ema_fast=12, ema_slow=26`, the superseded default); the one run using today's exact config
+(today, EUR/USD 1day) had zero directional signals. The strict-equality qualifying filter
+correctly refused to feed the classifier signals from a ruleset that's no longer live.
+
+**Follow-up**: added `scripts/rebuild_backtests.py` + `.github/workflows/rebuild-backtests.yml`
+(`workflow_dispatch`) to actually populate qualifying data -- re-runs the rule-engine backtest
+against the full archive with TODAY's default config for every pair/interval, same
+GitHub-Actions-avoids-the-~125s-gateway-timeout reasoning as `train-rl.yml`/
+`backfill-archive.yml`. Extracted `load_full_candle_history_sync` out of `scripts/train_rl.py`
+into `app/services/candle_archive.py` (sibling to the existing async
+`load_full_candle_history`) so both scripts share one sync loader instead of duplicating it.
+The workflow chains `POST /ml/train?force=true` onto the end of the same run, so one dispatch
+rebuilds the qualifying backtest pool AND retrains the classifier on it -- `force=true` because
+the resolved-signal *count* can be unchanged from the prior run while the underlying rows are
+entirely different (fresh qualifying data replacing all-non-qualifying data), which `/ml/train`'s
+own same-count skip check can't tell apart otherwise. Not yet run.
 
 ## 2026-09-12 (cont., latest x2)
 

@@ -68,3 +68,26 @@ async def load_full_candle_history(pair: str, interval: str) -> list[dict]:
     combined["pair"] = pair
     combined["interval"] = interval
     return combined.to_dict("records")
+
+
+def load_full_candle_history_sync(db, pair: str, interval: str) -> pd.DataFrame:
+    """
+    Sync-pymongo counterpart of load_full_candle_history above, for scripts that run
+    standalone on a GitHub Actions runner instead of inside the FastAPI Cloud process (see
+    scripts/train_rl.py and scripts/rebuild_backtests.py's own docstrings for why -- no event
+    loop to share, and app.core.database/config deliberately not imported there). Same
+    archive-merged-with-Mongo, Mongo-wins-on-overlap semantics; returns a DataFrame directly
+    (not list[dict]) since every sync caller immediately wants a DataFrame anyway.
+    """
+    mongo_docs = list(
+        db["candles"].find(
+            {"pair": pair, "interval": interval}, {"_id": 0, "pair": 0, "interval": 0}
+        ).sort("timestamp", 1)
+    )
+    archive_df = load_archived_candles(pair, interval)
+    mongo_df = pd.DataFrame(mongo_docs, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    combined = pd.concat([archive_df, mongo_df], ignore_index=True)
+    if combined.empty:
+        return combined
+    return combined.drop_duplicates(subset="timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)

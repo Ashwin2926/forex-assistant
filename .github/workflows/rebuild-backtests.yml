@@ -1,0 +1,64 @@
+name: Rebuild intraday backtests (ML training data)
+
+# Regenerates rule-engine backtest signals against the full historical archive using TODAY's
+# live default RuleConfig (signal_engine.PROFILE_DEFAULTS["intraday"]) -- see
+# scripts/rebuild_backtests.py's own docstring for why this has to run here instead of via
+# POST /backtest per combo: a deep-archive backtest on 5min/15min replays hundreds of
+# thousands of candles, and FastAPI Cloud's ~125s gateway timeout has already caused
+# documented failures on similarly slow endpoints. No per-request timeout here at all.
+#
+# Also the actual fix for app/services/ml_training_data.py's qualifying-backtest-signal gate
+# having nothing to draw on: checked live on 2026-09-12, every existing backtest_signals run
+# with real directional signals predates the 2026-09-07 EMA 9/21 default and so doesn't
+# qualify. Run this manually now, and again any time PROFILE_DEFAULTS["intraday"] changes --
+# it's dispatch-only (not scheduled), since the default config changes rarely, not daily.
+on:
+  workflow_dispatch:
+    inputs:
+      pair:
+        description: "Single pair, e.g. EUR/USD. Leave blank (with interval) to backtest every pair x interval."
+        required: false
+      interval:
+        description: "Single interval, e.g. 15min. Leave blank (with pair) to backtest every pair x interval."
+        required: false
+      max_lookforward:
+        description: "Max candles to wait for target/stop before calling a signal expired."
+        required: false
+        default: "20"
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+      FOREX_PAIRS: ${{ secrets.FOREX_PAIRS }}
+      # Same API_BASE/AUTOMATION_TOKEN keep-fresh.yml already uses for its own "Retrain ML
+      # model" step (X-Service-Token auth, see app/core/auth.py) -- reused here so the new
+      # backtest_signals this job just wrote get picked up in the same run, rather than
+      # waiting for keep-fresh.yml's own cron cycle to notice them.
+      API_BASE: https://forex-assistant.fastapicloud.dev
+      AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Rebuild backtests
+        env:
+          PAIR: ${{ inputs.pair }}
+          INTERVAL: ${{ inputs.interval }}
+          MAX_LOOKFORWARD: ${{ inputs.max_lookforward || '20' }}
+        run: |
+          args=(--max-lookforward "$MAX_LOOKFORWARD")
+          if [ -n "$PAIR" ] && [ -n "$INTERVAL" ]; then args+=(--pair "$PAIR" --interval "$INTERVAL"); fi
+          python scripts/rebuild_backtests.py "${args[@]}"
+      # force=true because the resolved-signal COUNT can be unchanged from the last run while
+      # the underlying rows are entirely different (fresh qualifying backtest signals
+      # replacing what were previously all non-qualifying) -- see /ml/train's own docstring
+      # for why it otherwise skips a same-count refit.
+      - name: Retrain ML model
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train?force=true"
