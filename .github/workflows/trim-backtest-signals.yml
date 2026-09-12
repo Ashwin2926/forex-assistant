@@ -1,0 +1,41 @@
+name: Emergency - trim oversized backtest_signals runs
+
+# Frees Atlas storage directly via pymongo -- the FastAPI Cloud app itself cannot start while
+# the cluster is over its space quota (init_indexes' create_index calls are writes, and writes
+# are blocked cluster-wide once over quota), so this can't go through the API. See
+# scripts/trim_backtest_signals.py's own docstring for why POST /backtest/prune-history's
+# existing "keep the 50 most recent runs" policy doesn't help here (today's oversized rebuild
+# runs ARE the most recent -- that policy would keep exactly the bloat).
+on:
+  workflow_dispatch:
+    inputs:
+      keep_per_run:
+        description: "Max backtest_signals docs to retain per run_id (random sample kept)."
+        required: false
+        default: "1000"
+      confirm:
+        description: "Type 'true' to actually delete. Anything else (or blank) is a dry run that only reports what would be deleted."
+        required: false
+        default: "false"
+
+jobs:
+  trim:
+    runs-on: ubuntu-latest
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install pymongo
+      - name: Trim
+        env:
+          KEEP_PER_RUN: ${{ inputs.keep_per_run || '1000' }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          args=(--keep-per-run "$KEEP_PER_RUN")
+          if [ "$CONFIRM" = "true" ]; then args+=(--confirm); fi
+          python scripts/trim_backtest_signals.py "${args[@]}"
