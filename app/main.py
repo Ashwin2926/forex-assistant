@@ -29,7 +29,7 @@ from app.models.schemas import (
     LoginRequest, RuleConfig, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
     PPOPolicy, MLTrainResult,
 )
-from app.services.data_fetcher import fetch_and_store
+from app.services.data_fetcher import fetch_and_store, backfill_batch
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, apply_rules
 from app.services.backtester import run_backtest, run_consensus_backtest
@@ -132,6 +132,28 @@ async def ingest(interval: str, output_size: int = 300):
             results[pair] = f"{count} candles stored"
         except Exception as e:
             results[pair] = f"error: {e}"
+    return results
+
+
+@app.post("/ingest/backfill/{interval}")
+async def ingest_backfill(interval: str, start_date: str = "2010-01-01", max_calls_per_pair: int = 5):
+    """
+    Deep historical backfill for ML/RL training data (candles_collection), separate from
+    /ingest's live-tail pulls. One call only advances each pair by up to max_calls_per_pair
+    pages toward start_date -- a full 2010-> now backfill at finer intervals is hundreds of
+    calls per pair, too long for one synchronous HTTP request. Resumable with no extra state:
+    progress is just "the earliest candle already stored" (see backfill_batch), so call this
+    repeatedly (.github/workflows/backfill-history.yml does) until every pair's "done" is true.
+    """
+    results = {}
+    for i, pair in enumerate(settings.pairs_list):
+        if i > 0:
+            await asyncio.sleep(2)
+        try:
+            results[pair] = await backfill_batch(pair, interval, start_date, max_calls=max_calls_per_pair)
+        except Exception as e:
+            results[pair] = {"error": str(e)}
+    results["all_done"] = all(isinstance(r, dict) and r.get("done") for r in results.values())
     return results
 
 

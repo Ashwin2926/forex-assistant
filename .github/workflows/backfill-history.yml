@@ -1,0 +1,63 @@
+name: Backfill historical candles
+
+# One-off / on-demand deep history pull for ML/RL training data, separate from
+# keep-fresh.yml's live-tail ingest. Twelve Data's per-minute rate limit (not the 800/day
+# credit cap -- outputsize doesn't change a call's credit cost) is the real constraint on a
+# 2010-to-now backfill, so POST /ingest/backfill/{interval} does bounded, resumable batches
+# (progress is just "earliest candle already stored per pair/interval" in candles_collection,
+# see data_fetcher.backfill_batch) and this workflow just calls it repeatedly until every
+# pair reports done.
+#
+# Expected batch counts per interval (Twelve Data max 5000 candles/call, 4 pairs, default
+# max_calls_per_pair_per_batch=2): 1day ~1 batch, 4h ~4, 1h ~15, 15min ~59, 5min ~176 --
+# default max_batches=200 comfortably covers even 5min in one run (~4h at this pacing,
+# under the 6h default job timeout). If a run still hits max_batches, just re-trigger this
+# workflow with the same inputs -- nothing is lost, it resumes from the last stored candle.
+#
+# Don't run this at the same time as keep-fresh.yml's ingest steps against the same
+# interval/pairs -- both hit Twelve Data's shared per-minute limit and could 429 each other.
+on:
+  workflow_dispatch:
+    inputs:
+      interval:
+        description: "Candle interval to backfill: 5min, 15min, 1h, 4h, or 1day."
+        required: true
+      start_date:
+        description: "How far back to backfill (YYYY-MM-DD)."
+        required: false
+        default: "2010-01-01"
+      max_calls_per_pair_per_batch:
+        description: "Twelve Data calls per pair per HTTP request -- kept small so each request stays well under any gateway timeout (a prior 60-90s request already triggered a 524, see train-rl.yml's history)."
+        required: false
+        default: "2"
+      max_batches:
+        description: "Safety cap on how many times this job will call the endpoint before giving up (in case of a bug that never reports done)."
+        required: false
+        default: "200"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    env:
+      API_BASE: https://forex-assistant.fastapicloud.dev
+      AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+    steps:
+      - name: Backfill until done or max_batches reached
+        run: |
+          INTERVAL="${{ inputs.interval }}"
+          START_DATE="${{ inputs.start_date }}"
+          MAX_CALLS="${{ inputs.max_calls_per_pair_per_batch }}"
+          MAX_BATCHES="${{ inputs.max_batches }}"
+          for i in $(seq 1 "$MAX_BATCHES"); do
+            echo "=== batch $i (interval=$INTERVAL start_date=$START_DATE) ==="
+            RESPONSE=$(curl -s -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/ingest/backfill/$INTERVAL?start_date=$START_DATE&max_calls_per_pair=$MAX_CALLS")
+            echo "$RESPONSE"
+            ALL_DONE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('all_done', False))" 2>/dev/null || echo "False")
+            if [ "$ALL_DONE" = "True" ]; then
+              echo "All pairs reached $START_DATE for $INTERVAL."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Reached max_batches ($MAX_BATCHES) without every pair finishing -- re-run this workflow with the same inputs to continue; progress is durably resumed from Mongo, nothing is lost."

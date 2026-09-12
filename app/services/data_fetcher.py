@@ -20,10 +20,14 @@ MAX_RETRIES_ON_RATE_LIMIT = 3
 RETRY_BACKOFF_SECONDS = 20
 
 
-async def fetch_candles(pair: str, interval: str, output_size: int = 100) -> list[Candle]:
+async def fetch_candles(
+    pair: str, interval: str, output_size: int = 100, end_date: str | None = None
+) -> list[Candle]:
     """
     Fetch OHLCV candles for a forex pair from Twelve Data.
     interval examples: '1min', '5min', '15min', '1h', '4h', '1day'
+    end_date: optional 'YYYY-MM-DD HH:MM:SS' (or 'YYYY-MM-DD') to page backward through
+    history instead of returning the most recent output_size candles -- see backfill_batch.
     """
     params = {
         "symbol": pair,
@@ -32,6 +36,8 @@ async def fetch_candles(pair: str, interval: str, output_size: int = 100) -> lis
         "apikey": settings.twelve_data_api_key,
         "timezone": "UTC",
     }
+    if end_date is not None:
+        params["end_date"] = end_date
 
     for attempt in range(MAX_RETRIES_ON_RATE_LIMIT + 1):
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -129,3 +135,65 @@ async def fetch_and_store(pair: str, interval: str, output_size: int = 100) -> i
 
     candles = await fetch_candles(pair, interval, output_size)
     return await store_candles(candles)
+
+
+# Twelve Data's binding constraint for a deep backfill is the per-minute rate limit, not
+# the 800/day credit cap -- outputsize doesn't change a call's credit cost (see
+# MAX_AUTO_BACKFILL_CANDLES's comment above), so this just paces calls comfortably under
+# that per-minute ceiling rather than trying to find its exact edge.
+BACKFILL_CALL_DELAY_SECONDS = 8
+
+# Twelve Data's documented max outputsize per call, even on paid plans.
+BACKFILL_PAGE_SIZE = 5000
+
+
+async def backfill_batch(pair: str, interval: str, start_date: str, max_calls: int = 5) -> dict:
+    """
+    Walks candle history backward from whatever's already stored for this pair/interval (or
+    from "now" if nothing is stored yet) toward start_date, one Twelve Data call per page,
+    stopping after max_calls so a single call stays short enough for one HTTP request/gateway
+    timeout -- a full 2010-to-now backfill at 5min is 300+ calls per pair, far more than should
+    ever run inside one synchronous request. Progress is just "the earliest timestamp already
+    in candles_collection for this pair/interval", so calling this repeatedly (see
+    POST /ingest/backfill/{interval} and .github/workflows/backfill-history.yml) resumes
+    correctly with no separate state to track, and is safe to re-run after a failed/timed-out
+    call since every page is stored before the next one is requested.
+    """
+    earliest = await candles_collection.find_one(
+        {"pair": pair, "interval": interval}, sort=[("timestamp", 1)]
+    )
+    cursor = earliest["timestamp"] if earliest else None
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+
+    if cursor is not None and cursor <= start:
+        return {"done": True, "calls_made": 0, "candles_stored": 0, "oldest": cursor.isoformat()}
+
+    calls_made = 0
+    candles_stored = 0
+    done = False
+    while calls_made < max_calls:
+        end_date_param = cursor.strftime("%Y-%m-%d %H:%M:%S") if cursor else None
+        candles = await fetch_candles(pair, interval, output_size=BACKFILL_PAGE_SIZE, end_date=end_date_param)
+        calls_made += 1
+        if not candles:
+            done = True
+            break
+        candles_stored += await store_candles(candles)
+        oldest_in_page = min(c.timestamp for c in candles)
+        if cursor is not None and oldest_in_page >= cursor:
+            # Same page as last time -- Twelve Data has nothing older to give us.
+            done = True
+            break
+        cursor = oldest_in_page
+        if cursor <= start:
+            done = True
+            break
+        if calls_made < max_calls:
+            await asyncio.sleep(BACKFILL_CALL_DELAY_SECONDS)
+
+    return {
+        "done": done,
+        "calls_made": calls_made,
+        "candles_stored": candles_stored,
+        "oldest": cursor.isoformat() if cursor else None,
+    }
