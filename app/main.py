@@ -31,6 +31,7 @@ from app.models.schemas import (
     PPOPolicy, MLTrainResult,
 )
 from app.services.data_fetcher import fetch_and_store, backfill_batch
+from app.services.candle_archive import load_full_candle_history
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, apply_rules
 from app.services.backtester import run_backtest, run_consensus_backtest
@@ -475,8 +476,7 @@ async def backtest_consensus(interval: str, pair: str, train_frac: float = 0.7, 
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
     config = default_config_for("intraday", pair)
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
-    docs = await cursor.to_list(length=None)
+    docs = await load_full_candle_history(pair, interval)
     if not docs:
         raise HTTPException(
             status_code=400,
@@ -544,8 +544,7 @@ async def backtest(
     For comparing several configs against the same data in one call, use /backtest/sweep instead.
     """
     config = config or default_config_for(profile, pair)
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
-    docs = await cursor.to_list(length=None)
+    docs = await load_full_candle_history(pair, interval)
 
     min_needed = config.ema_slow + max_lookforward + 1
     if len(docs) < min_needed:
@@ -602,8 +601,7 @@ async def backtest_sweep(
     if not configs:
         raise HTTPException(status_code=400, detail="Provide at least one config to sweep.")
 
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
-    docs = await cursor.to_list(length=None)
+    docs = await load_full_candle_history(pair, interval)
     if not docs:
         raise HTTPException(
             status_code=400,
@@ -684,8 +682,7 @@ async def backtest_optimize(
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
-    docs = await cursor.to_list(length=None)
+    docs = await load_full_candle_history(pair, interval)
     if not docs:
         raise HTTPException(
             status_code=400,
@@ -1078,8 +1075,7 @@ async def _run_rl_training(
         raise ValueError("starting_balance must be positive.")
 
     config = default_config_for(rl_config_profile(interval), pair)
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", 1)
-    docs = await cursor.to_list(length=None)
+    docs = await load_full_candle_history(pair, interval)
     if not docs:
         raise ValueError(f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.")
 

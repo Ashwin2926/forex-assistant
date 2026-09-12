@@ -31,6 +31,7 @@ from pymongo import MongoClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.services.candle_archive import load_archived_candles
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import rl_config_profile, RL_FEATURE_NAMES
 from app.services.signal_engine import default_config_for
@@ -40,6 +41,30 @@ from app.services.signal_engine import default_config_for
 # importing Settings, see module docstring for why.
 DEFAULT_PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"]
 RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
+
+
+def load_full_candle_history_sync(db, pair: str, interval: str) -> pd.DataFrame:
+    """
+    Sync-pymongo counterpart of app/services/candle_archive.load_full_candle_history --
+    merges the committed CSV export (deep history, see scripts/export_candles.py) with
+    whatever's currently live in Mongo (ingestion always covers at least "recent", see
+    data_fetcher.fetch_and_store's gap-fill logic), so PPO trains against the full
+    2020-onward (or 2007-onward for 1day) history instead of only what still fits in
+    Atlas's free-tier storage cap. Overlap resolves in Mongo's favor (it's always at least
+    as fresh as the archive).
+    """
+    mongo_docs = list(
+        db["candles"].find(
+            {"pair": pair, "interval": interval}, {"_id": 0, "pair": 0, "interval": 0}
+        ).sort("timestamp", 1)
+    )
+    archive_df = load_archived_candles(pair, interval)
+    mongo_df = pd.DataFrame(mongo_docs, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    combined = pd.concat([archive_df, mongo_df], ignore_index=True)
+    if combined.empty:
+        return combined
+    return combined.drop_duplicates(subset="timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
 
 DEFAULT_STARTING_BALANCE = 50.0
 
@@ -76,8 +101,8 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
     default. Lets a candidate value be swept via this (reliable, GitHub-Actions-backed) path
     instead of the direct endpoint, which has been seen to 524 on a slow combo."""
     config = default_config_for(rl_config_profile(interval), pair)
-    docs = list(db["candles"].find({"pair": pair, "interval": interval}).sort("timestamp", 1))
-    if not docs:
+    df = load_full_candle_history_sync(db, pair, interval)
+    if df.empty:
         raise ValueError(f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.")
 
     ml_reference_signals = list(db["signals"].find(
@@ -86,7 +111,6 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
 
     warm_start_policy_id, warm_start_model_bytes = find_warm_start_policy(db, pair, interval)
 
-    df = pd.DataFrame(docs)
     policy, eval_run, trade_signals, _poc_diagnostics = train_ppo_policy(
         df, pair, interval, config, total_timesteps=total_timesteps, train_frac=train_frac,
         max_lookforward=max_lookforward, starting_balance=starting_balance,

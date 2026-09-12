@@ -1,0 +1,44 @@
+name: Export candles to repo archive
+
+# Dumps candles_collection to compressed CSV files under data/candles/ and commits them back
+# to the branch -- see scripts/export_candles.py's docstring for why (Atlas free-tier storage
+# cap, ML/RL training and the backend's deep-history backtest endpoints both needing access
+# to history that no longer has to all live in Mongo). Same "do the DB work on a GitHub
+# Actions runner" pattern as train-rl.yml.
+#
+# Run this after a backfill-history.yml run adds meaningful new history, or periodically to
+# keep the archive current with what "Sync now" has caught Mongo up to -- it's not on an
+# automatic schedule because it's only worth re-running when there's materially new history
+# to capture, not on every candle.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+      FOREX_PAIRS: ${{ secrets.FOREX_PAIRS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Export
+        run: python scripts/export_candles.py
+      - name: Commit archive
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/candles/
+          if git diff --cached --quiet; then
+            echo "No changes to the archive."
+          else
+            git commit -m "Update candle archive ($(date -u +%Y-%m-%d))"
+            git push
+          fi
