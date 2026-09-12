@@ -133,6 +133,8 @@ def train_hit_classifier(signals: list[dict], train_frac: float = 0.7) -> MLTrai
         created_at=datetime.utcnow(),
         train_samples=len(train_signals),
         test_samples=len(test_signals),
+        train_samples_backtest=sum(1 for s in train_signals if s.get("source") == "backtest"),
+        test_samples_backtest=sum(1 for s in test_signals if s.get("source") == "backtest"),
         train_accuracy=round(float(train_accuracy), 4),
         test_accuracy=round(float(test_accuracy), 4),
         test_precision=round(float(test_precision), 4),

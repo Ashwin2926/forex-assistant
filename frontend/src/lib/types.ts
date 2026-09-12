@@ -145,6 +145,11 @@ export interface MLTrainResult {
   created_at: string;
   train_samples: number;
   test_samples: number;
+  // How many of train_samples/test_samples came from a qualifying backtest signal rather than
+  // a live one -- live counts are train_samples - train_samples_backtest. Optional since older
+  // stored runs predate this field.
+  train_samples_backtest?: number;
+  test_samples_backtest?: number;
   train_accuracy: number;
   test_accuracy: number;
   test_precision: number | null;

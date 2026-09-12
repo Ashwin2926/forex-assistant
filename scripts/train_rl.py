@@ -32,6 +32,8 @@ from pymongo import MongoClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.candle_archive import load_archived_candles
+from app.services.case_memory import RESOLVED_STATUSES
+from app.services.ml_training_data import is_qualifying_backtest_run, QUALIFYING_BACKTEST_PROFILE
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import rl_config_profile, RL_FEATURE_NAMES
 from app.services.signal_engine import default_config_for
@@ -89,6 +91,25 @@ def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, by
     return prev["policy_id"], prev["model_bytes"]
 
 
+def get_ml_reference_signals_sync(db) -> list[dict]:
+    """Mirrors app/services/ml_training_data.py's async get_ml_reference_signals exactly (same
+    live-signals-union-qualifying-backtest-signals shape) but against a sync pymongo db --
+    delegates to is_qualifying_backtest_run for the actual qualifying logic so a future
+    RuleConfig/PROFILE_DEFAULTS change can't silently diverge between the two paths."""
+    live_signals = list(db["signals"].find({"source": "live", "status": {"$in": list(RESOLVED_STATUSES)}}))
+
+    candidate_runs = list(db["backtest_runs"].find({"profile": QUALIFYING_BACKTEST_PROFILE}))
+    qualifying_run_ids = [r["run_id"] for r in candidate_runs if is_qualifying_backtest_run(r)]
+
+    backtest_signals = list(db["backtest_signals"].find({
+        "run_id": {"$in": qualifying_run_ids},
+        "status": {"$in": list(RESOLVED_STATUSES)},
+        "size_tier": None,
+    })) if qualifying_run_ids else []
+
+    return live_signals + backtest_signals
+
+
 def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: float,
             max_lookforward: int, starting_balance: float, random_seed: int | None,
             target_atr_mult: float | None = None, stop_atr_mult: float | None = None):
@@ -105,9 +126,7 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
     if df.empty:
         raise ValueError(f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.")
 
-    ml_reference_signals = list(db["signals"].find(
-        {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
-    ))
+    ml_reference_signals = get_ml_reference_signals_sync(db)
 
     warm_start_policy_id, warm_start_model_bytes = find_warm_start_policy(db, pair, interval)
 

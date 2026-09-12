@@ -108,10 +108,10 @@ export default function MLPage() {
         <h1 className="text-xl font-semibold tracking-tight">ML (v1)</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
           A supervised classifier (XGBoost, <strong>not</strong> reinforcement
-          learning) trained on every resolved live signal to predict hit vs. not-hit. Trains
-          automatically every cron cycle on whatever has resolved so far — with the current
-          sample size, treat every prediction as a rough, evolving estimate, not a validated
-          edge. Doesn&apos;t affect the regular signal feed or consensus in any way; purely
+          learning) trained on every resolved live signal plus every qualifying historical
+          backtest signal to predict hit vs. not-hit. Trains automatically every cron cycle on
+          whatever has resolved so far — treat every prediction as a rough, evolving estimate,
+          not a validated edge. Doesn&apos;t affect the regular signal feed or consensus in any way; purely
           advisory.
         </p>
       </section>
@@ -131,9 +131,13 @@ export default function MLPage() {
         {trainResult && (
           <div className="mt-4 flex flex-col gap-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-2">
-              <MLStatCard label="Train" accuracy={trainResult.train_accuracy} samples={trainResult.train_samples} accent="zinc" />
               <MLStatCard
-                label="Test (out-of-sample)" accuracy={trainResult.test_accuracy} samples={trainResult.test_samples} accent="emerald"
+                label="Train" accuracy={trainResult.train_accuracy} samples={trainResult.train_samples}
+                backtestSamples={trainResult.train_samples_backtest} accent="zinc"
+              />
+              <MLStatCard
+                label="Test (out-of-sample)" accuracy={trainResult.test_accuracy} samples={trainResult.test_samples}
+                backtestSamples={trainResult.test_samples_backtest} accent="emerald"
                 precision={trainResult.test_precision} recall={trainResult.test_recall}
               />
             </div>
@@ -340,9 +344,9 @@ export default function MLPage() {
 }
 
 function MLStatCard({
-  label, accuracy, samples, accent, precision, recall,
+  label, accuracy, samples, backtestSamples, accent, precision, recall,
 }: {
-  label: string; accuracy: number; samples: number; accent: "zinc" | "emerald";
+  label: string; accuracy: number; samples: number; backtestSamples?: number; accent: "zinc" | "emerald";
   precision?: number | null; recall?: number | null;
 }) {
   const border = accent === "emerald" ? "border-emerald-200 dark:border-emerald-900" : "border-zinc-200 dark:border-zinc-800";
@@ -353,6 +357,7 @@ function MLStatCard({
       <p className="mt-1 text-2xl font-semibold">{(accuracy * 100).toFixed(1)}%</p>
       <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
         {samples} samples
+        {!!backtestSamples && ` (${backtestSamples} backtest)`}
         {precision != null && recall != null && ` · precision ${(precision * 100).toFixed(1)}% · recall ${(recall * 100).toFixed(1)}%`}
       </p>
     </div>

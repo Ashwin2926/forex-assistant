@@ -4,6 +4,43 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-12 (cont., latest x3)
+
+**ML classifier widened from live-only signals to live + qualifying historical backtest
+signals -- closes a real data gap, not yet deployed/verified live.**
+
+`app/services/ml_model.py`'s XGBoost hit/miss classifier, and every endpoint that depends on
+it (the `create_signal` ML quality gate, `POST /ml/predict`, `POST /ml/train`'s own
+diagnostic report, RL training's `ml_reference_signals`/`frozen_ml_snapshot`), was trained on
+live resolved signals only -- just 662 total (confirmed via `GET /signals/accuracy`) despite
+`backtest_signals_collection` already holding 13,054 resolved documents from replaying the
+full historical Parquet archive through `/backtest`/`/backtest/sweep`/`/backtest/optimize`
+and RL training.
+
+Added `app/services/ml_training_data.py` (`get_ml_reference_signals` + sync mirror in
+`scripts/train_rl.py`) to union live signals with **qualifying** backtest signals only --
+`backtest_signals_collection` mixes genuine rule-engine signals with RL/PPO trade-log noise
+(`confidence=0.0, reasons=[]`, distinguished by `size_tier` being set) and signals from many
+swept `RuleConfig`s that aren't what's live today. "Qualifying" = the signal's `run_id` links
+to a `backtest_runs` doc with `profile="intraday"`, `rule_config` byte-identical to today's
+`default_config_for("intraday")`, AND matching top-level `target_atr_mult`/`stop_atr_mult`
+(these are separate query-param overrides `run_backtest` accepts independently of the
+`RuleConfig` body -- checking only `rule_config` would miss a run that used the default
+config but swept target/stop distance separately). Confirmed safe for RL:
+`rl_engine.frozen_ml_snapshot` filters purely by `timestamp < split_timestamp`, no assumption
+about `source`, so older backtest-sourced signals are exactly the fix for early split
+boundaries that currently have little/no live history to fit on.
+
+`MLTrainResult` gained `train_samples_backtest`/`test_samples_backtest` (defaulted to 0 for
+old stored docs) so the `/ml` page can show the live/backtest split rather than a bigger
+`train_samples` number being the only sign the fix worked.
+
+**Not yet deployed or verified**: still need to (1) compute the exact qualifying-signal count
+against production data before assuming a specific multiplier, (2) confirm `POST
+/ml/train?force=true` actually picks up the wider sample post-deploy, (3) spot-check
+`frozen_ml_snapshot` on a sparse-live-history pair/interval returns a fitted model now instead
+of `None`. See the plan file (`misty-noodling-wand.md`) for the full verification checklist.
+
 ## 2026-09-12 (cont., latest x2)
 
 **New Mongo-free deep-backfill pipeline: writes straight into the Parquet archive.**
