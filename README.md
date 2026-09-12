@@ -286,6 +286,42 @@ disagrees, check whether there's enough data before concluding an effect isn't r
 `session_filter_enabled`/`session_start_hour_utc`/`session_end_hour_utc` are just more
 `RuleConfig` fields — override them per-request the same way as any other threshold.
 
+## Historical candle archive
+
+Deep candle history (back to 2020 intraday, 2007-2008 daily) lives in
+`data/candles/*.parquet` — 20 files (4 pairs × 5 intervals), brotli-compressed,
+**committed to git**, not just in MongoDB. This exists because `candles_collection` is
+deliberately kept trimmed to a rolling recent window (Atlas's free M0 tier has a hard
+512MB cap), so anything that needs full history — `/backtest`, `/backtest/sweep`,
+`/backtest/optimize`, `/consensus/backtest`, RL training — reads through
+`app/services/candle_archive.py`'s `load_full_candle_history()`, which merges the
+archive file with whatever Mongo currently holds (Mongo wins on overlap, since it's the
+freshest). `load_archived_candles()` reads just the archive file directly when you don't
+need Mongo's live tail.
+
+Parquet was chosen over the original gzip-CSV after measuring both on this project's own
+EUR/USD 5min file (502k rows): brotli-parquet is ~27-29% *larger* on disk (~5.2MB vs
+4.1MB) but reads ~15-20x *faster* in pandas (0.024s vs 0.50s) — worth it since slow
+archive reads had already caused live gateway-timeout incidents on FastAPI Cloud.
+
+**Keeping the archive in sync:**
+- `scripts/export_candles.py` (run via `.github/workflows/export-candles.yml`) reads
+  each existing archive file, merges in whatever `candles_collection` currently has,
+  dedupes on `timestamp`, and writes the union back — coverage only ever grows, even if
+  Mongo has since been trimmed. **Never rewrite this to overwrite instead of merge** — a
+  version that did lost 16 of the 20 files' full history in one run before being caught
+  and restored from git history (see `PROGRESS.md`, 2026-09-12).
+- `scripts/backfill_to_archive.py` (run via `.github/workflows/backfill-archive.yml`,
+  `workflow_dispatch` with `interval`/`start_date`/`max_calls_per_pair` inputs) extends
+  the archive's depth directly from Twelve Data, bypassing Mongo entirely — one
+  continuous process per job (no per-request gateway timeout to fight), committing
+  progress every 10 calls so a timeout or cancellation doesn't lose a whole pair's work.
+  This is the pipeline to use for pushing history further back; it needs a
+  `TWELVE_DATA_API_KEY` GitHub Actions secret to run.
+- `.github/workflows/backfill-history.yml` (Mongo-routed, older) still exists and still
+  backs live ingestion / the dashboard's "Sync now" button — a separate, shallower
+  concern from the archive above.
+
 ## Project structure
 
 This has grown well past the rule-engine-only description above — see **`ARCHITECTURE.md`**
@@ -314,12 +350,17 @@ app/
     deriv_client.py      # Deriv WebSocket session + virtual-account safety gate
     paper_trading.py     # Signal -> Deriv Multipliers contract execution + sync
   main.py            # FastAPI app + every endpoint
-scripts/              # one-off maintenance scripts (dedupe/cleanup live signals) — run manually, not on any schedule
+data/candles/*.parquet  # git-committed deep candle archive, see "Historical candle archive" above
+scripts/              # one-off maintenance scripts (dedupe/cleanup live signals, candle archive
+                       # export/backfill — see "Historical candle archive" above) — run manually
+                       # or via a workflow, not on any in-process schedule
 .github/workflows/
   keep-fresh.yml       # GitHub Actions cron -- the actual production heartbeat (ingest/generate/
                        # consensus/RL/score/ML-retrain); see ARCHITECTURE.md for the current schedule.
                        # NOT an in-process scheduler -- an earlier APScheduler approach silently died
                        # whenever the FastAPI Cloud instance scaled to zero between requests.
+  export-candles.yml   # merges candles_collection into data/candles/*.parquet, run manually
+  backfill-archive.yml # extends archive depth directly from Twelve Data (Mongo-free), workflow_dispatch
 frontend/            # Next.js dashboard (signal feed + live accuracy, chart, backtesting, RL page, ML page, paper trading)
 ```
 

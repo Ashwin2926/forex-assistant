@@ -4,6 +4,39 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-12 (cont., latest x2)
+
+**New Mongo-free deep-backfill pipeline: writes straight into the Parquet archive.**
+
+Every prior deep backfill this session went through `POST /ingest/backfill/{interval}`
+(Mongo-routed), which caused two recurring problems: `candles_collection` growing past
+Atlas's M0 512MB cap (needing repeated manual trims), and every individual Twelve-Data
+page fetch being its own HTTP request to FastAPI Cloud subject to the gateway's ~125s
+timeout -- runs kept silently continuing server-side past what the client saw, needing
+retries just to find out whether they'd actually finished (see gotcha #3 in CLAUDE.md).
+This is exactly what left the `5min` archive short of its January 2020 target
+(stopped ~2020-03-18 instead) after a run got stuck and was cancelled.
+
+Added `scripts/backfill_to_archive.py` + `.github/workflows/backfill-archive.yml`
+instead: one continuous Python process for the whole GitHub Actions job (up to 6h,
+`timeout-minutes: 350`), talking to Twelve Data directly and writing straight into
+`data/candles/*.parquet` using the same read-merge-dedupe-write pattern
+`export_candles.py` uses (coverage only ever grows). Commits/pushes every 10 calls
+within a pair's loop, not just at the end, so a job timeout or cancellation partway
+through still keeps most progress. Deliberately never touches `candles_collection` --
+keeping Mongo's rolling recent window fresh for live signals stays `keep-fresh.yml`'s
+job, a separate concern. Logic-tested locally (mocked `fetch_page` against a temp
+directory, verified pagination/merge/dedupe/stop-condition) before committing.
+
+`backfill-history.yml` (Mongo-routed) still exists and still backs live ingestion /
+"Sync now" for recent candles -- the new workflow is only for extending the archive's
+deep history.
+
+**Blocked**: the workflow needs a `TWELVE_DATA_API_KEY` GitHub Actions secret that
+doesn't exist yet (only Claude Code sessions can't add repo secrets -- this needs the
+repo owner). Once added: run `backfill-archive.yml` with `interval=5min`,
+`start_date=2020-01-01` to close the remaining ~77-day gap in the `5min` archive.
+
 ## 2026-09-12 (cont., latest)
 
 **Real data-loss bug: export_candles.py overwriting the archive instead of merging with it
