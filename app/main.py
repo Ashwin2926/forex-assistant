@@ -1480,6 +1480,77 @@ async def reset_rl(confirm: bool = False):
     return result
 
 
+@app.post("/rl/prune-history")
+async def prune_rl_history(confirm: bool = False, keep_latest_n: int = 1):
+    """
+    Reclaims Atlas storage from RL training history WITHOUT losing any feature this app
+    actually uses -- unlike /rl/reset, which wipes everything RL-related, this only removes
+    the parts nothing ever reads again:
+
+      - ppo_policies_collection: every policy doc except the keep_latest_n most recent per
+        pair/interval gets its model_bytes field unset (the doc and its metadata survive).
+        Every read of model_bytes in this file (choose_action_ppo, warm-start lookup,
+        POST /rl/signal/{interval}) queries sort=[("created_at", -1)] for a single combo --
+        an older policy's weights are never loaded again once a newer one exists. GET
+        /rl/policies (the learning-progress trend view) already excludes model_bytes from
+        its projection, so stripping it there is invisible to that feature.
+      - backtest_signals_collection: the individual test-slice trade log for every RL eval
+        run (backtest_runs profile="rl_ppo") except the ones still linked to a kept policy
+        (their eval_run_id) gets deleted outright. The trend view only reads
+        backtest_runs_collection (hit_rate_pct/expectancy_pct summaries, ~1MB total) for
+        this, never the per-trade detail -- only a drill-down into one specific historical
+        run's trade list would miss it, and only for a run old enough to have been pruned.
+
+    Non-RL backtest_signals (rule-based /backtest and /backtest/optimize runs, profile !=
+    "rl_ppo") are untouched -- same scope /rl/reset already uses.
+
+    confirm: defaults to False, a dry run that returns exactly what WOULD change without
+    changing anything.
+    """
+    stripped_policy_ids = []
+    kept_eval_run_ids = set()
+    prunable_eval_run_ids = set()
+    policies_size_before = 0
+
+    for pair in settings.pairs_list:
+        for interval in RL_INTERVALS:
+            docs = await ppo_policies_collection.find(
+                {"pair": pair, "interval": interval}, {"model_bytes": 1, "eval_run_id": 1}
+            ).sort("created_at", -1).to_list(length=None)
+            for d in docs[:keep_latest_n]:
+                if d.get("eval_run_id"):
+                    kept_eval_run_ids.add(d["eval_run_id"])
+            for d in docs[keep_latest_n:]:
+                if d.get("model_bytes") is not None:
+                    stripped_policy_ids.append(d["_id"])
+                    policies_size_before += len(d["model_bytes"])
+                if d.get("eval_run_id"):
+                    prunable_eval_run_ids.add(d["eval_run_id"])
+
+    prunable_eval_run_ids -= kept_eval_run_ids
+    signals_count = await backtest_signals_collection.count_documents(
+        {"run_id": {"$in": list(prunable_eval_run_ids)}}
+    ) if prunable_eval_run_ids else 0
+
+    result = {
+        "confirmed": confirm,
+        "ppo_policies_stripped": len(stripped_policy_ids),
+        "ppo_policies_model_bytes_freed_mb": round(policies_size_before / 1024 / 1024, 2),
+        "backtest_signals_to_delete": signals_count,
+        "eval_runs_affected": len(prunable_eval_run_ids),
+    }
+    if not confirm:
+        return result
+
+    if stripped_policy_ids:
+        await ppo_policies_collection.update_many(
+            {"_id": {"$in": stripped_policy_ids}}, {"$unset": {"model_bytes": ""}}
+        )
+    if prunable_eval_run_ids:
+        await backtest_signals_collection.delete_many({"run_id": {"$in": list(prunable_eval_run_ids)}})
+    return result
+
+
 @app.post("/rl/signal/{interval}")
 async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_STARTING_BALANCE):
     """

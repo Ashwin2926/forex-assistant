@@ -8,9 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       path:
-        description: "Path to GET, e.g. /debug/db-stats"
+        description: "Path (with query string) to call, e.g. /debug/db-stats or /rl/prune-history?confirm=false"
         required: true
         default: "/debug/db-stats"
+      method:
+        description: "HTTP method"
+        required: false
+        default: "GET"
 
 jobs:
   call:
@@ -19,6 +23,6 @@ jobs:
       API_BASE: https://forex-assistant.fastapicloud.dev
       AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
     steps:
-      - name: GET the path
+      - name: Call the path
         run: |
-          curl -s -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE${{ inputs.path }}" | python3 -m json.tool
+          curl -s -X "${{ inputs.method }}" -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE${{ inputs.path }}" | python3 -m json.tool
