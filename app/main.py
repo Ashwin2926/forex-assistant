@@ -52,7 +52,7 @@ from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import (
     score_pending_signals, score_pending_consensus_signals, score_pending_rl_signals,
-    resolve_rl_signal_real_outcome, LIVE_MAX_LOOKFORWARD_BY_INTERVAL,
+    resolve_rl_signal_real_outcome, LIVE_MAX_LOOKFORWARD_BY_INTERVAL, counterfactual_target_stop,
 )
 
 settings = get_settings()
@@ -2239,6 +2239,16 @@ STRONG_WIN_MIN_HIT_RATE_PCT = 40.0
 HIGH_SUPERSEDE_FRACTION = 0.4
 HIGH_EXPIRED_FRACTION = 0.8
 LIVE_VS_TRAINED_GAP_PCT = 15.0  # same margin DEGRADATION_MARGIN_PCT below uses for auto-retrain
+# How much lower a counterfactual target/stop's expired_fraction_pct needs to be than the
+# current config's own (replayed against the exact same signals) before it's worth surfacing
+# as a specific suggestion rather than just noting the raw expired rate.
+COUNTERFACTUAL_MEANINGFUL_IMPROVEMENT_PCT = 15.0
+# Scale factors tried against the current (target_atr_mult, stop_atr_mult), keeping their
+# ratio fixed -- tighter, not wider, since a high expired fraction means price isn't reaching
+# either band within the window, and RL_ATR_MULT_PAIR_OVERRIDES' own GBP/USD 15min tuning
+# note found the same "tighten, same ratio" move already works when this has been done by
+# hand. 0.75/0.5 mirrors the exact candidates that sweep tried.
+COUNTERFACTUAL_SCALE_FACTORS = (0.75, 0.5)
 
 
 def _finding(severity: str, title: str, detail: str, pair: str | None = None, interval: str | None = None) -> dict:
@@ -2313,12 +2323,51 @@ async def rl_insights():
                         pair=pair, interval=interval,
                     ))
                 if expired / total_all >= HIGH_EXPIRED_FRACTION:
+                    expired_pct = round(expired / total_all * 100)
+                    current_mults = rl_atr_mults(interval, pair)
+                    candidates = [current_mults] + [
+                        (round(current_mults[0] * f, 3), round(current_mults[1] * f, 3))
+                        for f in COUNTERFACTUAL_SCALE_FACTORS
+                    ]
+                    counterfactual = await counterfactual_target_stop(pair, interval, candidates)
+
+                    detail = None
+                    if counterfactual is not None:
+                        baseline = counterfactual["by_mults"][current_mults]
+                        best_mults, best = min(
+                            ((m, r) for m, r in counterfactual["by_mults"].items() if m != current_mults),
+                            key=lambda mr: mr[1]["expired_fraction_pct"] if mr[1]["expired_fraction_pct"] is not None else 100.0,
+                        )
+                        if (
+                            baseline["expired_fraction_pct"] is not None and best["expired_fraction_pct"] is not None
+                            and baseline["expired_fraction_pct"] - best["expired_fraction_pct"] >= COUNTERFACTUAL_MEANINGFUL_IMPROVEMENT_PCT
+                        ):
+                            detail = (
+                                f"{expired_pct}% of resolved signals timed out without hitting target or "
+                                f"stop. Replaying the same {counterfactual['replayed_signals']} signals' "
+                                f"actual price paths with a tighter {best_mults[0]}x/{best_mults[1]}x "
+                                f"target/stop (vs the current {current_mults[0]}x/{current_mults[1]}x) "
+                                f"would have cut the expired share to {best['expired_fraction_pct']}% "
+                                f"(hit rate {best['hit_rate_pct']}% vs {baseline['hit_rate_pct']}% now) -- "
+                                f"doesn't account for spread cost on the tighter band, but a real "
+                                f"reduction in signals that never resolve."
+                            )
+                        else:
+                            detail = (
+                                f"{expired_pct}% of resolved signals timed out without hitting target or "
+                                f"stop. Replayed the same signals' actual price paths with tighter "
+                                f"target/stop bands and none meaningfully reduced it -- points at a "
+                                f"window problem (see GET /rl/resolution-stats), not a sizing one."
+                            )
+                    if detail is None:
+                        detail = (
+                            f"{expired_pct}% of resolved signals timed out without hitting target or "
+                            f"stop. On fast intervals this is often the fixed spread cost eating most of "
+                            f"the typical move -- worth revisiting target/stop sizing for this interval "
+                            f"specifically."
+                        )
                     findings.append(_finding(
-                        "warning", f"{label}: signals rarely reach a real outcome",
-                        f"{round(expired / total_all * 100)}% of resolved signals timed out "
-                        f"without hitting target or stop. On fast intervals this is often the "
-                        f"fixed spread cost eating most of the typical move -- worth revisiting "
-                        f"target/stop sizing for this interval specifically.",
+                        "warning", f"{label}: signals rarely reach a real outcome", detail,
                         pair=pair, interval=interval,
                     ))
 

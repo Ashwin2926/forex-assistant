@@ -2,6 +2,8 @@ from typing import Optional
 import pandas as pd
 from app.core.database import candles_collection, signals_collection, consensus_signals_collection, rl_signals_collection
 from app.services.signal_engine import label_outcome, spread_cost_pct
+from app.services.indicators import atr as compute_atr_series
+from app.services.candle_archive import load_full_candle_history
 
 DEFAULT_MAX_LOOKFORWARD = 20
 
@@ -256,3 +258,88 @@ async def score_pending_rl_signals(max_lookforward: Optional[int] = None) -> dic
         tally[update["status"]] += 1
 
     return tally
+
+
+ATR_PERIOD = 14  # matches signal_engine's own indicator defaults elsewhere
+
+# Below this many replayable signals, a counterfactual's hit/expired mix is too small a
+# sample to act on -- same spirit as GET /rl/insights' own MIN_SAMPLE_FOR_INSIGHT.
+COUNTERFACTUAL_MIN_SIGNALS = 15
+
+
+async def counterfactual_target_stop(
+    pair: str, interval: str, candidate_mults: list[tuple[float, float]],
+) -> Optional[dict]:
+    """
+    Replays every already-resolved (hit/miss/expired) live RL signal for this pair/interval
+    against each (target_atr_mult, stop_atr_mult) in candidate_mults -- same entry price,
+    direction, and actual subsequent candle path each already has, just a different
+    target/stop distance computed from the ATR value at signal time, resolved with the same
+    label_outcome walk-forward live scoring itself uses. Answers "what would the hit/expired
+    mix have looked like under a different sizing" without spending any PPO retraining
+    compute -- automates the same kind of manual sweep this project has already done by hand
+    to tune RL_ATR_MULT_PAIR_OVERRIDES (see rl_engine.py's GBP/USD 15min note).
+
+    Every candidate replays the exact same set of signals, so counts are directly
+    comparable -- only the hit/miss/expired mix shifts between candidates, not how many
+    signals were replayed.
+
+    Does NOT account for spread cost eating into a tighter target's edge -- a real
+    consideration this project already factors into live rule-based signals (see
+    spread_cost_pct), deliberately left out here since it would need real spread data at
+    each historical timestamp, not just the ATR band. Treat this as "does resolution
+    improve," not a full expectancy verdict.
+
+    Returns None if there's neither enough resolved signal history nor enough candle
+    history (archive + Mongo) to replay it meaningfully.
+    """
+    docs = await load_full_candle_history(pair, interval)
+    if len(docs) < ATR_PERIOD + 1:
+        return None
+    df = pd.DataFrame(docs).sort_values("timestamp").reset_index(drop=True)
+    atr_series = compute_atr_series(df, period=ATR_PERIOD)
+
+    window = LIVE_MAX_LOOKFORWARD_BY_INTERVAL.get(interval, DEFAULT_MAX_LOOKFORWARD)
+
+    signals = await rl_signals_collection.find(
+        {"pair": pair, "interval": interval, "source": "live", "status": {"$in": ["hit", "miss", "expired"]}},
+        {"timestamp": 1, "direction": 1, "entry_price": 1},
+    ).to_list(length=None)
+
+    tallies = {mults: {"hit": 0, "miss": 0, "expired": 0} for mults in candidate_mults}
+    replayed = 0
+    timestamps = df["timestamp"]
+    for sig in signals:
+        idx = int(timestamps.searchsorted(sig["timestamp"], side="right")) - 1
+        if idx < ATR_PERIOD or idx + 1 + window > len(df):
+            continue  # not enough ATR warmup, or not enough real future history to replay a full window
+        atr_at_signal = atr_series.iloc[idx]
+        if pd.isna(atr_at_signal) or atr_at_signal <= 0:
+            continue
+
+        future_df = df.iloc[idx + 1: idx + 1 + window]
+        entry_price, direction = sig["entry_price"], sig["direction"]
+        replayed += 1
+        for (target_mult, stop_mult) in candidate_mults:
+            if direction == "BUY":
+                target_price = entry_price + target_mult * atr_at_signal
+                stop_price = entry_price - stop_mult * atr_at_signal
+            else:
+                target_price = entry_price - target_mult * atr_at_signal
+                stop_price = entry_price + stop_mult * atr_at_signal
+            status, *_ = label_outcome(future_df, direction, target_price, stop_price, window)
+            if status in tallies[(target_mult, stop_mult)]:
+                tallies[(target_mult, stop_mult)][status] += 1
+
+    if replayed < COUNTERFACTUAL_MIN_SIGNALS:
+        return None
+
+    by_mults = {}
+    for mults, tally in tallies.items():
+        total = tally["hit"] + tally["miss"] + tally["expired"]
+        by_mults[mults] = {
+            **tally,
+            "hit_rate_pct": round(tally["hit"] / total * 100, 1) if total else None,
+            "expired_fraction_pct": round(tally["expired"] / total * 100, 1) if total else None,
+        }
+    return {"replayed_signals": replayed, "window_candles": window, "by_mults": by_mults}
