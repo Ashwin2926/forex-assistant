@@ -4,6 +4,36 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-12 (cont.)
+
+**Made GET /rl/insights' "signals rarely reach a real outcome" finding computed instead of
+generic advice, and hit a real scale bug doing it.**
+
+Added `counterfactual_target_stop` (outcome_scoring.py): replays every already-resolved
+live RL signal against alternate (target_atr_mult, stop_atr_mult) candidates -- same entry,
+direction, and actual subsequent candle path each already has, just a different exit
+distance from the ATR at signal time, resolved with the same `label_outcome` walk-forward
+live scoring itself uses. Automates by hand what this project already did manually to tune
+`RL_ATR_MULT_PAIR_OVERRIDES` (see rl_engine.py's GBP/USD 15min note) -- no retraining
+compute, just replaying history already collected.
+
+**First version crashed GET /rl/insights outright** (empty response body, no catchable
+exception even from a bare `except Exception` wrapping the whole call) -- root cause: it
+called `load_full_candle_history`, which loads the ENTIRE archive+Mongo merge, just to
+sample ATR at a few dozen signal timestamps. Coincided with the in-progress `5min` backfill
+pushing `candles_collection` past 1.75M documents, but this was never just a today-only
+timing fluke -- even after that backfill finishes and Mongo gets re-trimmed back down, the
+archive file itself will be ~700k rows for `5min` alone, and this function would still have
+loaded and processed all of it every time. Fixed to compute the actual bounded range each
+signal needs (ATR warmup + lookforward window) and query/slice only that.
+
+**Live result once fixed**: every 5min/15min combo currently flagged (GBP/USD, USD/JPY,
+AUD/USD -- 82-90% expired) replayed against tighter target/stop and none improved
+meaningfully -- a real, specific diagnosis ("window problem, not sizing, widen
+LIVE_MAX_LOOKFORWARD_BY_INTERVAL instead") the old generic text couldn't give. Also added
+`GET /debug/counterfactual-check` (same bare-except-with-traceback pattern as
+`/debug/dispatch-check`) -- kept as a permanent diagnostic, not just for this incident.
+
 ## 2026-09-12
 
 **Deep historical backfill for ML/RL training data, a real storage crisis it caused, and a
