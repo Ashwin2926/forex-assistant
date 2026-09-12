@@ -12,6 +12,7 @@ import pandas as pd
 from app.core.config import get_settings
 from app.core.auth import AuthMiddleware, create_token, verify_credentials
 from app.core.database import (
+    db,
     init_indexes,
     candles_collection,
     signals_collection,
@@ -1227,6 +1228,32 @@ async def debug_egress_check():
         except httpx.RequestError as e:
             results[name] = {"ok": False, "error": f"{type(e).__name__}: {e}", "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
     return results
+
+
+@app.get("/debug/db-stats")
+async def debug_db_stats():
+    """
+    Diagnostic only, read-only -- per-collection storage size, so what's actually consuming
+    an Atlas cluster's storage cap can be checked directly instead of guessed at (added while
+    figuring out what to prune on Cluster2's M0 tier: 280.89MB used out of a 512MB hard cap,
+    before the deep intraday candle backfill added anything more).
+    """
+    overall = await db.command("dbStats")
+    collections = {}
+    for name in await db.list_collection_names():
+        stats = await db.command("collStats", name)
+        collections[name] = {
+            "count": stats.get("count"),
+            "size_mb": round(stats.get("size", 0) / 1024 / 1024, 2),
+            "storage_size_mb": round(stats.get("storageSize", 0) / 1024 / 1024, 2),
+            "total_index_size_mb": round(stats.get("totalIndexSize", 0) / 1024 / 1024, 2),
+        }
+    return {
+        "data_size_mb": round(overall.get("dataSize", 0) / 1024 / 1024, 2),
+        "storage_size_mb": round(overall.get("storageSize", 0) / 1024 / 1024, 2),
+        "index_size_mb": round(overall.get("indexSize", 0) / 1024 / 1024, 2),
+        "collections": dict(sorted(collections.items(), key=lambda kv: kv[1]["storage_size_mb"], reverse=True)),
+    }
 
 
 @app.get("/debug/dispatch-check")
