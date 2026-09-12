@@ -10,7 +10,7 @@ candles, optional Deriv demo-account paper trading. Backend deploys to **FastAPI
 (`forex-assistant.fastapicloud.dev`), frontend to **Vercel**
 (`forex-assistant-five.vercel.app`), both from `master`.
 
-## Two platform gotchas that cost an entire debugging session to find (2026-08-18)
+## Platform gotchas that cost an entire debugging session to find (2026-08-18)
 
 1. ~~**FastAPI Cloud dashboard "redeploy"/restart does NOT rebuild from git...**~~
    **Superseded 2026-08-27**: a plain `git push` to `master` now DOES trigger a real
@@ -29,6 +29,16 @@ candles, optional Deriv demo-account paper trading. Backend deploys to **FastAPI
    shows in the web UI's run-detail page, not via the REST API. Root cause here was an
    unquoted `run: curl ... -H "X-Service-Token: $VAR" ...` — YAML disallows a bare `: `
    (colon-space) inside a plain scalar; fix is `run: |` block-literal style.
+3. **A "failed" long-running mutating request may still be running server-side** (found
+   2026-09-12): `POST /candles/prune-history?confirm=true` timed out client-side (empty
+   response body) after ~125s deleting ~1.28M documents across 20 sequential
+   `delete_many` calls — but the request kept executing on FastAPI Cloud past when the
+   client/gateway gave up. A retry ~90s later raced with the still-running original: some
+   combos' reported `deleted` count came back lower than their own `to_delete` count,
+   because the first request had already deleted the rest concurrently. Not dangerous for
+   an idempotent, archive-backed delete, but don't assume a timed-out mutating call did
+   nothing — verify actual state (a fresh dry run, `/debug/db-stats`, etc.) before retrying
+   destructive operations, and expect the retry to race with it.
 
 **Related, milder finding (2026-08-27)**: even with valid YAML, `keep-fresh.yml`'s
 `*/20 * * * *` schedule doesn't fire exactly on time — pulled 100 real run timestamps via

@@ -4,6 +4,76 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-12
+
+**Deep historical backfill for ML/RL training data, a real storage crisis it caused, and a
+new candle-archive architecture to fix it for good.**
+
+Started from "get 2010-onward candle history for ML/RL training." Built `POST
+/ingest/backfill/{interval}` (paginated, resumable via "earliest candle already stored" —
+no separate state) and `.github/workflows/backfill-history.yml` to drive it at a
+rate-limit-safe pace. Ran it for `1day`/`4h`/`1h`/`15min`.
+
+**Correction to the original premise**: Twelve Data's free plan does NOT have intraday
+forex history back to 2010 — confirmed live, every intraday interval (`4h`, `1h`, `15min`)
+independently bottoms out at **2020-01-29** for all 4 pairs (`1day` goes back to
+2007/2008, unaffected — daily isn't subject to the same plan restriction). `backfill_batch`
+originally reported "done" identically whether it actually reached `start_date` or Twelve
+Data simply ran out of history to give — fixed to return `reached_start_date` separately
+(`59afac5`) so this distinction is never silently lost again.
+
+**Storage crisis**: the backfill pushed Cluster2 (Atlas M0, 512MB hard cap) from 280.89MB
+to 370.15MB, most of it not candles — `backtest_signals` (152.71MB, 231k docs) from
+`/backtest`/`/backtest/optimize` runs with no retention policy, ever, was nearly as large
+as `candles` itself. Cancelled the in-flight `5min` backfill before it could push past the
+cap. Added `GET /debug/db-stats` (read-only `collStats`/`dbStats`) to see this instead of
+guessing.
+
+Reclaimed **370MB → 197MB with zero feature loss**, not just deleted history:
+- `POST /rl/prune-history`: traced every read of `ppo_policies.model_bytes` and confirmed
+  each one always queries the single latest doc per pair/interval — older policies' model
+  bytes are dead weight, `$unset` rather than deleted so `GET /rl/policies`' learning-progress
+  trend view (which never reads `model_bytes` anyway) is untouched. Same logic for the
+  RL eval runs' per-trade `backtest_signals`.
+- `POST /backtest/prune-history`: the much bigger win — `frontend/src/app/backtest/page.tsx`
+  only ever lists the 50 most recent runs globally (no pair/profile filter), so anything
+  older is already unreachable from the app. Deleted 199,814 of 212,868 non-RL
+  `backtest_signals` docs.
+
+**New architecture, not just a cleanup**: `scripts/export_candles.py` +
+`.github/workflows/export-candles.yml` dump `candles_collection` to `data/candles/*.csv.gz`
+and commit it back to the branch — survives independently of Atlas's cap, readable by
+anything checking out this repo. `app/services/candle_archive.py` merges that archive with
+whatever's live in Mongo (ingestion keeps covering "recent" per `fetch_and_store`'s
+existing gap-fill logic). Wired into `/backtest`, `/backtest/sweep`, `/backtest/optimize`,
+`/consensus/backtest`, and both RL training paths (`_run_rl_training` and
+`scripts/train_rl.py`, the one `train-rl.yml` actually runs) — verified live before
+trusting it (`GET /debug/archive-check` proved the deployed backend can actually read a
+committed `.csv.gz`, not just assumed it from "FastAPI Cloud deploys from this repo").
+
+With the archive verified, trimmed `candles_collection` itself: `POST
+/candles/prune-history` keeps only the 2000 most recent candles per pair/interval (4x the
+500-candle ceiling every live read actually uses), only for a combo whose archive
+demonstrably covers everything about to be deleted. **370MB → 197MB → 23.4MB** final.
+
+**New platform gotcha found**: a `POST /candles/prune-history?confirm=true` call timed out
+client-side (empty response body, "Expecting value: line 1 column 1") after ~125s deleting
+~1.28M documents across 20 sequential `delete_many` calls — but the request kept running
+**server-side** past the client/gateway giving up. A retry ~90s later raced with it:
+several combos' `deleted` count came back lower than their own `to_delete` count (e.g.
+AUD/USD 5min: `to_delete: 98366` but `deleted: 58399`) because the still-running first
+request had already deleted the rest concurrently. Not dangerous here (idempotent,
+archive-backed), but worth knowing before assuming a "failed" long-running mutating
+request didn't do anything — it might still be running.
+
+**In progress**: resuming the `5min` backfill to 2020 now that there's ~489MB of headroom
+(it only reaches Aug 2025 in the archive — was cancelled early during the storage crisis).
+Since Mongo's `5min` "earliest stored candle" is now recent (trimmed to 2000), this walks
+all the way back from scratch rather than truly resuming from Aug 2025 — correct, just
+~1,400 Twelve Data calls instead of ~1,000, still well inside the free daily credit budget.
+Plan: let it finish, `export-candles.yml` to capture it, `/candles/prune-history` again to
+bring Mongo back down.
+
 ## 2026-09-10
 
 **Decided: move PPO training execution off FastAPI Cloud entirely, into GitHub Actions.**
