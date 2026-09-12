@@ -768,6 +768,51 @@ async def backtest_optimize(
     }
 
 
+@app.post("/backtest/prune-history")
+async def prune_backtest_history(confirm: bool = False, keep_latest_n: int = 50):
+    """
+    Reclaims Atlas storage from rule-based backtest/sweep/optimize runs (profile != "rl_ppo"
+    -- see /rl/prune-history for that side) with the same zero-feature-loss reasoning: the
+    frontend's only path to a run's per-signal detail is GET /backtest/runs?limit=50 (see
+    frontend/src/app/backtest/page.tsx, no pair/profile filter -- a single global most-recent
+    list) followed by clicking into one of those 50 (RunDetail.tsx calls
+    GET /backtest/runs/{run_id}/signals). A run older than the 50 most recent overall is
+    already unreachable from the app, so its backtest_signals_collection detail is dead
+    weight -- this keeps backtest_runs_collection itself untouched (cheap, <1MB for 800+
+    docs) and only deletes the per-trade signals for runs past keep_latest_n.
+
+    confirm: defaults to False, a dry run that returns exactly what WOULD be deleted.
+    """
+    keep_run_ids = {
+        d["run_id"] async for d in
+        backtest_runs_collection.find({"profile": {"$ne": "rl_ppo"}}, {"run_id": 1})
+            .sort("created_at", -1).limit(keep_latest_n)
+    }
+    prunable_run_ids = [
+        d["run_id"] async for d in
+        backtest_runs_collection.find(
+            {"profile": {"$ne": "rl_ppo"}, "run_id": {"$nin": list(keep_run_ids)}}, {"run_id": 1},
+        )
+    ]
+
+    signals_count = await backtest_signals_collection.count_documents(
+        {"run_id": {"$in": prunable_run_ids}}
+    ) if prunable_run_ids else 0
+
+    result = {
+        "confirmed": confirm,
+        "runs_kept": len(keep_run_ids),
+        "runs_pruned": len(prunable_run_ids),
+        "backtest_signals_to_delete": signals_count,
+    }
+    if not confirm:
+        return result
+
+    if prunable_run_ids:
+        await backtest_signals_collection.delete_many({"run_id": {"$in": prunable_run_ids}})
+    return result
+
+
 @app.get("/backtest/runs")
 async def list_backtest_runs(pair: str | None = None, profile: str | None = None, limit: int = 20):
     query = {}
