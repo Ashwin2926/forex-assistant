@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type MLPrediction, type MLTrainResult } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRebuildJob, type MLPrediction, type MLTrainResult } from "@/lib/types";
 
 interface PredictGridCell {
   pair: string;
@@ -11,10 +11,19 @@ interface PredictGridCell {
   error?: string;
 }
 
+// How often to poll GET /backtest/rebuild-all/{job_id} while a rebuild is in progress --
+// same interval the RL page uses for its own train-all job (rebuild-backtests.yml runs
+// much faster than a PPO sweep, but there's no harm polling at the same cadence).
+const REBUILD_POLL_MS = 4000;
+
 export default function MLPage() {
   const [training, setTraining] = useState(false);
   const [trainError, setTrainError] = useState<string | null>(null);
   const [trainResult, setTrainResult] = useState<MLTrainResult | null>(null);
+
+  const [rebuildJob, setRebuildJob] = useState<BacktestRebuildJob | null>(null);
+  const [rebuildStartError, setRebuildStartError] = useState<string | null>(null);
+  const rebuildPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [runs, setRuns] = useState<MLTrainResult[]>([]);
   const [runsLoading, setRunsLoading] = useState(true);
@@ -43,6 +52,56 @@ export default function MLPage() {
   useEffect(() => {
     loadRuns();
   }, []);
+
+  // Resumes polling if a rebuild kicked off earlier (this tab or another) is still running --
+  // same "don't lose visibility on refresh" behavior the RL page's train-all job has.
+  useEffect(() => {
+    (async () => {
+      try {
+        const job = await api.getLatestRebuildBacktestsJob();
+        if (job) {
+          setRebuildJob(job);
+          if (job.status === "running") pollRebuildJob(job.job_id);
+        }
+      } catch {
+        // non-critical section
+      }
+    })();
+    return () => {
+      if (rebuildPollRef.current) clearInterval(rebuildPollRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function pollRebuildJob(jobId: string) {
+    if (rebuildPollRef.current) clearInterval(rebuildPollRef.current);
+    rebuildPollRef.current = setInterval(async () => {
+      try {
+        const job = await api.getRebuildBacktestsJob(jobId);
+        setRebuildJob(job);
+        if (job.status !== "running") {
+          if (rebuildPollRef.current) clearInterval(rebuildPollRef.current);
+          rebuildPollRef.current = null;
+          await loadRuns(); // the workflow chains POST /ml/train?force=true, so a fresh run just landed
+        }
+      } catch {
+        // transient poll failure -- keep trying on the next tick rather than giving up
+      }
+    }, REBUILD_POLL_MS);
+  }
+
+  async function handleRebuild() {
+    setRebuildStartError(null);
+    try {
+      const job = await api.startRebuildBacktests();
+      setRebuildJob(job);
+      pollRebuildJob(job.job_id);
+    } catch (e) {
+      setRebuildStartError(e instanceof ApiError ? e.message : "Couldn't start the rebuild.");
+    }
+  }
+
+  const rebuildRunning = rebuildJob?.status === "running";
 
   async function handleTrain() {
     setTraining(true);
@@ -114,6 +173,60 @@ export default function MLPage() {
           not a validated edge. Doesn&apos;t affect the regular signal feed or consensus in any way; purely
           advisory.
         </p>
+      </section>
+
+      <section className="card p-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Rebuild backtest training data</h2>
+          <button onClick={handleRebuild} disabled={rebuildRunning} className="btn-primary shrink-0">
+            {rebuildRunning
+              ? `Rebuilding ${rebuildJob?.completed ?? 0}/${rebuildJob?.total ?? 20}…`
+              : "Rebuild & retrain"}
+          </button>
+        </div>
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          Re-runs the rule engine against the full historical archive with today&apos;s live default
+          config, on a GitHub Actions runner (a deep 5min/15min backtest is too slow for FastAPI
+          Cloud&apos;s own gateway timeout) — this is what feeds the classifier historical examples
+          beyond just live signals. Only backtest runs matching today&apos;s exact default config
+          count, so re-run this whenever that default changes. Retrains the model automatically
+          once done.
+        </p>
+        {rebuildStartError && (
+          <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
+            {rebuildStartError}
+          </p>
+        )}
+        {rebuildJob && rebuildJob.results.length > 0 && (
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="text-zinc-500 dark:text-zinc-400">
+                  <th className="px-3 py-1.5">Pair</th>
+                  <th className="px-3 py-1.5">Interval</th>
+                  <th className="px-3 py-1.5">Directional signals</th>
+                  <th className="px-3 py-1.5">Hits</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rebuildJob.results.map((cell) => (
+                  <tr key={`${cell.pair}-${cell.interval}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                    <td className="px-3 py-1.5">{cell.pair}</td>
+                    <td className="px-3 py-1.5">{cell.interval}</td>
+                    {cell.ok ? (
+                      <>
+                        <td className="px-3 py-1.5 font-mono">{cell.directional_signals}</td>
+                        <td className="px-3 py-1.5 font-mono">{cell.hits}</td>
+                      </>
+                    ) : (
+                      <td className="px-3 py-1.5 text-rose-600 dark:text-rose-400" colSpan={2}>{cell.error}</td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       <section className="card p-4">

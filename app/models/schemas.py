@@ -437,6 +437,38 @@ class RLTrainAllJob(BaseModel):
     results: list[RLTrainAllCell] = []
 
 
+class BacktestRebuildCell(BaseModel):
+    """One pair/interval's outcome within a BacktestRebuildJob."""
+    pair: str
+    interval: str
+    ok: bool
+    error: Optional[str] = None
+    directional_signals: Optional[int] = None
+    hits: Optional[int] = None
+
+
+class BacktestRebuildJob(BaseModel):
+    """
+    Tracks a "rebuild every pair x interval's default-config backtest" run on
+    .github/workflows/rebuild-backtests.yml (scripts/rebuild_backtests.py) -- same
+    Mongo-persisted-job pattern as RLTrainAllJob, see that model's own docstring for why
+    (survives the triggering browser tab closing, and FastAPI Cloud recycling the instance
+    between requests). Exists to give the ML classifier's qualifying-backtest-signal filter
+    (app/services/ml_training_data.py) something current to draw on -- see PROGRESS.md's
+    2026-09-12 entry for why the existing backtest_signals were all stale (pre-dated the
+    EMA 9/21 default). The workflow chains POST /ml/train?force=true onto the end of its own
+    run, so this job's completion also means a fresh classifier retrain already happened.
+    """
+    job_id: str
+    status: Literal["running", "done"]
+    created_at: datetime
+    finished_at: Optional[datetime] = None
+    max_lookforward: int
+    total: int
+    completed: int = 0
+    results: list[BacktestRebuildCell] = []
+
+
 class RunAllFlowsJob(BaseModel):
     """
     Tracks the manual "Sync now" catch-up job (app/main.py's _run_all_flows_job background

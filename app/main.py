@@ -26,10 +26,11 @@ from app.core.database import (
     rl_train_jobs_collection,
     run_all_flows_jobs_collection,
     ppo_policies_collection,
+    backtest_rebuild_jobs_collection,
 )
 from app.models.schemas import (
     LoginRequest, RuleConfig, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
-    PPOPolicy, MLTrainResult,
+    PPOPolicy, MLTrainResult, BacktestRebuildJob,
 )
 from app.services.data_fetcher import fetch_and_store, backfill_batch
 from app.services.candle_archive import load_full_candle_history, load_archived_candles
@@ -1306,6 +1307,79 @@ async def _trigger_rl_train_workflow(job_id: str, total_timesteps: int, train_fr
         raise HTTPException(
             status_code=502, detail=f"GitHub workflow_dispatch failed ({resp.status_code}): {resp.text[:300]}",
         )
+
+
+async def _trigger_rebuild_backtests_workflow(job_id: str, max_lookforward: int):
+    """
+    Dispatches .github/workflows/rebuild-backtests.yml the same way
+    _trigger_rl_train_workflow dispatches train-rl.yml -- see that function's own docstring
+    for the shared reasoning (settings.github_pat/github_repo, error handling, the CORS gotcha
+    from wrapping httpx's own exceptions). A deep-archive backtest on 5min/15min is too slow
+    for FastAPI Cloud's own gateway timeout, same as PPO training, so this also runs on a
+    GitHub Actions runner instead of in-process (see PROGRESS.md's 2026-09-12 entry).
+    """
+    if not settings.github_pat or not settings.github_repo:
+        raise HTTPException(
+            status_code=500,
+            detail="github_pat/github_repo not configured -- can't dispatch .github/workflows/rebuild-backtests.yml.",
+        )
+    url = f"https://api.github.com/repos/{settings.github_repo}/actions/workflows/rebuild-backtests.yml/dispatches"
+    payload = {"ref": "master", "inputs": {"job_id": job_id, "max_lookforward": str(max_lookforward)}}
+    headers = {"Authorization": f"Bearer {settings.github_pat}", "Accept": "application/vnd.github+json"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502, detail=f"Couldn't reach GitHub's API ({type(e).__name__}): {e}",
+        )
+    if resp.status_code != 204:
+        raise HTTPException(
+            status_code=502, detail=f"GitHub workflow_dispatch failed ({resp.status_code}): {resp.text[:300]}",
+        )
+
+
+@app.post("/backtest/rebuild-all")
+async def rebuild_all_backtests(max_lookforward: int = 20):
+    """
+    Triggers a fresh rule-engine backtest (today's live default RuleConfig, see
+    signal_engine.PROFILE_DEFAULTS["intraday"]) across every pair x interval on a GitHub
+    Actions runner (.github/workflows/rebuild-backtests.yml) and returns immediately with a
+    job_id -- poll GET /backtest/rebuild-all/{job_id} for progress, same pattern as
+    POST /rl/train-all.
+
+    This is what actually populates data for app/services/ml_training_data.py's qualifying-
+    backtest-signal filter to draw on: that filter only accepts backtest signals whose run
+    used a rule_config/target_atr_mult/stop_atr_mult byte-identical to today's default, so any
+    time PROFILE_DEFAULTS["intraday"] changes, every previously-qualifying run stops
+    qualifying and this needs to be re-run. The workflow itself chains
+    POST /ml/train?force=true onto the end of its run, so this job's completion also means
+    the classifier has already been retrained on the fresh data.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    await _trigger_rebuild_backtests_workflow(job_id, max_lookforward)
+    job = BacktestRebuildJob(
+        job_id=job_id, status="running", created_at=datetime.utcnow(),
+        max_lookforward=max_lookforward, total=len(settings.pairs_list) * len(RL_INTERVALS),
+    )
+    await backtest_rebuild_jobs_collection.insert_one(job.model_dump())
+    return job
+
+
+@app.get("/backtest/rebuild-all/{job_id}")
+async def get_rebuild_all_backtests_job(job_id: str):
+    doc = await backtest_rebuild_jobs_collection.find_one({"job_id": job_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No backtest rebuild job {job_id}.")
+    return BacktestRebuildJob(**{k: v for k, v in doc.items() if k != "_id"})
+
+
+@app.get("/backtest/rebuild-all-latest")
+async def get_latest_rebuild_all_backtests_job():
+    doc = await backtest_rebuild_jobs_collection.find_one(sort=[("created_at", -1)])
+    if not doc:
+        return None
+    return BacktestRebuildJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 
 @app.get("/debug/egress-check")

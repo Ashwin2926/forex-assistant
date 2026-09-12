@@ -232,6 +232,30 @@ export interface RLTrainAllJob {
   cancel_requested: boolean;
 }
 
+export interface BacktestRebuildCell {
+  pair: string;
+  interval: string;
+  ok: boolean;
+  error?: string | null;
+  directional_signals?: number | null;
+  hits?: number | null;
+}
+
+// A "rebuild every pair x interval's default-config backtest" batch run (see app/main.py's
+// POST /backtest/rebuild-all), same job-doc-plus-polling pattern as RLTrainAllJob. This is
+// what populates data for the ML classifier's qualifying-backtest-signal filter
+// (app/services/ml_training_data.py) -- see the /ml page for where this gets triggered.
+export interface BacktestRebuildJob {
+  job_id: string;
+  status: "running" | "done";
+  created_at: string;
+  finished_at?: string | null;
+  max_lookforward: number;
+  total: number;
+  completed: number;
+  results: BacktestRebuildCell[];
+}
+
 export interface RLSignal {
   _id?: string;
   // Absent on any signal generated before this field existed -- GET /rl/signals returns raw

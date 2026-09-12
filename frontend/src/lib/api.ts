@@ -1,4 +1,4 @@
-import type { BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
+import type { BacktestRebuildJob, BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -183,6 +183,22 @@ export const api = {
 
   listMLRuns(limit = 20) {
     return request<MLTrainResult[]>(`/ml/runs?limit=${limit}`);
+  },
+
+  // Rebuilds qualifying backtest data for the ML classifier (see
+  // app/services/ml_training_data.py) on a GitHub Actions runner, then retrains -- same
+  // job-doc-plus-polling pattern as startTrainAllRL below.
+  startRebuildBacktests(maxLookforward?: number) {
+    const qs = maxLookforward !== undefined ? `?max_lookforward=${maxLookforward}` : "";
+    return request<BacktestRebuildJob>(`/backtest/rebuild-all${qs}`, { method: "POST" });
+  },
+
+  getRebuildBacktestsJob(jobId: string) {
+    return request<BacktestRebuildJob>(`/backtest/rebuild-all/${jobId}`);
+  },
+
+  getLatestRebuildBacktestsJob() {
+    return request<BacktestRebuildJob | null>(`/backtest/rebuild-all-latest`);
   },
 
   predictML(pair: string, interval: string, profile: string) {

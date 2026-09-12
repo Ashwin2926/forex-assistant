@@ -54,7 +54,15 @@ The workflow chains `POST /ml/train?force=true` onto the end of the same run, so
 rebuilds the qualifying backtest pool AND retrains the classifier on it -- `force=true` because
 the resolved-signal *count* can be unchanged from the prior run while the underlying rows are
 entirely different (fresh qualifying data replacing all-non-qualifying data), which `/ml/train`'s
-own same-count skip check can't tell apart otherwise. Not yet run.
+own same-count skip check can't tell apart otherwise.
+
+**Frontend trigger added**: `POST /backtest/rebuild-all` dispatches `rebuild-backtests.yml` via
+GitHub's REST API -- exact same pattern `_trigger_rl_train_workflow`/`POST /rl/train-all`
+already established (`settings.github_pat`/`github_repo`, job doc persisted in a new
+`backtest_rebuild_jobs` collection, `GET /backtest/rebuild-all/{job_id}` + `-latest` to poll).
+The `/ml` page has a new "Rebuild backtest training data" card (button + per-combo results
+table + resume-polling-on-reload), directly above the existing "Train the model now" card,
+mirroring the RL page's train-all UI. Not yet run.
 
 ## 2026-09-12 (cont., latest x2)
 

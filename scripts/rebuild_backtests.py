@@ -27,6 +27,7 @@ downstream needs to know this ran here instead of through the API.
 import argparse
 import os
 import sys
+from datetime import datetime
 
 from pymongo import MongoClient
 
@@ -68,6 +69,7 @@ def run_one(db, pair: str, interval: str, max_lookforward: int) -> tuple[int, in
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--job-id", default=None, help="backtest_rebuild_jobs_collection doc to report progress into; created if it doesn't already exist (e.g. a schedule-triggered run with no pre-created job doc).")
     parser.add_argument("--pair", default=None, help="Single pair (e.g. 'EUR/USD'). Omit together with --interval to sweep every pair x interval.")
     parser.add_argument("--interval", default=None, help="Single interval (e.g. '15min'). Omit together with --pair to sweep every pair x interval.")
     parser.add_argument("--max-lookforward", type=int, default=20)
@@ -84,15 +86,38 @@ def main():
     client = MongoClient(mongodb_uri)
     db = client[mongodb_db_name]
 
+    job_id = args.job_id
+    if job_id:
+        job_doc = db["backtest_rebuild_jobs"].find_one({"job_id": job_id})
+        if not job_doc:
+            db["backtest_rebuild_jobs"].insert_one({
+                "job_id": job_id, "status": "running", "created_at": datetime.utcnow(),
+                "max_lookforward": args.max_lookforward, "total": len(combos), "completed": 0,
+                "results": [],
+            })
+
     exit_code = 0
     for pair, interval in combos:
         print(f"Backtesting {pair}/{interval} (today's live default config)...")
         try:
             directional, hits = run_one(db, pair, interval, args.max_lookforward)
+            cell = {"pair": pair, "interval": interval, "ok": True, "directional_signals": directional, "hits": hits}
             print(f"  ok: {directional} directional signals, {hits} hits")
         except Exception as e:
-            print(f"  FAILED: {e}")
+            cell = {"pair": pair, "interval": interval, "ok": False, "error": str(e)}
             exit_code = 1
+            print(f"  FAILED: {e}")
+        if job_id:
+            db["backtest_rebuild_jobs"].update_one(
+                {"job_id": job_id, "status": "running"},
+                {"$push": {"results": cell}, "$inc": {"completed": 1}},
+            )
+
+    if job_id:
+        db["backtest_rebuild_jobs"].update_one(
+            {"job_id": job_id, "status": "running"},
+            {"$set": {"status": "done", "finished_at": datetime.utcnow()}},
+        )
 
     sys.exit(exit_code)
 

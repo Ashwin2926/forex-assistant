@@ -15,6 +15,9 @@ name: Rebuild intraday backtests (ML training data)
 on:
   workflow_dispatch:
     inputs:
+      job_id:
+        description: "backtest_rebuild_jobs_collection job id to report progress into (POST /backtest/rebuild-all passes this; a manual run can leave it blank)."
+        required: false
       pair:
         description: "Single pair, e.g. EUR/USD. Leave blank (with interval) to backtest every pair x interval."
         required: false
@@ -48,11 +51,13 @@ jobs:
         run: pip install -r requirements.txt
       - name: Rebuild backtests
         env:
+          JOB_ID: ${{ inputs.job_id }}
           PAIR: ${{ inputs.pair }}
           INTERVAL: ${{ inputs.interval }}
           MAX_LOOKFORWARD: ${{ inputs.max_lookforward || '20' }}
         run: |
           args=(--max-lookforward "$MAX_LOOKFORWARD")
+          if [ -n "$JOB_ID" ]; then args+=(--job-id "$JOB_ID"); fi
           if [ -n "$PAIR" ] && [ -n "$INTERVAL" ]; then args+=(--pair "$PAIR" --interval "$INTERVAL"); fi
           python scripts/rebuild_backtests.py "${args[@]}"
       # force=true because the resolved-signal COUNT can be unchanged from the last run while
