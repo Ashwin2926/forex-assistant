@@ -1,9 +1,11 @@
+from datetime import timedelta
 from typing import Optional
 import pandas as pd
 from app.core.database import candles_collection, signals_collection, consensus_signals_collection, rl_signals_collection
 from app.services.signal_engine import label_outcome, spread_cost_pct
 from app.services.indicators import atr as compute_atr_series
-from app.services.candle_archive import load_full_candle_history
+from app.services.candle_archive import load_archived_candles
+from app.services.data_fetcher import INTERVAL_MINUTES
 
 DEFAULT_MAX_LOOKFORWARD = 20
 
@@ -292,19 +294,47 @@ async def counterfactual_target_stop(
 
     Returns None if there's neither enough resolved signal history nor enough candle
     history (archive + Mongo) to replay it meaningfully.
-    """
-    docs = await load_full_candle_history(pair, interval)
-    if len(docs) < ATR_PERIOD + 1:
-        return None
-    df = pd.DataFrame(docs).sort_values("timestamp").reset_index(drop=True)
-    atr_series = compute_atr_series(df, period=ATR_PERIOD)
 
+    Deliberately does NOT load full candle history (archive + Mongo combined can be 1M+ rows
+    for a deeply-backfilled intraday interval, and only grows from here) -- every signal only
+    ever needs a bounded window around its own timestamp (ATR_PERIOD candles of warmup,
+    `window` candles of lookahead), so this fetches exactly that range instead, from Mongo
+    (a single indexed range query) and the archive file (loaded once, then sliced to the same
+    range -- still reads the whole compressed file, but skips the expensive concat/dedup/ATR-
+    rolling-computation over everything outside what's actually needed).
+    """
     window = LIVE_MAX_LOOKFORWARD_BY_INTERVAL.get(interval, DEFAULT_MAX_LOOKFORWARD)
 
     signals = await rl_signals_collection.find(
         {"pair": pair, "interval": interval, "source": "live", "status": {"$in": ["hit", "miss", "expired"]}},
         {"timestamp": 1, "direction": 1, "entry_price": 1},
     ).to_list(length=None)
+    if not signals:
+        return None
+
+    bar_minutes = INTERVAL_MINUTES.get(interval, 60)
+    warmup_span = timedelta(minutes=bar_minutes * (ATR_PERIOD + 5))
+    lookahead_span = timedelta(minutes=bar_minutes * (window + 5))
+    range_start = min(s["timestamp"] for s in signals) - warmup_span
+    range_end = max(s["timestamp"] for s in signals) + lookahead_span
+
+    archive_df = load_archived_candles(pair, interval)
+    if not archive_df.empty:
+        archive_df = archive_df[(archive_df["timestamp"] >= range_start) & (archive_df["timestamp"] <= range_end)]
+
+    mongo_docs = await candles_collection.find(
+        {"pair": pair, "interval": interval, "timestamp": {"$gte": range_start, "$lte": range_end}},
+        {"_id": 0, "pair": 0, "interval": 0},
+    ).sort("timestamp", 1).to_list(length=None)
+    mongo_df = pd.DataFrame(mongo_docs, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    df = pd.concat([archive_df, mongo_df], ignore_index=True)
+    if df.empty:
+        return None
+    df = df.drop_duplicates(subset="timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
+    if len(df) < ATR_PERIOD + 1:
+        return None
+    atr_series = compute_atr_series(df, period=ATR_PERIOD)
 
     tallies = {mults: {"hit": 0, "miss": 0, "expired": 0} for mults in candidate_mults}
     replayed = 0
