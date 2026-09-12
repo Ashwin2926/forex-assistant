@@ -62,7 +62,44 @@ already established (`settings.github_pat`/`github_repo`, job doc persisted in a
 `backtest_rebuild_jobs` collection, `GET /backtest/rebuild-all/{job_id}` + `-latest` to poll).
 The `/ml` page has a new "Rebuild backtest training data" card (button + per-combo results
 table + resume-polling-on-reload), directly above the existing "Train the model now" card,
-mirroring the RL page's train-all UI. Not yet run.
+mirroring the RL page's train-all UI.
+
+**Run live, and it broke two things -- both fixed same-day.**
+
+1. **The chained retrain step got silently skipped.** 2/20 combos (`EUR/USD`/`GBP/USD` 5min)
+   failed with a transient Atlas connection drop against `shard-00-01` specifically (looked
+   like a momentary node blip, not a bug -- `USD/JPY`/`AUD/USD` 5min succeeded fine, and the
+   other 18 combos wrote real data: ~90,000+ directional signals total). `rebuild_backtests.py`
+   correctly recorded the 2 failures per-combo and kept going, but still exits 1 overall, which
+   made GitHub Actions mark the "Rebuild backtests" step failed and **skip** the chained
+   "Retrain ML model" step entirely -- reported by the user as "training failed." Fixed by
+   adding `if: always()` to that step (`rebuild-backtests.yml`) so a partial failure (already
+   visible in the job doc's own results table) doesn't block a retrain that has plenty of
+   fresh data to work with.
+
+2. **The uncapped qualifying-signal fetch took down the live backend.** The rebuild produced
+   ~90,000+ qualifying backtest signals overnight (vs. the ~662 live signals this was designed
+   around). `get_ml_reference_signals` had no size limit, and it runs SYNCHRONOUSLY on every
+   live signal-generation call (`create_signal`'s ML gate, `POST /rl/signal`), not just the
+   `/ml/train` diagnostic -- fetching + feature-extracting + refitting XGBoost on that many
+   rows blew past FastAPI Cloud's ~125s gateway timeout (confirmed: a direct `POST /ml/train`
+   call 524'd at exactly 126s) and left the instance visibly degraded afterward -- even the
+   public, DB-free `GET /` stopped responding for a while, consistent with this project's
+   already-documented "long requests keep running server-side past the client timeout" gotcha
+   piling up concurrent heavy work. Fixed by capping the backtest side of the fetch to 5,000
+   rows via Mongo's `$sample` (`ml_training_data.MAX_BACKTEST_SIGNALS`) in both the async
+   (`app/main.py`) and sync (`scripts/train_rl.py`) paths -- still ~7.5x the original live-only
+   sample, comfortably bounded for a synchronous per-request fit.
+
+**Also flagged, not yet fixed**: the ~90,000+ newly-inserted `backtest_signals` docs re-inflate
+Atlas storage back toward the M0 cap after the 2026-09-12 storage-crisis cleanup got it down to
+23.4MB -- user flagged "mongo db is almost full" live. `POST /backtest/prune-history` (keeps
+only the 50 most recent non-RL runs' signals) is the existing tool for this and should reclaim
+most of the old pre-2026-09-07 (EMA 12/26) bloat safely, since today's qualifying runs are also
+the most recent and would survive a prune right now -- but that tool has no concept of
+"currently qualifying for ML training," so a future prune, once enough other `/backtest` calls
+happen, could silently push a qualifying run out of the keep-window and delete data
+`ml_training_data.py` depends on. Worth reconciling before this becomes a recurring gotcha.
 
 ## 2026-09-12 (cont., latest x2)
 

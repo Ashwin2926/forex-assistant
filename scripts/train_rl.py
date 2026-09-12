@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.candle_archive import load_full_candle_history_sync
 from app.services.case_memory import RESOLVED_STATUSES
-from app.services.ml_training_data import is_qualifying_backtest_run, QUALIFYING_BACKTEST_PROFILE
+from app.services.ml_training_data import is_qualifying_backtest_run, QUALIFYING_BACKTEST_PROFILE, MAX_BACKTEST_SIGNALS
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import rl_config_profile, RL_FEATURE_NAMES
 from app.services.signal_engine import default_config_for
@@ -78,11 +78,14 @@ def get_ml_reference_signals_sync(db) -> list[dict]:
     candidate_runs = list(db["backtest_runs"].find({"profile": QUALIFYING_BACKTEST_PROFILE}))
     qualifying_run_ids = [r["run_id"] for r in candidate_runs if is_qualifying_backtest_run(r)]
 
-    backtest_signals = list(db["backtest_signals"].find({
-        "run_id": {"$in": qualifying_run_ids},
-        "status": {"$in": list(RESOLVED_STATUSES)},
-        "size_tier": None,
-    })) if qualifying_run_ids else []
+    backtest_signals = list(db["backtest_signals"].aggregate([
+        {"$match": {
+            "run_id": {"$in": qualifying_run_ids},
+            "status": {"$in": list(RESOLVED_STATUSES)},
+            "size_tier": None,
+        }},
+        {"$sample": {"size": MAX_BACKTEST_SIGNALS}},
+    ])) if qualifying_run_ids else []
 
     return live_signals + backtest_signals
 

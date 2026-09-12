@@ -64,6 +64,16 @@ jobs:
       # the underlying rows are entirely different (fresh qualifying backtest signals
       # replacing what were previously all non-qualifying) -- see /ml/train's own docstring
       # for why it otherwise skips a same-count refit.
+      #
+      # if: always() -- rebuild_backtests.py exits 1 if even ONE pair/interval combo failed
+      # (e.g. a transient Atlas connection drop on a single slow 5min combo, seen live
+      # 2026-09-12: 18/20 combos still succeeded and wrote real data). Without this, GitHub
+      # Actions marks the "Rebuild backtests" step failed and skips every step after it --
+      # silently losing the retrain even though plenty of fresh qualifying data just landed.
+      # Per-combo failures are already visible in the job doc's own results table
+      # (GET /backtest/rebuild-all/{job_id}), so failing loud here would be redundant, not
+      # informative -- this step should run on any outcome short of the job being cancelled.
       - name: Retrain ML model
+        if: always()
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train?force=true"

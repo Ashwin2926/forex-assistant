@@ -16,6 +16,21 @@ from app.services.signal_engine import default_config_for
 
 QUALIFYING_BACKTEST_PROFILE = "intraday"
 
+# Hard cap on how many qualifying backtest signals a single fetch returns, via Mongo's
+# $sample (a random subset, not "first N" -- avoids skewing toward whichever combo happens to
+# sort first). Added after this went uncapped and immediately broke: rebuilding all 20
+# pair/interval combos on 2026-09-12 (scripts/rebuild_backtests.py) produced ~90,000+
+# qualifying rows overnight, and this fetch runs SYNCHRONOUSLY on every live signal-generation
+# call (create_signal's ML gate, POST /rl/signal, not just the POST /ml/train diagnostic) --
+# fetching + per-row feature extraction + refitting XGBoost on that many rows blew well past
+# FastAPI Cloud's ~125s gateway timeout (confirmed live: a direct POST /ml/train call hit a
+# 524 at exactly 126s) and left the instance visibly degraded for a while afterward (even the
+# public, DB-free GET / stopped responding). 5,000 is generous relative to the ~662 live
+# signals this whole project started with, while keeping fit time in the tenths-of-a-second
+# range this classifier was designed around (see ml_model.py's own N_ESTIMATORS/MAX_DEPTH
+# comment) -- this is a hard operational ceiling, not a data-quality judgment.
+MAX_BACKTEST_SIGNALS = 5000
+
 
 def is_qualifying_backtest_run(run: dict) -> bool:
     """
@@ -70,10 +85,13 @@ async def get_ml_reference_signals(signals_collection, backtest_signals_collecti
     ).to_list(length=None)
     qualifying_run_ids = [r["run_id"] for r in candidate_runs if is_qualifying_backtest_run(r)]
 
-    backtest_signals = await backtest_signals_collection.find({
-        "run_id": {"$in": qualifying_run_ids},
-        "status": {"$in": list(RESOLVED_STATUSES)},
-        "size_tier": None,
-    }).to_list(length=None) if qualifying_run_ids else []
+    backtest_signals = await backtest_signals_collection.aggregate([
+        {"$match": {
+            "run_id": {"$in": qualifying_run_ids},
+            "status": {"$in": list(RESOLVED_STATUSES)},
+            "size_tier": None,
+        }},
+        {"$sample": {"size": MAX_BACKTEST_SIGNALS}},
+    ]).to_list(length=None) if qualifying_run_ids else []
 
     return live_signals + backtest_signals
