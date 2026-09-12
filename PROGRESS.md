@@ -29,6 +29,16 @@ Triggered by the user via the Actions tab; app restart still pending as of this 
 pushing this doc update to trigger FastAPI Cloud's git-triggered redeploy, since freeing
 Atlas storage doesn't itself make an already-crashed instance retry startup.
 
+**The trim didn't actually help**: a fresh deploy attempt after `trim_backtest_signals.py
+--confirm` still hit the identical "518 MB of 512 MB" -- confirms the theory above.
+`delete_many` doesn't shrink a collection's on-disk file on Atlas M0 (WiredTiger reuses freed
+space internally rather than returning it to the OS without a `compact`, which M0 disallows).
+Added `scripts/export_backtest_signals.py` + `scripts/drop_backtest_signals.py` +
+`.github/workflows/archive-and-reset-backtest-signals.yml`: archives the full collection to
+`data/backtest_signals_archive/*.parquet` and commits it first, THEN drops the collection
+entirely (the one operation that frees the file immediately) -- step ordering in the workflow
+itself (no `if: always()`) guarantees the drop never runs if the archive/commit failed.
+
 ## 2026-09-12 (cont., latest x3)
 
 **ML classifier widened from live-only signals to live + qualifying historical backtest

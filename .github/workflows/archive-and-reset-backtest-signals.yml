@@ -1,0 +1,47 @@
+name: Emergency - archive & reset backtest_signals
+
+# One-off, manual (workflow_dispatch only -- not scheduled, doesn't keep re-running) recovery
+# for the 2026-09-12 Atlas-over-quota outage. scripts/trim_backtest_signals.py --confirm
+# already ran and deleted a large fraction of backtest_signals, but Atlas STILL reported the
+# exact same "518 MB of 512 MB" afterward -- WiredTiger doesn't shrink a collection's on-disk
+# file on delete without a `compact`, which Atlas's free/shared M0 tier doesn't allow.
+# Dropping the collection is the one operation that frees the file immediately.
+#
+# Step order is the actual safety mechanism here, not just documentation: export archives
+# everything to data/backtest_signals_archive/*.parquet and commits it FIRST; the drop step
+# only runs if both prior steps succeeded (default GitHub Actions behavior -- no
+# `if: always()` here, unlike rebuild-backtests.yml's chained retrain step). If the export or
+# the git push fails, the job stops there and backtest_signals is never touched.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  archive-and-reset:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install pymongo pandas pyarrow
+      - name: Export backtest_signals to Parquet
+        run: python scripts/export_backtest_signals.py
+      - name: Commit archive
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/backtest_signals_archive/
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit -- aborting before the drop step for safety."
+            exit 1
+          fi
+          git commit -m "Archive backtest_signals before emergency reset ($(date -u +%Y-%m-%d))"
+          git push
+      - name: Drop backtest_signals collection (the actual space reclaim)
+        run: python scripts/drop_backtest_signals.py
