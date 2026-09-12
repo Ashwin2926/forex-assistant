@@ -154,6 +154,9 @@ async def ingest_backfill(interval: str, start_date: str = "2010-01-01", max_cal
         except Exception as e:
             results[pair] = {"error": str(e)}
     results["all_done"] = all(isinstance(r, dict) and r.get("done") for r in results.values())
+    results["all_reached_start_date"] = all(
+        isinstance(r, dict) and r.get("reached_start_date") for r in results.values()
+    )
     return results
 
 

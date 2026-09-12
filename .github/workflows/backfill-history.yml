@@ -55,7 +55,12 @@ jobs:
             echo "$RESPONSE"
             ALL_DONE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('all_done', False))" 2>/dev/null || echo "False")
             if [ "$ALL_DONE" = "True" ]; then
-              echo "All pairs reached $START_DATE for $INTERVAL."
+              REACHED_START=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('all_reached_start_date', False))" 2>/dev/null || echo "False")
+              if [ "$REACHED_START" = "True" ]; then
+                echo "All pairs reached $START_DATE for $INTERVAL."
+              else
+                echo "All pairs stopped before $START_DATE for $INTERVAL -- Twelve Data has no older history to give (see each pair's 'oldest' above, not a bug in this workflow)."
+              fi
               exit 0
             fi
             sleep 20

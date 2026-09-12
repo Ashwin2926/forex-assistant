@@ -166,7 +166,13 @@ async def backfill_batch(pair: str, interval: str, start_date: str, max_calls: i
     start = datetime.strptime(start_date, "%Y-%m-%d")
 
     if cursor is not None and cursor <= start:
-        return {"done": True, "calls_made": 0, "candles_stored": 0, "oldest": cursor.isoformat()}
+        return {
+            "done": True,
+            "reached_start_date": True,
+            "calls_made": 0,
+            "candles_stored": 0,
+            "oldest": cursor.isoformat(),
+        }
 
     calls_made = 0
     candles_stored = 0
@@ -193,6 +199,12 @@ async def backfill_batch(pair: str, interval: str, start_date: str, max_calls: i
 
     return {
         "done": done,
+        # "done" alone conflates two different situations: actually reaching start_date, vs.
+        # Twelve Data running out of history to give before we got there (a plan-level
+        # historical-depth limit, not "no more data exists") -- distinguishing them here so a
+        # caller can tell the difference instead of wrongly assuming full coverage back to
+        # start_date whenever done is true.
+        "reached_start_date": done and cursor is not None and cursor <= start,
         "calls_made": calls_made,
         "candles_stored": candles_stored,
         "oldest": cursor.isoformat() if cursor else None,
