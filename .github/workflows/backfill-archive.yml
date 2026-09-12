@@ -1,0 +1,49 @@
+name: Backfill candles directly to archive
+
+# Deep historical backfill that writes straight into data/candles/*.parquet, bypassing Mongo
+# entirely -- see scripts/backfill_to_archive.py's own docstring and PROGRESS.md's 2026-09-12
+# entries for why .github/workflows/backfill-history.yml's Mongo-then-export-then-trim cycle
+# was replaced for this purpose (Atlas storage growth, repeated gateway timeouts on every
+# individual page fetch). This runs as one continuous script for the whole job, so there's no
+# per-request gateway timeout at all -- a 5min backfill that needed several stuck/retried
+# attempts the old way should complete in one run here.
+#
+# backfill-history.yml (Mongo-routed) still exists and is still what live ingestion/"Sync
+# now" use for recent candles -- this workflow is only for extending the archive's deep
+# history, a separate concern.
+on:
+  workflow_dispatch:
+    inputs:
+      interval:
+        description: "Candle interval to backfill: 5min, 15min, 1h, 4h, or 1day."
+        required: true
+      start_date:
+        description: "How far back to backfill (YYYY-MM-DD)."
+        required: false
+        default: "2020-01-01"
+      max_calls_per_pair:
+        description: "Twelve Data calls per pair this run will make at most -- 400 comfortably covers a full 2020-onward 5min backfill (~350 needed) in one run, since there's no per-request timeout to work around here."
+        required: false
+        default: "400"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    env:
+      TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+      FOREX_PAIRS: ${{ secrets.FOREX_PAIRS }}
+      INTERVAL: ${{ inputs.interval }}
+      START_DATE: ${{ inputs.start_date }}
+      MAX_CALLS_PER_PAIR: ${{ inputs.max_calls_per_pair }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Backfill to archive
+        run: python scripts/backfill_to_archive.py
