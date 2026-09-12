@@ -1271,6 +1271,31 @@ async def debug_egress_check():
     return results
 
 
+@app.get("/debug/archive-check")
+async def debug_archive_check(pair: str, interval: str):
+    """
+    Diagnostic only, read-only -- proves whether THIS deployed backend can actually read the
+    committed data/candles/*.csv.gz archive files (FastAPI Cloud deploys from this same repo,
+    but that's an assumption, not something confirmed before /candles/prune-history relies on
+    it). Reports row count and min/max timestamp found in the archive file, separate from
+    whatever's in Mongo -- a row count of 0 here means either no archive file exists for this
+    pair/interval, or it exists but the deployed container doesn't actually have it on disk.
+    """
+    from app.services.candle_archive import load_archived_candles, ARCHIVE_DIR, _slug
+
+    path = ARCHIVE_DIR / f"{_slug(pair)}_{interval}.csv.gz"
+    df = load_archived_candles(pair, interval)
+    return {
+        "archive_dir": str(ARCHIVE_DIR),
+        "archive_dir_exists": ARCHIVE_DIR.exists(),
+        "expected_file": str(path),
+        "file_exists": path.exists(),
+        "rows": len(df),
+        "min_timestamp": df["timestamp"].min().isoformat() if len(df) else None,
+        "max_timestamp": df["timestamp"].max().isoformat() if len(df) else None,
+    }
+
+
 @app.get("/debug/db-stats")
 async def debug_db_stats():
     """
