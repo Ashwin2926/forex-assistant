@@ -4,6 +4,31 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-12 (cont., latest x4)
+
+**Outage: Atlas went over its 512MB quota, which crashed the app on startup entirely.**
+
+Direct cause of "training failed" turned out to be much worse than the chained-step issue
+below -- FastAPI Cloud's own crash log showed `app/main.py`'s startup handler failing:
+`init_indexes()`'s `create_index` calls are writes, and Atlas blocks ALL writes cluster-wide
+once over quota (`pymongo.errors.OperationFailure: you are over your space quota, using 518
+MB of 512 MB`). The app couldn't serve a single request, not even the public `GET /` --
+matches everything observed (508/524s, then flat timeouts once the instance gave up retrying).
+
+Root cause: the backtest rebuild (below) wrote ~90,000+ signals in one run. `POST
+/backtest/prune-history` couldn't fix this -- it keeps the 50 MOST RECENT non-RL runs, and
+today's oversized rebuild runs ARE the most recent, so that policy would've kept exactly the
+bloat. Added `scripts/trim_backtest_signals.py` + `.github/workflows/trim-backtest-signals.yml`
+instead: connects directly via pymongo (the API can't be used to fix an outage the API itself
+is suffering from) and caps every run_id's stored signals to a random sample (default
+1000/run) regardless of recency, freeing the bulk of the space while leaving
+`ml_training_data.py`'s own `$sample`-based fetch (already capped at `MAX_BACKTEST_SIGNALS`,
+see below) enough to draw from per run.
+
+Triggered by the user via the Actions tab; app restart still pending as of this entry --
+pushing this doc update to trigger FastAPI Cloud's git-triggered redeploy, since freeing
+Atlas storage doesn't itself make an already-crashed instance retry startup.
+
 ## 2026-09-12 (cont., latest x3)
 
 **ML classifier widened from live-only signals to live + qualifying historical backtest
