@@ -69,45 +69,20 @@ _ARCHIVE_COLUMNS = ["pair", "interval", "timestamp", "direction", "confidence", 
 
 def load_backtest_signals_archive() -> list[dict]:
     """
-    Reads every data/backtest_signals_archive/*.parquet file (one per pair/interval, see
-    scripts/rebuild_backtests.py) and returns a randomly capped sample across all of them
-    combined. Missing archive dir (nothing rebuilt yet) returns an empty list, not an error --
-    same "absent archive means no data yet" convention as candle_archive.load_archived_candles.
-
-    Downsamples EACH FILE immediately after reading it, before moving on to the next one --
-    confirmed live 2026-09-13: reading every file in full and only sampling AFTER
-    concatenating all of them held all ~330,000 rows across 16 files in memory
-    simultaneously and OOM-killed the whole FastAPI Cloud instance (every endpoint, not just
-    this one, since the crash takes the whole process down). Capping per-file first means
-    at most one full file plus a small set of already-capped frames is ever in memory at once.
+    EMERGENCY DISABLED as of 2026-09-13 -- returns [] unconditionally. Reading the archive
+    (even with per-file downsampling and column pruning) OOM-killed the whole FastAPI Cloud
+    instance twice in a row once rebuild-backtests.yml populated all 16 files (~330,000 rows
+    total): first reading everything before sampling, then again immediately after adding a
+    per-file cap + column restriction -- whatever headroom this deployment tier actually has
+    is smaller than expected, and repeated live experimentation to find the exact ceiling
+    risks repeatedly crashing signal generation for everyone. Disabling live-request reads
+    entirely restores service (get_ml_reference_signals falls back to live-only signals, the
+    same behavior this project had before this whole feature) while a proper fix is designed
+    offline: have scripts/rebuild_backtests.py itself build ONE small, already-capped sample
+    file during the GitHub Actions run (where memory is not a constraint) instead of asking
+    the live app to sample down 330,000 rows on every request.
     """
-    if not ARCHIVE_DIR.exists():
-        return []
-
-    valid_paths = [p for p in ARCHIVE_DIR.glob("*.parquet") if p.name in _VALID_ARCHIVE_FILENAMES]
-    if not valid_paths:
-        return []
-
-    per_file_cap = max(1, MAX_BACKTEST_SIGNALS // len(valid_paths))
-    frames = []
-    for p in valid_paths:
-        file_df = pd.read_parquet(p, columns=_ARCHIVE_COLUMNS)
-        if len(file_df) > per_file_cap:
-            file_df = file_df.sample(n=per_file_cap)
-        frames.append(file_df)
-
-    df = pd.concat(frames, ignore_index=True)
-    if len(df) > MAX_BACKTEST_SIGNALS:
-        df = df.sample(n=MAX_BACKTEST_SIGNALS)
-
-    signals = df.to_dict("records")
-    for s in signals:
-        # reasons is stored JSON-stringified (a list[dict] doesn't round-trip through Parquet
-        # as cleanly as a plain column) -- restored here so extract_features() sees the same
-        # list-of-dicts shape it gets from a live Mongo document.
-        if isinstance(s.get("reasons"), str):
-            s["reasons"] = json.loads(s["reasons"])
-    return signals
+    return []
 
 
 async def get_ml_reference_signals(signals_collection) -> list[dict]:
