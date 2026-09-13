@@ -32,8 +32,22 @@ from pathlib import Path
 import pandas as pd
 
 from app.services.case_memory import RESOLVED_STATUSES
+from app.services.ml_features import KNOWN_PAIRS, KNOWN_INTERVALS
 
 ARCHIVE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "backtest_signals_archive"
+
+# Only files matching {pair_slug}_{interval}.parquet for a known pair/interval are trusted --
+# NOT a bare "*.parquet" glob. Learned the hard way: a one-off incident-recovery export
+# (backtest_signals_2026-09-12.parquet, written by scripts/export_backtest_signals.py during
+# the 2026-09-12 outage) sat in this same directory and would otherwise have been silently
+# read back in as if it were current data -- it was actually a raw, unfiltered dump of the
+# whole old Mongo collection: stale pre-2026-09-07 EMA 12/26 signals, RL trade-log noise, and
+# the handful of genuinely-current signals all mixed together, exactly what the qualifying-
+# config design was built to keep out. A stray or manually-dropped file can't repeat that
+# once only exact expected filenames are accepted.
+_VALID_ARCHIVE_FILENAMES = {
+    f"{pair.replace('/', '_')}_{interval}.parquet" for pair in KNOWN_PAIRS for interval in KNOWN_INTERVALS
+}
 
 # Hard cap on how many archived backtest signals a single fetch returns, via a random sample
 # (not "first N" -- avoids skewing toward whichever combo happens to have the most rows, e.g.
@@ -57,7 +71,9 @@ def load_backtest_signals_archive() -> list[dict]:
     if not ARCHIVE_DIR.exists():
         return []
 
-    frames = [pd.read_parquet(p) for p in ARCHIVE_DIR.glob("*.parquet")]
+    frames = [
+        pd.read_parquet(p) for p in ARCHIVE_DIR.glob("*.parquet") if p.name in _VALID_ARCHIVE_FILENAMES
+    ]
     if not frames:
         return []
 
