@@ -61,21 +61,40 @@ _VALID_ARCHIVE_FILENAMES = {
 MAX_BACKTEST_SIGNALS = 5000
 
 
+# Only these columns are ever read from an archive file -- extract_features()/
+# train_hit_classifier() don't touch price_at_signal, target_price, outcome_*, or any of the
+# RL-sizing fields Signal also carries, so there's no reason to load them into memory at all.
+_ARCHIVE_COLUMNS = ["pair", "interval", "timestamp", "direction", "confidence", "reasons", "status", "source", "profile"]
+
+
 def load_backtest_signals_archive() -> list[dict]:
     """
     Reads every data/backtest_signals_archive/*.parquet file (one per pair/interval, see
     scripts/rebuild_backtests.py) and returns a randomly capped sample across all of them
     combined. Missing archive dir (nothing rebuilt yet) returns an empty list, not an error --
     same "absent archive means no data yet" convention as candle_archive.load_archived_candles.
+
+    Downsamples EACH FILE immediately after reading it, before moving on to the next one --
+    confirmed live 2026-09-13: reading every file in full and only sampling AFTER
+    concatenating all of them held all ~330,000 rows across 16 files in memory
+    simultaneously and OOM-killed the whole FastAPI Cloud instance (every endpoint, not just
+    this one, since the crash takes the whole process down). Capping per-file first means
+    at most one full file plus a small set of already-capped frames is ever in memory at once.
     """
     if not ARCHIVE_DIR.exists():
         return []
 
-    frames = [
-        pd.read_parquet(p) for p in ARCHIVE_DIR.glob("*.parquet") if p.name in _VALID_ARCHIVE_FILENAMES
-    ]
-    if not frames:
+    valid_paths = [p for p in ARCHIVE_DIR.glob("*.parquet") if p.name in _VALID_ARCHIVE_FILENAMES]
+    if not valid_paths:
         return []
+
+    per_file_cap = max(1, MAX_BACKTEST_SIGNALS // len(valid_paths))
+    frames = []
+    for p in valid_paths:
+        file_df = pd.read_parquet(p, columns=_ARCHIVE_COLUMNS)
+        if len(file_df) > per_file_cap:
+            file_df = file_df.sample(n=per_file_cap)
+        frames.append(file_df)
 
     df = pd.concat(frames, ignore_index=True)
     if len(df) > MAX_BACKTEST_SIGNALS:
