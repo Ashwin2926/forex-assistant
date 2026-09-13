@@ -1459,6 +1459,29 @@ async def debug_archive_check(pair: str, interval: str):
     }
 
 
+@app.get("/debug/backtest-archive-check")
+async def debug_backtest_archive_check():
+    """
+    Diagnostic only, read-only -- same purpose as /debug/archive-check but for
+    data/backtest_signals_archive/*.parquet (see app/services/ml_training_data.py). Added
+    while debugging POST /ml/train reporting train_samples_backtest=0 immediately after a
+    fresh rebuild-backtests.yml run committed 16 files -- this proves whether the deployed
+    backend can actually see them, separate from anything about the ML fetch/fit logic.
+    """
+    from app.services.ml_training_data import ARCHIVE_DIR, _VALID_ARCHIVE_FILENAMES, load_backtest_signals_archive
+
+    all_files = sorted(p.name for p in ARCHIVE_DIR.glob("*.parquet")) if ARCHIVE_DIR.exists() else []
+    valid_files = [f for f in all_files if f in _VALID_ARCHIVE_FILENAMES]
+    signals = load_backtest_signals_archive()
+    return {
+        "archive_dir": str(ARCHIVE_DIR),
+        "archive_dir_exists": ARCHIVE_DIR.exists(),
+        "all_files_found": all_files,
+        "valid_files_found": valid_files,
+        "loaded_signal_count": len(signals),
+    }
+
+
 @app.get("/debug/db-stats")
 async def debug_db_stats():
     """
