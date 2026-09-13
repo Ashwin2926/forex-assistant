@@ -57,6 +57,10 @@ jobs:
       MONGODB_URI: ${{ secrets.MONGODB_URI }}
       MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
       FOREX_PAIRS: ${{ secrets.FOREX_PAIRS }}
+      # Same API_BASE/AUTOMATION_TOKEN keep-fresh.yml and rebuild-backtests.yml already use --
+      # needed for the "Prune RL history" step below.
+      API_BASE: https://forex-assistant.fastapicloud.dev
+      AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -86,3 +90,18 @@ jobs:
             args+=(--target-atr-mult "$TARGET_ATR_MULT" --stop-atr-mult "$STOP_ATR_MULT")
           fi
           python scripts/train_rl.py "${args[@]}"
+      # Every run writes a fresh per-trade test-slice log into backtest_signals_collection
+      # for each combo it trains (confirmed live 2026-09-13: a single 20-combo sweep added
+      # ~55,000 docs / ~27MB) -- with this running unattended every day via the schedule
+      # above and nothing ever cleaning up, that compounds daily and would eventually repeat
+      # the 2026-09-12 Atlas-over-quota outage on its own, independent of anything else this
+      # project does. POST /rl/prune-history (keep_latest_n=1, its own default) already
+      # exists for exactly this -- keeps only the latest policy/eval per pair/interval and
+      # deletes the rest, so growth stays bounded to roughly "one run's worth" instead of
+      # accumulating across every day this has ever run. if: always() for the same reason
+      # rebuild-backtests.yml's chained retrain uses it -- a partial per-combo failure
+      # shouldn't block cleanup of everything that DID succeed.
+      - name: Prune RL history
+        if: always()
+        run: |
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/prune-history?confirm=true"

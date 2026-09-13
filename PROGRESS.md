@@ -4,6 +4,28 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-13
+
+**Caught a second slow-motion version of the same storage risk in RL training, before it
+became an outage this time.**
+
+First real "Train all" run since the Parquet-archive migration (job `f5ab85ec5cc5`, 20/20
+combos) confirmed PPO's own per-trade test-slice log still writes to
+`backtest_signals_collection` (unrelated to the rule-engine rebuild's data -- see
+`ppo_engine.py`'s trade-log append, a separate write path). Numbers were bigger than expected:
+one sweep added ~55,000 docs / ~27MB. `train-rl.yml` runs this exact sweep automatically every
+day via its own cron schedule (`20 0 * * *`) with nothing ever cleaning up after it -- left
+alone, that compounds daily and would have quietly recreated the 2026-09-12 Atlas-over-quota
+outage within roughly 1-2 weeks, independent of the rebuild-backtests fix.
+
+`POST /rl/prune-history` already existed for exactly this (keeps the latest policy + its
+eval's trade log per pair/interval, deletes the rest -- built during the original 2026-09-12
+storage crisis, see that entry) but nothing ever called it automatically. Added a "Prune RL
+history" step to `train-rl.yml`, chained after training with `if: always()` (same reasoning as
+`rebuild-backtests.yml`'s chained retrain -- a partial per-combo failure shouldn't block
+cleanup of what did succeed). Growth now stays bounded to roughly one run's worth between
+prunes instead of accumulating across every day this has ever run.
+
 ## 2026-09-12 (cont., latest x5)
 
 **Redesigned the ML training-data gap-fix to never touch Mongo for backtest signals at all --
