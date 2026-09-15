@@ -1,3 +1,12 @@
+# Imported first, before pandas (below) or anything that transitively imports pandas/pyarrow
+# gets a chance to -- Windows-only DLL-init-order conflict: pandas/pyarrow's bundled native
+# DLLs collide with torch's own DLL loading if pandas claims the relevant DLL slot first
+# (WinError 1114, "DLL initialization routine failed", on torch/lib/c10.dll -- reproducible:
+# `import pandas; import torch` crashes, `import torch; import pandas` doesn't). Only matters
+# for local Windows dev; FastAPI Cloud's Linux deploy has never hit this. torch is already a
+# hard dependency via ppo_engine.py -- this only controls WHEN it first loads, not whether.
+import torch  # noqa: F401
+
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
