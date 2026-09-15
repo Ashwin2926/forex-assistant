@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import type { RunAllFlowsResult } from "@/lib/types";
@@ -20,11 +20,20 @@ const POLL_MS = 3000;
 // hit with a single /rl/train call, so waiting on one synchronous response would just be a
 // bigger version of that same problem.
 export function SyncNowButton() {
-  const [loggedIn] = useState(() => !!getToken());
+  // Same pattern as AuthNav/AuthGuard: getToken() reads localStorage, which doesn't exist
+  // during server render, so a plain useState(() => !!getToken()) lazy initializer locks
+  // this to false forever (SSR renders "logged out" and the mismatch never gets corrected)
+  // -- found live: the button silently never appeared for a logged-in user. Checking inside
+  // useEffect instead defers the real check to the client, after mount.
+  const [loggedIn, setLoggedIn] = useState(false);
   const [status, setStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [summary, setSummary] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ step: string | null; completed: number; total: number } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    setLoggedIn(!!getToken());
+  }, []);
 
   if (!loggedIn) return null;
 
