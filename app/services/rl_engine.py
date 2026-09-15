@@ -22,6 +22,47 @@ DEFAULT_STARTING_BALANCE = 50.0
 MIN_VIABLE_BALANCE = 1.0  # below this, ruin -- can't size a real position, walk/episode ends
 RUIN_REWARD = -10.0  # large fixed penalty when a trade would wipe the balance out entirely
 
+# Same threshold app/main.py's /rl/signal live-exclusion gate and GET /rl/insights use to flag
+# a policy's own training-time eval as a clear losing edge, not noise -- reused here (not
+# redefined a second time in app/main.py, which now imports it from here instead) so "good
+# enough to warm-start from" and "good enough to serve live" can never silently drift apart.
+STRONG_LOSS_RETURN_PCT = -30.0
+
+
+def is_usable_warm_start(eval_run: Optional[dict]) -> bool:
+    """
+    Whether a prior policy's own training-time eval is a starting point worth continuing
+    training from, vs. giving the next run a fresh random init instead. Two independent
+    disqualifiers: converged to always-HOLD (no directional_signals at all -- continuing from
+    this just perpetuates the same stuck point, the original reason this check existed), or
+    its own eval already crossed the same STRONG_LOSS_RETURN_PCT threshold that excludes a
+    policy from live trading anyway -- continuing training from an already-catastrophic policy
+    has no particular reason to recover, and every day spent doing so is a day a genuinely
+    fresh attempt doesn't get. See PROGRESS.md's 2026-09-15 entry: GBP/USD 15min's full policy
+    lineage showed 14 straight daily warm-started generations, ALL net negative and getting
+    WORSE, after the one run that actually worked (+10.2% return) -- nothing before this ever
+    stopped a training run from continuing off a policy that had already gone bad.
+    """
+    if not eval_run or not eval_run.get("directional_signals"):
+        return False
+    return_pct = eval_run.get("total_return_pct")
+    return return_pct is None or return_pct > STRONG_LOSS_RETURN_PCT
+
+
+def should_keep_new_policy(new_return_pct: Optional[float], baseline_return_pct: float) -> bool:
+    """
+    The actual fix for the warm-start-drift pattern PROGRESS.md's 2026-09-15 entry documents:
+    a freshly trained policy only replaces the one already live if it's at least as good, by
+    the same total_return_pct this project already trusts everywhere else (the live-exclusion
+    gate, GET /rl/insights, RLTrainAllCell reporting) -- not unconditionally, which is what let
+    a single bad day's continuation permanently overwrite a policy that had been working.
+    baseline_return_pct is 0.0 (breakeven/hold) when there's no usable prior policy to compare
+    against (see is_usable_warm_start) -- a brand new policy still shouldn't go live if it
+    lost money outright. Ties keep the new policy (>=, not >) -- deliberately not stacking a
+    second, unvalidated margin requirement on top of an already-real metric.
+    """
+    return new_return_pct is None or new_return_pct >= baseline_return_pct
+
 # Names in the same order STRATEGIES itself is declared -- derived, not hand-typed, so this
 # can't drift out of sync the same way consensus.py's STRATEGY_WEIGHTS already avoids that.
 STRATEGY_NAMES = [fn.__name__.removeprefix("call_") for fn in STRATEGIES]

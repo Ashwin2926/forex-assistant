@@ -412,6 +412,12 @@ class RLTrainAllCell(BaseModel):
     starting_balance: Optional[float] = None
     ending_balance: Optional[float] = None
     total_return_pct: Optional[float] = None
+    # Whether this combo's freshly trained policy actually got persisted/went live, or was
+    # discarded for scoring worse than the policy it warm-started from (see
+    # rl_engine.should_keep_new_policy and PROGRESS.md's 2026-09-15 entry). Defaults True so
+    # job docs written before this field existed still read back as the old, unconditional
+    # behavior they actually had.
+    kept: bool = True
 
 
 class RLTrainAllJob(BaseModel):

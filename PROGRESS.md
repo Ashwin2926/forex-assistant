@@ -31,9 +31,8 @@ whatever it happened to reward, nothing pulls it back toward the earlier good op
 next day's continuation. The reward formula and ATR mults aren't the problem -- they already
 produced a working policy once.
 
-Not fixed yet -- this needs real iteration (try a from-scratch retrain cadence instead of
-always warm-starting, or an entropy/KL guard on the warm-started update) which shouldn't
-happen against prod a third time this week. By user's request:
+By user's request, paused everything training-related to investigate rather than iterate
+against prod a third time this week:
 - Cancelled the in-progress `/rl/train-all` job (`e040f85f3c27`) via its own cancel endpoint,
   stopped at 13/20 combos (USD/JPY 4h/1day and all of AUD/USD never ran). Every completed
   combo showed the same pattern: 5min/15min/GBP-1h deeply negative, 4h/1day strongly positive.
@@ -42,10 +41,28 @@ happen against prod a third time this week. By user's request:
   were the only two schedule-triggered workflows in the repo; every other workflow
   (`rebuild-backtests.yml`, the backfill/export/emergency tools) is `workflow_dispatch`-only
   and was already not running unattended.
-- Next: set up the backend to run locally (Python isn't currently installed on this
-  machine -- plan is `winget install Python.Python.3.12`, then the README's normal
-  venv/`pip install -r requirements.txt`/`uvicorn` flow) against a separate Mongo so RL
-  retrain experiments don't touch the same collections the live app and its cron jobs use.
+- Cloned the repo to `~/Downloads/GitHub/forex-assistant` (a persistent location, replacing
+  the ephemeral session-scoped scratchpad clone) to set up local dev; plan is
+  `winget install Python.Python.3.12` (not currently installed on this machine) then the
+  README's normal venv/`pip install -r requirements.txt`/`uvicorn` flow, pointed at the same
+  production MongoDB (the user's explicit choice, not a separate dev cluster).
+
+**Implemented the actual fix**, ahead of local setup since it's a pure code change (no
+training run needed to write it): warm-started PPO training now only keeps/persists a new
+policy if it scores at least as well (by `total_return_pct`) as the policy it warm-started
+from -- `rl_engine.should_keep_new_policy`, gated by a new `rl_engine.is_usable_warm_start`
+that also folds in `STRONG_LOSS_RETURN_PCT` (moved here from `main.py`, imported back rather
+than duplicated) so a policy already excluded from live trading can no longer be warm-started
+from either, closing the gap `_find_warm_start_policy`'s old check left (it only ever ruled
+out all-HOLD collapse, never "trades constantly and loses catastrophically," which is what
+actually happened here). A rejected run's summary `BacktestRun` is still persisted for
+visibility (`GET /backtest/runs`); only the heavy parts (the `PPOPolicy` itself and its
+per-signal trade log) are skipped. Applied identically in both training paths
+(`app/main.py::_run_rl_training` and `scripts/train_rl.py::run_one`, which already mirrored
+each other) and surfaced via a new `kept` field on `RLTrainAllCell`/the single-endpoint
+response. Untested against real data yet -- next real training run (once local dev is up)
+is the first live check that this actually stops the slide instead of just looking right on
+paper.
 
 ## 2026-09-13
 

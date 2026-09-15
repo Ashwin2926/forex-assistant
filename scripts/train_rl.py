@@ -35,7 +35,9 @@ from app.services.candle_archive import load_full_candle_history_sync
 from app.services.case_memory import RESOLVED_STATUSES
 from app.services.ml_training_data import load_backtest_signals_archive
 from app.services.ppo_engine import train_ppo_policy
-from app.services.rl_engine import rl_config_profile, RL_FEATURE_NAMES
+from app.services.rl_engine import (
+    rl_config_profile, RL_FEATURE_NAMES, is_usable_warm_start, should_keep_new_policy,
+)
 from app.services.signal_engine import default_config_for
 
 # Same default set app/core/config.py's Settings.forex_pairs and app/main.py's
@@ -55,17 +57,18 @@ def pairs_list() -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
-def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, bytes | None]:
-    """Mirrors app/main.py's _find_warm_start_policy exactly (same two conditions: feature
-    schema still current, prior policy's own eval wasn't a degenerate all-HOLD result) but
-    against a sync pymongo db. See that function's own docstring for the full reasoning."""
+def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, bytes | None, float]:
+    """Mirrors app/main.py's _find_warm_start_policy exactly (same is_usable_warm_start check,
+    same baseline_return_pct contract) but against a sync pymongo db. See that function's own
+    docstring for the full reasoning -- both delegate to rl_engine.is_usable_warm_start so the
+    two paths can't drift on what counts as a usable prior policy."""
     prev = db["ppo_policies"].find_one({"pair": pair, "interval": interval}, sort=[("created_at", -1)])
     if not prev or prev.get("feature_names") != RL_FEATURE_NAMES:
-        return None, None
+        return None, None, 0.0
     eval_run = db["backtest_runs"].find_one({"run_id": prev.get("eval_run_id")})
-    if not eval_run or not eval_run.get("directional_signals"):
-        return None, None
-    return prev["policy_id"], prev["model_bytes"]
+    if not is_usable_warm_start(eval_run):
+        return None, None, 0.0
+    return prev["policy_id"], prev["model_bytes"], eval_run.get("total_return_pct") or 0.0
 
 
 def get_ml_reference_signals_sync(db) -> list[dict]:
@@ -87,7 +90,12 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
     target_atr_mult/stop_atr_mult: same override _run_rl_training/POST /rl/train/{interval}
     accept -- omit (both None) to use rl_engine.rl_atr_mults(interval, pair)'s configured
     default. Lets a candidate value be swept via this (reliable, GitHub-Actions-backed) path
-    instead of the direct endpoint, which has been seen to 524 on a slow combo."""
+    instead of the direct endpoint, which has been seen to 524 on a slow combo.
+
+    Only persists the newly trained policy (letting it become "latest" for the next
+    warm-start / live serving) if rl_engine.should_keep_new_policy says it's at least as good
+    as whatever it warm-started from -- mirrors app/main.py's _run_rl_training exactly, see
+    that function's own docstring for why. Returns (policy, eval_run, kept)."""
     config = default_config_for(rl_config_profile(interval), pair)
     df = load_full_candle_history_sync(db, pair, interval)
     if df.empty:
@@ -95,7 +103,7 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
 
     ml_reference_signals = get_ml_reference_signals_sync(db)
 
-    warm_start_policy_id, warm_start_model_bytes = find_warm_start_policy(db, pair, interval)
+    warm_start_policy_id, warm_start_model_bytes, baseline_return_pct = find_warm_start_policy(db, pair, interval)
 
     policy, eval_run, trade_signals, _poc_diagnostics = train_ppo_policy(
         df, pair, interval, config, total_timesteps=total_timesteps, train_frac=train_frac,
@@ -105,11 +113,13 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
         warm_start_policy_id=warm_start_policy_id, warm_start_model_bytes=warm_start_model_bytes,
     )
 
-    if trade_signals:
-        db["backtest_signals"].insert_many([s.model_dump() for s in trade_signals])
+    kept = should_keep_new_policy(eval_run.total_return_pct, baseline_return_pct)
+    if kept:
+        if trade_signals:
+            db["backtest_signals"].insert_many([s.model_dump() for s in trade_signals])
+        db["ppo_policies"].insert_one(policy.model_dump())
     db["backtest_runs"].insert_one(eval_run.model_dump())
-    db["ppo_policies"].insert_one(policy.model_dump())
-    return policy, eval_run
+    return policy, eval_run, kept
 
 
 def main():
@@ -161,7 +171,7 @@ def main():
                 break
         print(f"Training {pair}/{interval}...")
         try:
-            policy, eval_run = run_one(
+            policy, eval_run, kept = run_one(
                 db, pair, interval, args.total_timesteps, args.train_frac, args.max_lookforward,
                 args.starting_balance, args.random_seed,
                 target_atr_mult=args.target_atr_mult, stop_atr_mult=args.stop_atr_mult,
@@ -171,9 +181,13 @@ def main():
                 "hit_rate_pct": eval_run.hit_rate_pct, "expectancy_pct": eval_run.expectancy_pct,
                 "directional_signals": eval_run.directional_signals, "hold_signals": eval_run.hold_signals,
                 "starting_balance": eval_run.starting_balance, "ending_balance": eval_run.ending_balance,
-                "total_return_pct": eval_run.total_return_pct,
+                "total_return_pct": eval_run.total_return_pct, "kept": kept,
             }
-            print(f"  ok: hit_rate={eval_run.hit_rate_pct}% expectancy={eval_run.expectancy_pct}%")
+            print(
+                f"  {'kept' if kept else 'REJECTED (worse than prior policy, not persisted)'}: "
+                f"hit_rate={eval_run.hit_rate_pct}% expectancy={eval_run.expectancy_pct}% "
+                f"return={eval_run.total_return_pct}%"
+            )
         except Exception as e:
             cell = {"pair": pair, "interval": interval, "ok": False, "error": str(e)}
             exit_code = 1

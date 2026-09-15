@@ -45,7 +45,8 @@ from app.services.ml_training_data import get_ml_reference_signals
 from app.services.rl_engine import (
     compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
-    RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES,
+    RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT,
+    is_usable_warm_start, should_keep_new_policy,
 )
 from app.services.case_memory import (
     memory_summary, memory_gate, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
@@ -1082,30 +1083,31 @@ def _rl_state_from_candles(
 RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 
-async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None, bytes | None]:
+async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None, bytes | None, float]:
     """
     Finds the most recent usable PPOPolicy for this pair/interval to continue training from,
-    or (None, None) if there isn't one. "Usable" means both:
+    or (None, None, 0.0) if there isn't one. "Usable" (rl_engine.is_usable_warm_start) means
+    both:
       1. feature_names still matches RL_FEATURE_NAMES -- same staleness guard
          choose_action_ppo already applies for live inference; a policy trained against an
          older/different state schema can't have its weights meaningfully continued.
       2. its OWN test-slice evaluation (the linked BacktestRun) shows at least one
-         directional_signals -- otherwise it's a policy that converged to always-HOLD, and
-         warm-starting from it would continue training from that same stuck point rather
-         than giving this combo a fresh random initialization's chance to find a real
-         trading policy. This is the fix for training runs landing on an all-HOLD policy
-         for some pair/interval combos (which one varies run to run -- see PROGRESS.md) --
-         skip it here rather than perpetuating it.
-    Returns (policy_id, model_bytes) on success so the caller can pass both through to
-    train_ppo_policy for warm_started_from tracking.
+         directional_signals (not converged to always-HOLD) AND didn't itself cross
+         STRONG_LOSS_RETURN_PCT (not already a catastrophic policy) -- see
+         is_usable_warm_start's own docstring for why both matter.
+    Returns (policy_id, model_bytes, baseline_return_pct) on success -- the caller passes
+    policy_id/model_bytes through to train_ppo_policy for warm_started_from tracking, and
+    baseline_return_pct (the prior policy's own total_return_pct, or 0.0/breakeven when
+    there's no usable prior policy) is what this run's own result must match or beat, see
+    rl_engine.should_keep_new_policy.
     """
     prev = await ppo_policies_collection.find_one({"pair": pair, "interval": interval}, sort=[("created_at", -1)])
     if not prev or prev.get("feature_names") != RL_FEATURE_NAMES:
-        return None, None
+        return None, None, 0.0
     eval_run = await backtest_runs_collection.find_one({"run_id": prev.get("eval_run_id")})
-    if not eval_run or not eval_run.get("directional_signals"):
-        return None, None
-    return prev["policy_id"], prev["model_bytes"]
+    if not is_usable_warm_start(eval_run):
+        return None, None, 0.0
+    return prev["policy_id"], prev["model_bytes"], eval_run.get("total_return_pct") or 0.0
 
 
 async def _run_rl_training(
@@ -1130,12 +1132,28 @@ async def _run_rl_training(
     rather than re-rolling the dice each time. Falls back to a fresh model automatically when
     there's no prior policy, its feature schema is stale, or it degenerated to always-HOLD.
 
+    Only PERSISTS the freshly trained policy (and lets it become the new "latest" for
+    _find_warm_start_policy / live /rl/signal serving) if it's at least as good as whatever it
+    started from -- see rl_engine.should_keep_new_policy. Otherwise the training-time compute
+    still happened (can't avoid that) but the result is discarded: no new PPOPolicy, no new
+    trade log, so the better prior policy stays live and stays the next warm-start source. The
+    attempt's own eval_run IS still persisted either way (a small summary doc, not the heavy
+    per-signal trade log) so a rejected run remains visible in GET /backtest/runs for review,
+    not silently vanished. This is the actual fix for the warm-start-drift pattern PROGRESS.md's
+    2026-09-15 entry documents -- previously nothing stopped a worse day's continuation from
+    permanently overwriting a policy that had been working.
+
     target_atr_mult/stop_atr_mult: explicit override passed straight through to
     train_ppo_policy/train_and_evaluate_ppo_poc -- omit (recommended) to use
     rl_engine.rl_atr_mults(interval, pair)'s configured default. Exists for sweeping a
     candidate (target, stop) pair against a high-expired-rate interval/pair (see
-    GET /rl/resolution-stats) before committing it to RL_ATR_MULT_PAIR_OVERRIDES -- this
-    still persists a real policy/eval run like any other call, it's not a dry run.
+    GET /rl/resolution-stats) before committing it to RL_ATR_MULT_PAIR_OVERRIDES -- still
+    subject to the same keep-or-discard gate as any other call, not a dry run.
+
+    Returns (policy, eval_run, poc_diagnostics, kept) -- `policy` and `poc_diagnostics` are
+    always the candidate this call just trained (even when `kept` is False, so a caller can
+    still show/log what was tried and why it didn't stick); only check `kept` to know whether
+    it's actually the one now live.
     """
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1 (exclusive).")
@@ -1155,7 +1173,7 @@ async def _run_rl_training(
     # rl_engine.frozen_ml_snapshot for why that filtering can't happen here).
     ml_reference_signals = await get_ml_reference_signals(signals_collection)
 
-    warm_start_policy_id, warm_start_model_bytes = await _find_warm_start_policy(pair, interval)
+    warm_start_policy_id, warm_start_model_bytes, baseline_return_pct = await _find_warm_start_policy(pair, interval)
 
     df = pd.DataFrame(docs)
     policy, eval_run, trade_signals, poc_diagnostics = await run_in_threadpool(
@@ -1166,14 +1184,17 @@ async def _run_rl_training(
         warm_start_policy_id=warm_start_policy_id, warm_start_model_bytes=warm_start_model_bytes,
     )
 
-    # Individual test-slice trades reuse backtest_signals_collection (same as run_backtest's
-    # own persistence) tagged with eval_run.run_id -- GET /backtest/runs/{run_id}/signals
-    # already answers "which trades passed and which failed" for free, no new endpoint.
-    if trade_signals:
-        await backtest_signals_collection.insert_many([s.model_dump() for s in trade_signals])
+    kept = should_keep_new_policy(eval_run.total_return_pct, baseline_return_pct)
+    if kept:
+        # Individual test-slice trades reuse backtest_signals_collection (same as
+        # run_backtest's own persistence) tagged with eval_run.run_id -- GET
+        # /backtest/runs/{run_id}/signals already answers "which trades passed and which
+        # failed" for free, no new endpoint.
+        if trade_signals:
+            await backtest_signals_collection.insert_many([s.model_dump() for s in trade_signals])
+        await ppo_policies_collection.insert_one(policy.model_dump())
     await backtest_runs_collection.insert_one(eval_run.model_dump())
-    await ppo_policies_collection.insert_one(policy.model_dump())
-    return policy, eval_run, poc_diagnostics
+    return policy, eval_run, poc_diagnostics, kept
 
 
 @app.post("/rl/train/{interval}")
@@ -1234,7 +1255,7 @@ async def train_rl(
     back to back.
     """
     try:
-        policy, eval_run, poc_diagnostics = await _run_rl_training(
+        policy, eval_run, poc_diagnostics, kept = await _run_rl_training(
             pair, interval, total_timesteps, train_frac, max_lookforward, starting_balance,
             random_seed=random_seed, target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult,
         )
@@ -1244,6 +1265,12 @@ async def train_rl(
         "policy": policy.model_dump(exclude={"model_bytes"}),
         "evaluation": eval_run,
         "poc_diagnostics": poc_diagnostics,
+        "kept": kept,
+        "note": None if kept else (
+            "This run's total_return_pct didn't match or beat the policy it warm-started "
+            "from, so it was NOT persisted -- the previous (better) policy is still the one "
+            "live signals and the next warm-start will use. See rl_engine.should_keep_new_policy."
+        ),
     }
 
 
@@ -2372,7 +2399,9 @@ def _half_split_verdict(
 # every per-pair/interval finding (not just the live-resolution ones) so a combo with only a
 # handful of live signals doesn't generate a confident-sounding finding off noise.
 MIN_SAMPLE_FOR_INSIGHT = 15
-STRONG_LOSS_RETURN_PCT = -30.0
+# STRONG_LOSS_RETURN_PCT now lives in rl_engine.py (imported above) -- shared with the
+# warm-start-usability/keep-or-discard gates in _find_warm_start_policy/_run_rl_training so
+# "good enough to serve live" and "good enough to train from" can't drift apart.
 STRONG_WIN_RETURN_PCT = 30.0
 STRONG_WIN_MIN_HIT_RATE_PCT = 40.0
 HIGH_SUPERSEDE_FRACTION = 0.4
