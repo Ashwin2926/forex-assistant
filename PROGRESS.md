@@ -4,6 +4,49 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-15
+
+**Diagnosed why RL kept predicting HOLD and why 5min/15min policies keep losing -- traced to
+chained daily warm-start drift, not the reward/ATR-mult tuning. Paused all GitHub cron and
+the in-progress "train all" job to move this investigation to local dev instead of prod.**
+
+The `/rl/signal` "excluded_reason" circuit breaker (already in `main.py`, forces HOLD when a
+pair/interval's latest trained policy lost badly in its own eval) was firing for EUR/USD
+5min/15min -- correctly, since the current live job (`e040f85f3c27`) really had just trained
+policies that lost ~98% of a simulated $50 account for both. That part of the system worked
+as designed; the real question was why training keeps landing there.
+
+Pulled GBP/USD 15min's full policy lineage (`GET /rl/policies?pair=GBP/USD&interval=15min`,
+20 generations back to 2026-09-10) to check. One generation (`966ab8b60e12`, 2026-09-11
+14:46) actually worked -- 60.4% hit rate, +10.2% return, the exact run
+`RL_ATR_MULT_PAIR_OVERRIDES`'s `(1.0, 0.667)` override for this pair/interval was adopted
+from. Every one of the 14 generations warm-started from it since (`train_ppo_policy`/
+`scripts/train_rl.py` always continue from the prior day's weights via
+`_find_warm_start_policy`) has been net negative, and getting worse over time -- from -9%
+right after, to -98% by today. That's a consistent random walk downhill across 4+ days of
+daily chained retraining, not noise around a stable point. Working theory: PPO's `ent_coef`
+is left at stable-baselines3's default of `0.0` (no exploration bonus), so once a given
+day's noisy 50,000-step fine-tune on a shifted train/test window sharpens the policy toward
+whatever it happened to reward, nothing pulls it back toward the earlier good optimum on the
+next day's continuation. The reward formula and ATR mults aren't the problem -- they already
+produced a working policy once.
+
+Not fixed yet -- this needs real iteration (try a from-scratch retrain cadence instead of
+always warm-starting, or an entropy/KL guard on the warm-started update) which shouldn't
+happen against prod a third time this week. By user's request:
+- Cancelled the in-progress `/rl/train-all` job (`e040f85f3c27`) via its own cancel endpoint,
+  stopped at 13/20 combos (USD/JPY 4h/1day and all of AUD/USD never ran). Every completed
+  combo showed the same pattern: 5min/15min/GBP-1h deeply negative, 4h/1day strongly positive.
+- Disabled the `train-rl.yml` and `keep-fresh.yml` cron schedules (GitHub's workflow-disable
+  API, reversible via the matching enable call -- no file changes, no commit needed). These
+  were the only two schedule-triggered workflows in the repo; every other workflow
+  (`rebuild-backtests.yml`, the backfill/export/emergency tools) is `workflow_dispatch`-only
+  and was already not running unattended.
+- Next: set up the backend to run locally (Python isn't currently installed on this
+  machine -- plan is `winget install Python.Python.3.12`, then the README's normal
+  venv/`pip install -r requirements.txt`/`uvicorn` flow) against a separate Mongo so RL
+  retrain experiments don't touch the same collections the live app and its cron jobs use.
+
 ## 2026-09-13
 
 **Caught a second slow-motion version of the same storage risk in RL training, before it
