@@ -26,6 +26,13 @@ import os
 import sys
 from datetime import datetime
 
+# Imported before pandas (below) or anything that transitively imports pandas/pyarrow gets a
+# chance to -- Windows-only DLL-init-order conflict, same one app/main.py's own top-of-file
+# comment documents (WinError 1114 loading torch/lib/c10.dll if pandas claims the relevant DLL
+# slot first). Only matters when this script runs on a local Windows dev machine; the GitHub
+# Actions runner it's normally meant for is Linux and has never hit this.
+import torch  # noqa: F401
+
 import pandas as pd
 from pymongo import MongoClient
 
