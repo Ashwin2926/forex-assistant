@@ -21,33 +21,22 @@ class Candle(BaseModel):
 
 class RuleConfig(BaseModel):
     """
-    Every tunable threshold in the rule engine, in one place, so a parameter sweep
-    can vary them and compare backtested hit-rate without touching code. Defaults
-    match the original hardcoded values.
+    EMA/RSI/MACD/ATR periods and ATR-based target/stop multiples, read by the SMC strategy
+    functions (app/services/strategies.py, for EMA trend context) and indicators.py (to
+    compute the indicator columns main.py's chart endpoint and rl_engine's RSI feature read).
+    The old rule engine's vote-threshold and session-gate fields (rsi_oversold/overbought,
+    volatility_threshold_pct, session_filter_*) were removed with that engine -- see
+    PROGRESS.md's rule-engine-removal entry -- since nothing reads them anymore.
     """
     ema_fast: int = 50
     ema_slow: int = 200
     rsi_period: int = 14
-    rsi_oversold: float = 30
-    rsi_overbought: float = 70
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
     atr_period: int = 14
-    volatility_threshold_pct: float = 0.02  # ATR as % of price; below this, market is considered too quiet
 
-    # Session-awareness (intraday only) — outside the window, force HOLD regardless of
-    # votes. Default window is the London/NY overlap (12:00-16:00 UTC), the highest-liquidity
-    # stretch for majors; Asian-session hours tend to be too quiet for intraday setups.
-    session_filter_enabled: bool = False
-    session_start_hour_utc: int = 12
-    session_end_hour_utc: int = 16
-
-    # Target/stop distance as a multiple of ATR(14) at signal time. Part of RuleConfig (not
-    # a separate endpoint param) specifically so /backtest/optimize can search it alongside
-    # everything else — the breakeven hit-rate is stop/(target+stop), so these two numbers
-    # determine how good a hit-rate actually needs to be before a config can be profitable,
-    # not just "right often."
+    # Target/stop distance as a multiple of ATR(14) at signal time.
     target_atr_mult: float = 1.5
     stop_atr_mult: float = 1.0
 
@@ -148,6 +137,14 @@ class ConsensusSignal(BaseModel):
     target_price: float
     stop_price: float
     agreeing_count: int
+    # Weighted agreement strength (0-100), same shape/scale as the retired rule engine's
+    # Signal.confidence -- see consensus.direction_confidence. Used as an ML feature
+    # (ml_features.extract_features) the same way Signal.confidence was.
+    confidence: float = 0.0
+    # ATR as a % of entry_price at signal time -- the retired rule engine carried this via a
+    # "volatility_filter" SignalReason; ConsensusSignal has no reasons field of its own, so it
+    # gets a real field instead. Used as an ML feature the same way.
+    atr_pct: float = 0.0
     strategy_calls: list[StrategyCall]  # all 5, so disagreement is visible too, not just the winners
 
     status: Literal["pending", "hit", "miss", "expired"] = "pending"
@@ -158,6 +155,11 @@ class ConsensusSignal(BaseModel):
 
     source: Literal["live", "backtest"] = "live"
     run_id: Optional[str] = None
+
+    # Set by the ML quality gate (main.py's create_consensus_signal) -- same role
+    # Signal.ml_hit_probability/ml_override used to play for the retired rule engine.
+    ml_hit_probability: Optional[float] = None
+    ml_override: Optional[str] = None
 
 
 class RuleStat(BaseModel):

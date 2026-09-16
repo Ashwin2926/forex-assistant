@@ -68,13 +68,19 @@ export default function RunDetail({ runId }: { runId: string }) {
 
       <section>
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-          Rule performance — which rules earn their vote
+          Strategy performance — which SMC strategies earn their vote
         </h2>
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          For a consensus run, each row is one of the 5 SMC strategies (market_structure,
+          order_blocks, fair_value_gap, liquidity_sweep, supply_demand) — &quot;agreed&quot; counts how
+          often it matched the eventual consensus direction, and &quot;hit rate when agreed&quot; shows
+          which strategies actually pull their weight.
+        </p>
         <div className="mt-3 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
           <table className="w-full text-left text-sm">
             <thead className="table-head text-xs uppercase">
               <tr>
-                <th className="px-4 py-2">Rule</th>
+                <th className="px-4 py-2">Strategy</th>
                 <th className="px-4 py-2">Fired</th>
                 <th className="px-4 py-2">Agreed with direction</th>
                 <th className="px-4 py-2">Hit rate when agreed</th>

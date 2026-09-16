@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.services.candle_archive import load_full_candle_history_sync
 from app.services.case_memory import RESOLVED_STATUSES
 from app.services.ml_training_data import load_backtest_signals_archive
+from app.services.ml_features import is_current_smc_signal
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import (
     rl_config_profile, RL_FEATURE_NAMES, is_usable_warm_start, should_keep_new_policy,
@@ -80,10 +81,12 @@ def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, by
 
 def get_ml_reference_signals_sync(db) -> list[dict]:
     """Mirrors app/services/ml_training_data.py's async get_ml_reference_signals exactly (live
-    signals from Mongo, unioned with backtest signals from the Parquet archive) but against a
-    sync pymongo db for the live-signal half -- load_backtest_signals_archive itself needs no
-    sync/async split at all, since it's pure local file I/O."""
-    live_signals = list(db["signals"].find({"source": "live", "status": {"$in": list(RESOLVED_STATUSES)}}))
+    consensus signals from Mongo, unioned with backtest signals from the Parquet archive) but
+    against a sync pymongo db for the live-signal half -- load_backtest_signals_archive itself
+    needs no sync/async split at all, since it's pure local file I/O. consensus_signals, not
+    the retired rule engine's signals collection -- see PROGRESS.md's rule-engine-removal entry."""
+    live_signals = list(db["consensus_signals"].find({"source": "live", "status": {"$in": list(RESOLVED_STATUSES)}}))
+    live_signals = [s for s in live_signals if is_current_smc_signal(s)]
     return live_signals + load_backtest_signals_archive()
 
 

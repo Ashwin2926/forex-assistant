@@ -15,7 +15,7 @@ import {
   YAxis,
 } from "recharts";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type CandlePoint, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type CandlePoint, type ConsensusSignal } from "@/lib/types";
 
 // Validated against the dataviz skill's CVD/contrast checks (light + dark):
 // node scripts/validate_palette.js "#2a78d6,#eb6834,#10b981,#e34948" --mode light  -> PASS
@@ -63,7 +63,7 @@ export default function ChartPage() {
   const [interval, setInterval_] = useState<string>("1h");
 
   const [candles, setCandles] = useState<CandlePoint[]>([]);
-  const [signals, setSignals] = useState<Signal[]>([]);
+  const [signals, setSignals] = useState<ConsensusSignal[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -73,10 +73,10 @@ export default function ChartPage() {
     try {
       const [candleData, signalData] = await Promise.all([
         api.getCandles(pair, interval, "intraday", 250),
-        api.listSignals({ pair, limit: 300 }),
+        api.listConsensusSignals({ pair, limit: 300 }),
       ]);
       setCandles(candleData);
-      setSignals(signalData.filter((s) => s.interval === interval && s.direction !== "HOLD"));
+      setSignals(signalData.filter((s) => s.interval === interval));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load chart data. Is the API running?");
       setCandles([]);
@@ -94,7 +94,7 @@ export default function ChartPage() {
   // Merge signal markers onto the candle series by nearest timestamp, so Scatter can
   // plot them on the same x-axis as the price line without a separate axis.
   const chartData = useMemo(() => {
-    const signalByTs = new Map<string, Signal>();
+    const signalByTs = new Map<string, ConsensusSignal>();
     for (const s of signals) {
       const nearest = candles.reduce((best, c) => {
         const d = Math.abs(new Date(c.timestamp).getTime() - new Date(s.timestamp).getTime());
@@ -148,7 +148,7 @@ export default function ChartPage() {
         </p>
       )}
       {!error && !loading && chartData.length === 0 && (
-        <p className="text-sm text-zinc-500">No candle data. Ingest some first from the Signal Feed page.</p>
+        <p className="text-sm text-zinc-500">No candle data. Ingest some first from the Trading Signals page.</p>
       )}
 
       {chartData.length > 0 && (

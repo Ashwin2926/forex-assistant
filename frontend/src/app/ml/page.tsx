@@ -170,11 +170,11 @@ export default function MLPage() {
   }
 
   const sortedPredictGrid = [...predictGrid].sort((a, b) => {
-    const aDirectional = a.prediction && a.prediction.direction !== "HOLD" ? 1 : 0;
-    const bDirectional = b.prediction && b.prediction.direction !== "HOLD" ? 1 : 0;
+    const aDirectional = a.prediction?.consensus != null ? 1 : 0;
+    const bDirectional = b.prediction?.consensus != null ? 1 : 0;
     if (aDirectional !== bDirectional) return bDirectional - aDirectional;
-    const aProb = a.prediction?.ml_hit_probability ?? -1;
-    const bProb = b.prediction?.ml_hit_probability ?? -1;
+    const aProb = a.prediction?.consensus?.ml_hit_probability ?? -1;
+    const bProb = b.prediction?.consensus?.ml_hit_probability ?? -1;
     return bProb - aProb;
   });
 
@@ -213,12 +213,12 @@ export default function MLPage() {
           </div>
         </div>
         <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Re-runs the rule engine against the full historical archive with today&apos;s live default
-          config, on a GitHub Actions runner (a deep 5min/15min backtest is too slow for FastAPI
-          Cloud&apos;s own gateway timeout) — this is what feeds the classifier historical examples
-          beyond just live signals. Only backtest runs matching today&apos;s exact default config
-          count, so re-run this whenever that default changes. Retrains the model automatically
-          once done.
+          Re-runs the SMC consensus backtest against the full historical archive with today&apos;s
+          live default config, on a GitHub Actions runner (a deep 5min/15min backtest is too slow
+          for FastAPI Cloud&apos;s own gateway timeout) — this is what feeds the classifier
+          historical examples beyond just live signals. Only backtest runs matching today&apos;s
+          exact default config count, so re-run this whenever that default changes. Retrains the
+          model automatically once done.
         </p>
         {rebuildStartError && (
           <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
@@ -363,21 +363,25 @@ export default function MLPage() {
             {predictError}
           </p>
         )}
-        {prediction && (
+        {prediction && !prediction.consensus && (
+          <p className="mt-4 text-sm text-zinc-500 dark:text-zinc-400">
+            No consensus right now — that&apos;s the common case, not an error. Try a different
+            pair/interval or check back later.
+          </p>
+        )}
+        {prediction?.consensus && (
           <div className="mt-4 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <p className="text-lg font-semibold">
-              {prediction.direction}
-              {prediction.direction !== "HOLD" && ` at ${prediction.price_at_signal.toFixed(5)}`}
+              {prediction.consensus.direction} at {prediction.consensus.entry_price.toFixed(5)}
             </p>
-            {prediction.target_price != null && prediction.stop_price != null && (
-              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                Target {prediction.target_price.toFixed(5)} · Stop {prediction.stop_price.toFixed(5)}
-              </p>
-            )}
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+              Target {prediction.consensus.target_price.toFixed(5)} · Stop {prediction.consensus.stop_price.toFixed(5)}
+              {" · "}confidence {prediction.consensus.confidence}%
+            </p>
             <p className="mt-2 text-sm">
               ML hit probability:{" "}
-              {prediction.ml_hit_probability != null ? (
-                <span className="font-semibold">{(prediction.ml_hit_probability * 100).toFixed(1)}%</span>
+              {prediction.consensus.ml_hit_probability != null ? (
+                <span className="font-semibold">{(prediction.consensus.ml_hit_probability * 100).toFixed(1)}%</span>
               ) : (
                 <span className="text-zinc-400">not enough resolved data yet</span>
               )}
@@ -413,27 +417,28 @@ export default function MLPage() {
                 <tbody>
                   {sortedPredictGrid.map((cell) => {
                     const key = `${cell.pair}-${cell.interval}`;
-                    const p = cell.prediction;
-                    const directional = p && p.direction !== "HOLD";
+                    const c = cell.prediction?.consensus ?? null;
                     return (
                       <tr
                         key={key}
-                        className={`border-t border-zinc-100 dark:border-zinc-800 ${directional ? (p!.direction === "BUY" ? "bg-emerald-50 dark:bg-emerald-950" : "bg-rose-50 dark:bg-rose-950") : ""}`}
+                        className={`border-t border-zinc-100 dark:border-zinc-800 ${c ? (c.direction === "BUY" ? "bg-emerald-50 dark:bg-emerald-950" : "bg-rose-50 dark:bg-rose-950") : ""}`}
                       >
                         <td className="px-3 py-1.5 font-mono">{cell.pair}</td>
                         <td className="px-3 py-1.5 font-mono">{cell.interval}</td>
                         {cell.error ? (
                           <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>{cell.error}</td>
+                        ) : !c ? (
+                          <td className="px-3 py-1.5 text-zinc-400" colSpan={5}>no consensus</td>
                         ) : (
                           <>
-                            <td className={`px-3 py-1.5 font-semibold ${p!.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : p!.direction === "SELL" ? "text-rose-600 dark:text-rose-400" : "text-zinc-400"}`}>
-                              {p!.direction}
+                            <td className={`px-3 py-1.5 font-semibold ${c.direction === "BUY" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                              {c.direction}
                             </td>
-                            <td className="px-3 py-1.5">{directional ? p!.price_at_signal.toFixed(5) : "—"}</td>
-                            <td className="px-3 py-1.5">{p!.target_price != null ? p!.target_price.toFixed(5) : "—"}</td>
-                            <td className="px-3 py-1.5">{p!.stop_price != null ? p!.stop_price.toFixed(5) : "—"}</td>
+                            <td className="px-3 py-1.5">{c.entry_price.toFixed(5)}</td>
+                            <td className="px-3 py-1.5">{c.target_price.toFixed(5)}</td>
+                            <td className="px-3 py-1.5">{c.stop_price.toFixed(5)}</td>
                             <td className="px-3 py-1.5">
-                              {p!.ml_hit_probability != null ? `${(p!.ml_hit_probability * 100).toFixed(1)}%` : "—"}
+                              {c.ml_hit_probability != null ? `${(c.ml_hit_probability * 100).toFixed(1)}%` : "—"}
                             </td>
                           </>
                         )}

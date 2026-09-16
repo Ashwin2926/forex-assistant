@@ -1,5 +1,5 @@
 """
-Standalone rule-engine backtest runner, run directly on a GitHub Actions runner instead of
+Standalone SMC consensus backtest runner, run directly on a GitHub Actions runner instead of
 inside the FastAPI Cloud process -- same reasoning as scripts/train_rl.py (see that file's
 own docstring and PROGRESS.md's 2026-09-10 entry): a deep-archive-backed backtest on a
 5min/15min combo replays hundreds of thousands of candles, and looping that per-request
@@ -7,12 +7,15 @@ against FastAPI Cloud's ~125s gateway timeout has already caused documented fail
 similarly slow endpoints (see PROGRESS.md's 2026-09-12 storage-crisis/candle-archive entries).
 Doing it here removes that timeout entirely.
 
-Why this script exists (separate from just calling POST /backtest per combo): the ML
-classifier's training data (see app/services/ml_training_data.py) needs a large pool of
+Runs run_consensus_backtest (app/services/backtester.py), NOT the retired rule engine's
+run_backtest -- see PROGRESS.md's rule-engine-removal migration entry. Every decision surface
+in this project (live signals, ML training data, RL's ml_hit_probability) now runs on SMC
+consensus + ML + RL only.
+
+Why this script exists (separate from just calling POST /consensus/backtest per combo): the
+ML classifier's training data (see app/services/ml_training_data.py) needs a large pool of
 resolved signals generated under today's live default config -- deliberately, so the
-classifier never learns from a superseded ruleset. Checked live on 2026-09-12: every backtest
-run that existed before this script did predates the 2026-09-07 EMA 9/21 default (they used
-the older EMA 12/26), so none of them were usable. This script re-runs the CURRENT default
+classifier never learns from a superseded ruleset. This script re-runs the CURRENT default
 config across the full archive for every pair/interval, producing fresh training data. Re-run
 it any time PROFILE_DEFAULTS["intraday"] changes, for the same reason.
 
@@ -45,7 +48,7 @@ from pymongo import MongoClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.backtester import run_backtest
+from app.services.backtester import run_consensus_backtest
 from app.services.candle_archive import load_full_candle_history_sync
 from app.services.signal_engine import default_config_for
 
@@ -66,13 +69,14 @@ def pairs_list() -> list[str]:
 
 def _write_signals_parquet(pair: str, interval: str, signals: list) -> None:
     """Overwrites data/backtest_signals_archive/{pair}_{interval}.parquet with this run's
-    signals -- see module docstring for why overwrite, not merge. reasons is JSON-stringified
-    (a list[dict] doesn't round-trip through Parquet as cleanly as a plain column);
+    ConsensusSignals -- see module docstring for why overwrite, not merge. strategy_calls
+    (a list[dict], each with its own nested reasons list) is JSON-stringified -- doesn't
+    round-trip through Parquet as cleanly as a plain column;
     ml_training_data.load_backtest_signals_archive() restores it on read."""
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     rows = [s.model_dump() for s in signals]
     for r in rows:
-        r["reasons"] = json.dumps(r["reasons"], default=str)
+        r["strategy_calls"] = json.dumps(r["strategy_calls"], default=str)
     df = pd.DataFrame(rows)
     slug = pair.replace("/", "_")
     df.to_parquet(ARCHIVE_DIR / f"{slug}_{interval}.parquet", compression="brotli", index=False)
@@ -87,7 +91,7 @@ def run_one(db, pair: str, interval: str, max_lookforward: int) -> tuple[int, in
     if df.empty:
         raise ValueError(f"No candle history for {pair}/{interval}.")
 
-    run, signals = run_backtest(df, pair, interval, PROFILE, config=config, max_lookforward=max_lookforward)
+    run, signals = run_consensus_backtest(df, pair, interval, config=config, max_lookforward=max_lookforward)
 
     if signals:
         _write_signals_parquet(pair, interval, signals)

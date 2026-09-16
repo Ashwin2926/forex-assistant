@@ -4,8 +4,9 @@ from typing import Optional
 from xgboost import XGBClassifier
 from app.models.schemas import RuleConfig
 from app.services.indicators import add_all_indicators
-from app.services.signal_engine import compute_atr_target_stop, label_outcome, spread_cost_pct, apply_rules
-from app.services.strategies import STRATEGIES
+from app.services.signal_engine import compute_atr_target_stop, label_outcome, spread_cost_pct
+from app.services.strategies import STRATEGIES, STRATEGY_NAMES
+from app.services.consensus import direction_confidence
 from app.services.ml_features import signal_like_features, FEATURE_NAMES as ML_FEATURE_NAMES
 from app.services.ml_model import fit_hit_classifier
 
@@ -63,9 +64,8 @@ def should_keep_new_policy(new_return_pct: Optional[float], baseline_return_pct:
     """
     return new_return_pct is None or new_return_pct >= baseline_return_pct
 
-# Names in the same order STRATEGIES itself is declared -- derived, not hand-typed, so this
-# can't drift out of sync the same way consensus.py's STRATEGY_WEIGHTS already avoids that.
-STRATEGY_NAMES = [fn.__name__.removeprefix("call_") for fn in STRATEGIES]
+# STRATEGY_NAMES itself now lives in strategies.py (imported above) -- shared with
+# ml_features.py's ML feature names too, so neither can drift out of sync with STRATEGIES.
 
 # The market-only state -- precomputable once per bar, independent of the policy or any
 # balance (see compute_strategy_vote_states). balance_log_ratio is appended separately per
@@ -325,32 +325,24 @@ def compute_strategy_vote_states(indicator_df: pd.DataFrame, config: RuleConfig)
 
 
 def compute_ml_scores(
-    indicator_df: pd.DataFrame, config: RuleConfig, pair: str, interval: str, profile: str,
+    indicator_df: pd.DataFrame, config: RuleConfig, pair: str, interval: str,
     model: Optional[XGBClassifier],
 ) -> list[tuple[float, float]]:
     """
     One (ml_hit_probability_buy, ml_hit_probability_sell) pair per bar -- see
-    RL_MARKET_FEATURE_NAMES's own comment for why this exists. Computed via
-    signal_engine.apply_rules directly against the already-computed indicator_df, NOT
-    signal_engine.generate_signal (which calls add_all_indicators internally -- a full-
-    dataframe recompute on EVERY call; doing that once per bar here would be O(n^2) across
-    this module's own training-loop caller, the exact anti-pattern compute_strategy_vote_states'
-    own docstring warns against). apply_rules alone is cheap, pure row arithmetic.
+    RL_MARKET_FEATURE_NAMES's own comment for why this exists. Computed via the same 5 SMC
+    STRATEGIES calls compute_strategy_vote_states makes per bar (not signal_engine's retired
+    rule engine) directly against the already-computed indicator_df -- recomputed here rather
+    than shared with compute_strategy_vote_states's own per-bar loop (a possible future
+    optimization) since the two functions are called independently by this module's callers.
 
-    model=None (not enough resolved rule-based signals yet to fit a classifier, or this
-    training run's train slice starts before enough of them existed) -> (0.5, 0.5) neutral
-    placeholder for every bar -- every other state feature is always a real number, and 0.5
-    is the honest "no information" value for a probability, not a fabricated confident one.
+    model=None (not enough resolved signals yet to fit a classifier, or this training run's
+    train slice starts before enough of them existed) -> (0.5, 0.5) neutral placeholder for
+    every bar -- every other state feature is always a real number, and 0.5 is the honest "no
+    information" value for a probability, not a fabricated confident one.
 
     Bars before max(config.ema_slow, MIN_WARMUP_BARS)'s warmup threshold also get the neutral
-    placeholder rather than a real apply_rules call: unlike compute_strategy_vote_states'
-    STRATEGIES (which guard their own NaN indicator reads, see e.g. atr_pct's `if pd.notna`
-    checks there), apply_rules was only ever written to run on an already-warmed-up bar --
-    every existing caller (generate_signal, live inference) checks a warmup floor first. Bars
-    this early have NaN EMA/RSI/ADX/etc. values, which would otherwise flow through as NaN
-    features straight into XGBClassifier.predict_proba -- XGBoost tolerates NaN inputs
-    natively, but a NaN-laden warmup bar still isn't a meaningful read to hand the model, real
-    tolerance or not. The RL training path's own episode/eval loops never visit these bars as
+    placeholder -- the RL training path's own episode/eval loops never visit these bars as
     decision points anyway (they start from that same min_warmup), so this isn't losing any
     real information -- these bars were always going to be placeholder-only.
 
@@ -364,10 +356,9 @@ def compute_ml_scores(
     predict_proba is called ONCE on a batched matrix of every warmed-up bar's features (twice
     total -- once for BUY, once for SELL), not once per bar. Calling it n times in a Python
     loop is what actually caused a live 524 gateway timeout on EUR/USD 5min (thousands of
-    individual tiny sklearn calls, each paying real per-call overhead) even after the NaN
-    crash above was fixed -- apply_rules itself (plain per-row Python arithmetic) stays a
-    per-bar loop since it can't be vectorized the same way, but there's no reason the
-    classifier call has to be.
+    individual tiny sklearn calls, each paying real per-call overhead) -- the per-bar STRATEGIES
+    calls themselves stay a per-bar loop since they can't be vectorized the same way, but
+    there's no reason the classifier call has to be.
     """
     n = len(indicator_df)
     if model is None:
@@ -379,17 +370,13 @@ def compute_ml_scores(
     buy_matrix: list[list[float]] = []
     sell_matrix: list[list[float]] = []
     for i in warm_indices:
+        window_start = max(0, i + 1 - STATE_WINDOW_BARS)
+        window = indicator_df.iloc[window_start: i + 1]
+        calls = [fn(window, config) for fn in STRATEGIES]
         latest = indicator_df.iloc[i]
-        prev = indicator_df.iloc[i - 1]
-        reasons, _bullish_votes, _bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(
-            latest, prev, config,
-        )
-        buy_features = signal_like_features(
-            reasons, rule_votes, rule_strengths, total_rules, profile, "BUY", pair, interval,
-        )
-        sell_features = signal_like_features(
-            reasons, rule_votes, rule_strengths, total_rules, profile, "SELL", pair, interval,
-        )
+        atr_pct = float(latest["atr"] / latest["close"] * 100) if pd.notna(latest["atr"]) and latest["close"] else 0.0
+        buy_features = signal_like_features(calls, direction_confidence(calls, "BUY"), atr_pct, "BUY", pair, interval)
+        sell_features = signal_like_features(calls, direction_confidence(calls, "SELL"), atr_pct, "SELL", pair, interval)
         buy_matrix.append([buy_features[name] for name in ML_FEATURE_NAMES])
         sell_matrix.append([sell_features[name] for name in ML_FEATURE_NAMES])
 

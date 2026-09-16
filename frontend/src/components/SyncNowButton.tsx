@@ -80,7 +80,7 @@ export function SyncNowButton() {
       <button
         onClick={handleClick}
         disabled={status === "running"}
-        title="Manually runs one full cron cycle (ingest, generate signals, score, retrain ML) right now -- use this when the cron hasn't run in a while instead of waiting on it."
+        title="Manually runs one full cron cycle (ingest, retrain RL, check consensus, generate RL signals, score, retrain ML) right now -- use this when the cron hasn't run in a while instead of waiting on it."
         className="rounded-md border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
       >
         {status === "running"
@@ -106,6 +106,6 @@ function summarize(results: RunAllFlowsResult): string {
   const countErrors = (obj: Record<string, unknown>) =>
     Object.values(obj ?? {}).filter((v) => typeof v === "string" && v.startsWith("error:")).length;
   const errors =
-    countErrors(results.rl_training) + countErrors(results.signals) + countErrors(results.consensus) + countErrors(results.rl_signals);
+    countErrors(results.rl_training) + countErrors(results.consensus) + countErrors(results.rl_signals);
   return errors > 0 ? `Done, ${errors} step(s) had errors -- see /ops/run-all-flows for detail.` : "Done -- all steps ok.";
 }

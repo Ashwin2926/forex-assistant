@@ -61,6 +61,11 @@ export interface ConsensusSignal {
   target_price: number;
   stop_price: number;
   agreeing_count: number;
+  // Weighted agreement strength (0-100), same shape/scale the retired rule engine's
+  // Signal.confidence used -- see consensus.direction_confidence.
+  confidence: number;
+  // ATR as a % of entry_price at signal time.
+  atr_pct: number;
   strategy_calls: StrategyCall[];
   status: SignalStatus;
   outcome_price?: number | null;
@@ -69,6 +74,9 @@ export interface ConsensusSignal {
   candles_to_outcome?: number | null;
   source: SignalSource;
   run_id?: string | null;
+  // Set by the ML quality gate (main.py's create_consensus_signal).
+  ml_hit_probability?: number | null;
+  ml_override?: string | null;
 }
 
 export interface ConsensusCheckResult {
@@ -76,20 +84,19 @@ export interface ConsensusCheckResult {
   strategy_calls: StrategyCall[];
 }
 
+// EMA/RSI/MACD/ATR periods and ATR target/stop multiples the SMC strategies and
+// indicators.py still read off this model -- see app/models/schemas.py's RuleConfig. Not a
+// tunable ruleset anymore (the rule engine's own vote-threshold/session-gate fields were
+// removed with it, see PROGRESS.md's rule-engine-removal entry) -- only present here because
+// BacktestRun.rule_config still carries it for reference.
 export interface RuleConfig {
   ema_fast: number;
   ema_slow: number;
   rsi_period: number;
-  rsi_oversold: number;
-  rsi_overbought: number;
   macd_fast: number;
   macd_slow: number;
   macd_signal: number;
   atr_period: number;
-  volatility_threshold_pct: number;
-  session_filter_enabled: boolean;
-  session_start_hour_utc: number;
-  session_end_hour_utc: number;
   target_atr_mult: number;
   stop_atr_mult: number;
 }
@@ -323,25 +330,13 @@ export interface RLMemorySummary {
   policy_decided_trades: number;
 }
 
-// Signal's normal fields plus the ML classifier's advisory hit probability -- returned by
-// POST /ml/predict/{interval}/{profile}, which does NOT insert into the signals collection.
-export type MLPrediction = Signal & { ml_hit_probability: number | null };
-
-export type OptimizeRankBy = "expectancy" | "hit_rate";
-
-export interface OptimizeCandidate {
-  config: RuleConfig;
-  hit_rate_pct: number | null;
-  expectancy_pct: number | null;
-  directional_signals: number;
-}
-
-export interface OptimizeResult {
-  winning_config: RuleConfig;
-  rank_by: OptimizeRankBy;
-  train: BacktestRun;
-  test: BacktestRun;
-  candidates_evaluated: OptimizeCandidate[];
+// Returned by POST /ml/predict/{interval}/{profile} -- generates a fresh SMC consensus
+// signal the same way POST /consensus/{interval} does, with ml_hit_probability attached, but
+// does NOT insert into consensus_signals_collection (purely advisory). consensus is null
+// when nothing cleared the weighted-majority bar this bar -- the common case, not an error.
+export interface MLPrediction {
+  consensus: ConsensusSignal | null;
+  strategy_calls: StrategyCall[];
 }
 
 export interface ConsensusBacktestResult {
@@ -473,25 +468,6 @@ export interface RLInsights {
   findings: RLInsightFinding[];
 }
 
-export interface SignalAccuracy {
-  pair: string | null;
-  profile: Profile | null;
-  // Rolling window, capped at the request's `limit` (default 100) -- plateaus there, not a running total.
-  sample_size: number;
-  hits: number;
-  misses: number;
-  expired: number;
-  hit_rate_pct: number | null;
-  // Real uncapped counts/rate across every resolved live signal matching the same filter.
-  total_resolved: number;
-  total_hits: number;
-  total_misses: number;
-  total_expired: number;
-  total_hit_rate_pct: number | null;
-  // see RLAccuracy.directional_hit_rate_pct -- same reasoning, excludes "expired" from the denominator.
-  directional_hit_rate_pct: number | null;
-}
-
 // Results section of a finished RunAllFlowsJob -- the manual "catch up now" job, for when
 // the GitHub Actions cron has gone quiet for a while. Loosely typed on purpose: each
 // section's per-key value is either "ok", an "error: ..." string, or (for ingest/score/
@@ -504,10 +480,9 @@ export interface RunAllFlowsResult {
   // like the other sections -- retraining is worth surfacing hit_rate_pct/total_return_pct
   // inline, not just pass/fail).
   rl_training: Record<string, string | { policy_id: string; hit_rate_pct: number | null; total_return_pct: number | null }>;
-  signals: Record<string, string>;
   consensus: Record<string, string>;
   rl_signals: Record<string, string>;
-  score: { signals?: unknown; consensus?: unknown; rl?: unknown };
+  score: { consensus?: unknown; rl?: unknown };
   ml_train: unknown;
   fatal_error?: string;
 }

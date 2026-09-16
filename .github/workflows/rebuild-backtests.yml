@@ -1,11 +1,11 @@
 name: Rebuild intraday backtests (ML training data)
 
-# Regenerates rule-engine backtest signals against the full historical archive using TODAY's
-# live default RuleConfig (signal_engine.PROFILE_DEFAULTS["intraday"]) -- see
-# scripts/rebuild_backtests.py's own docstring for why this has to run here instead of via
-# POST /backtest per combo: a deep-archive backtest on 5min/15min replays hundreds of
-# thousands of candles, and FastAPI Cloud's ~125s gateway timeout has already caused
-# documented failures on similarly slow endpoints. No per-request timeout here at all.
+# Regenerates SMC consensus backtest signals against the full historical archive using
+# TODAY's live default_config_for("intraday") -- see scripts/rebuild_backtests.py's own
+# docstring for why this has to run here instead of via POST /consensus/backtest per combo:
+# a deep-archive backtest on 5min/15min replays hundreds of thousands of candles, and
+# FastAPI Cloud's ~125s gateway timeout has already caused documented failures on similarly
+# slow endpoints. No per-request timeout here at all.
 #
 # Also the actual fix for app/services/ml_training_data.py having nothing usable to draw on:
 # checked live on 2026-09-12, every backtest run that existed before this workflow did

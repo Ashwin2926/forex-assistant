@@ -1,18 +1,13 @@
-from app.models.schemas import SignalReason
+from app.models.schemas import StrategyCall
+from app.services.strategies import STRATEGY_NAMES
 
-# Maps each rule name that can appear in a Signal's `reasons` to one canonical feature name.
-# Three different RSI rule names (rsi_oversold/rsi_overbought/rsi_neutral -- only one ever
-# fires per signal, see signal_engine.apply_rules) collapse to the same "rsi" feature, since
-# they're all just "the RSI reading," not three different quantities.
-FEATURE_RULE_MAP: dict[str, str] = {
-    "trend_ema": "ema_spread_pct",
-    "rsi_oversold": "rsi",
-    "rsi_overbought": "rsi",
-    "rsi_neutral": "rsi",
-    "macd_cross": "macd_hist",
-    "volatility_filter": "atr_pct",
-    "session_filter": "session_hour",  # imputed 0.0 when the rule didn't fire, see below
-}
+# One feature per SMC strategy vote, reusing strategies.STRATEGY_NAMES rather than a second
+# hand-typed list, so this can't drift out of sync with RL's own vote feature names
+# (rl_engine.RL_MARKET_FEATURE_NAMES uses the exact same names with a "_vote" suffix, also
+# imported from strategies.py). Signed strength in [-1, 1] -- positive for a BUY-aligned
+# call, negative for SELL-aligned, 0 for HOLD/disagreement with whichever direction is being
+# scored -- same encoding rl_engine.compute_strategy_vote_states already uses.
+STRATEGY_VOTE_FEATURES: list[str] = [f"{name}_vote" for name in STRATEGY_NAMES]
 
 # The known pair/interval universe this project trades -- duplicated here (rather than
 # imported from app.core.config/app.main) to avoid a circular import, since app.main already
@@ -23,18 +18,12 @@ FEATURE_RULE_MAP: dict[str, str] = {
 KNOWN_PAIRS: list[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"]
 KNOWN_INTERVALS: list[str] = ["5min", "15min", "1h", "4h", "1day"]
 
-# session_hour/session_filter never appears on a signal generated with the session filter
-# disabled -- 0.0 there means "not applicable," a real and meaningful state, not a
-# stand-in for data that should have existed but is missing.
-#
-# pair_*/interval_* one-hots were added because a single shared model previously had no way
-# to tell EUR/USD 5min apart from USD/JPY 1h -- profile_intraday is currently constant
-# (there's only one profile), so it's the pair/interval one-hots that carry the meaningful
-# distinction, even though live accuracy is known to differ a lot between them (see
-# /rl/accuracy, /signals/accuracy per-pair/interval). profile_intraday is kept as-is
-# (rather than removed) so the feature schema stays compatible with already-trained models.
+# pair_*/interval_* one-hots let a single shared model tell EUR/USD 5min apart from USD/JPY
+# 1h -- profile_intraday is currently constant (there's only one profile), so it's these
+# one-hots that carry the meaningful pair/interval distinction, even though live accuracy is
+# known to differ a lot between them (see /rl/accuracy, /rl/insights per-pair/interval).
 FEATURE_NAMES: list[str] = [
-    "ema_spread_pct", "rsi", "macd_hist", "atr_pct", "session_hour",
+    *STRATEGY_VOTE_FEATURES, "atr_pct",
     "confidence", "profile_intraday", "direction_buy",
     *[f"pair_{p.replace('/', '')}" for p in KNOWN_PAIRS],
     *[f"interval_{iv}" for iv in KNOWN_INTERVALS],
@@ -43,27 +32,42 @@ FEATURE_NAMES: list[str] = [
 
 def extract_features(signal: dict) -> dict[str, float]:
     """
-    Maps a stored Signal document (a raw dict, as returned by signals_collection.find() --
-    not the Pydantic model) to a flat numeric feature dict for the ML classifier. The single
-    place this mapping lives, so training (ml_model.py) and live prediction (/ml/predict) can
-    never drift out of sync with each other.
+    Maps a stored ConsensusSignal document (a raw dict, as returned by
+    consensus_signals_collection.find() -- not the Pydantic model) to a flat numeric feature
+    dict for the ML classifier. The single place this mapping lives, so training
+    (ml_model.py) and live prediction can never drift out of sync with each other.
 
-    confidence/profile_intraday/direction_buy come from the signal itself, not its reasons --
-    including the existing rule-based confidence score as a feature lets the model learn
-    whether that score is itself predictive, rather than assuming it and hand-coding the
-    relationship.
+    Reads each strategy_call's direction/strength into its own `{strategy}_vote` feature
+    (signed: positive for a call agreeing with `signal["direction"]`, negative for a call
+    opposing it, 0 for HOLD) -- the same signed-strength encoding RL's own market state
+    already uses (rl_engine.compute_strategy_vote_states), so ML and RL read the same market
+    evidence the same way.
+
+    confidence/profile_intraday/direction_buy come from the signal itself, not its strategy
+    calls -- including the consensus's own agreeing-weight-fraction confidence as a feature
+    lets the model learn whether that score is itself predictive, rather than assuming it and
+    hand-coding the relationship.
     """
     features = {name: 0.0 for name in FEATURE_NAMES}
+    direction = signal.get("direction")
 
-    for reason in signal.get("reasons", []):
-        feature_name = FEATURE_RULE_MAP.get(reason.get("rule"))
-        value = reason.get("value")
-        if feature_name and value is not None:
-            features[feature_name] = float(value)
+    for call in signal.get("strategy_calls", []):
+        vote_feature = f"{call.get('strategy')}_vote"
+        if vote_feature not in features:
+            continue
+        call_direction = call.get("direction")
+        if call_direction == "HOLD" or call_direction is None:
+            continue
+        strength = call.get("strength") or 0.0
+        features[vote_feature] = float(strength) if call_direction == direction else -float(strength)
+
+    atr_pct = signal.get("atr_pct")
+    if atr_pct is not None:
+        features["atr_pct"] = float(atr_pct)
 
     features["confidence"] = float(signal.get("confidence") or 0.0)
-    features["profile_intraday"] = 1.0 if signal.get("profile") == "intraday" else 0.0
-    features["direction_buy"] = 1.0 if signal.get("direction") == "BUY" else 0.0
+    features["profile_intraday"] = 1.0 if signal.get("profile", "intraday") == "intraday" else 0.0
+    features["direction_buy"] = 1.0 if direction == "BUY" else 0.0
 
     pair_feature = f"pair_{(signal.get('pair') or '').replace('/', '')}"
     if pair_feature in features:
@@ -75,51 +79,42 @@ def extract_features(signal: dict) -> dict[str, float]:
     return features
 
 
-def direction_confidence(
-    direction: str, gate_ok: bool, rule_votes: dict[str, str], rule_strengths: dict[str, float], total_rules: int,
-) -> float:
+def is_current_smc_signal(signal: dict) -> bool:
     """
-    Same rule-agreement-strength formula signal_engine.decide() uses for whichever direction
-    the vote count actually won, generalized to a CALLER-CHOSEN direction instead. Needed
-    because rl_engine.compute_ml_scores scores what a BUY *and* a SELL would each look like
-    at every bar (RL hasn't committed to a direction yet when this runs, unlike a real
-    generated Signal which only ever reports confidence for the direction it settled on).
-    Mirrors decide()'s "gate fails -> zero confidence, regardless of direction" rule exactly,
-    and its "confidence" formula (sum of agreeing rules' strengths / total_rules, capped at
-    1.0) for the requested direction specifically rather than whichever direction won the
-    vote count.
+    Whether a stored ConsensusSignal's strategy_calls match today's 5 SMC strategies exactly
+    -- False for a signal generated under the RETIRED 7-strategy lineup (trend/bollinger/
+    support_resistance/candlestick/stoch_adx/volume_momentum/smart_money), which still sits in
+    consensus_signals_collection from before strategies.py's SMC rewrite (confirmed live: GET
+    /consensus still returns several of these old-shaped records). Filtering these out matters
+    the same way the old rule engine's EMA12/26-vs-EMA9/21 archive contamination did (see
+    PROGRESS.md): a stale-shaped record's strategy_calls have names that don't match any
+    current `{name}_vote` feature, so every vote feature would silently read as 0.0/HOLD for
+    it -- misleading training noise, not a crash, but noise that should be kept out.
     """
-    if not gate_ok or total_rules == 0:
-        return 0.0
-    agreeing_strength = sum(
-        rule_strengths.get(rule, 1.0) for rule, voted in rule_votes.items() if voted == direction
-    )
-    return round(min(agreeing_strength / total_rules, 1.0) * 100, 1)
+    calls = signal.get("strategy_calls") or []
+    return bool(calls) and all(c.get("strategy") in STRATEGY_NAMES for c in calls)
 
 
 def signal_like_features(
-    reasons: list[SignalReason], rule_votes: dict[str, str], rule_strengths: dict[str, float], total_rules: int,
-    profile: str, direction: str, pair: str, interval: str,
+    strategy_calls: list[StrategyCall], confidence: float, atr_pct: float,
+    direction: str, pair: str, interval: str,
 ) -> dict[str, float]:
     """
-    Builds the same dict shape extract_features() expects (a stored Signal document), from
-    apply_rules()'s raw return values directly instead of a full persisted Signal -- for
-    callers scoring a hypothetical BUY/SELL at a bar that was never actually turned into a
-    real Signal (see rl_engine.compute_ml_scores: calling signal_engine.generate_signal per
-    training bar would recompute every indicator from scratch on every call, prohibitively
-    expensive inside a loop that already visits hundreds of bars x hundreds of episodes --
-    apply_rules alone is cheap, pure row arithmetic against an already-computed indicator_df).
+    Builds the same dict shape extract_features() expects (a stored ConsensusSignal
+    document), from a bar's raw StrategyCall list directly instead of a full persisted
+    ConsensusSignal -- for callers scoring a hypothetical BUY/SELL at a bar that was never
+    actually turned into a real signal (see rl_engine.compute_ml_scores: recomputing SMC
+    strategies inside a training loop that already visits hundreds of bars x hundreds of
+    episodes needs the cheap, already-computed StrategyCall list, not a fresh
+    consensus.check_consensus roundtrip).
 
     direction: "BUY" or "SELL", the hypothetical this call is scoring -- NOT necessarily
-    whatever direction the vote count would have picked (see direction_confidence).
+    whatever direction a real consensus would have picked.
     """
-    volatility_ok = next((r.passed for r in reasons if r.rule == "volatility_filter"), True)
-    session_ok = next((r.passed for r in reasons if r.rule == "session_filter"), True)
-    confidence = direction_confidence(direction, volatility_ok and session_ok, rule_votes, rule_strengths, total_rules)
     signal_like = {
-        "reasons": [r.model_dump() for r in reasons],
+        "strategy_calls": [c.model_dump() if hasattr(c, "model_dump") else c for c in strategy_calls],
         "confidence": confidence,
-        "profile": profile,
+        "atr_pct": atr_pct,
         "direction": direction,
         "pair": pair,
         "interval": interval,

@@ -4,7 +4,6 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const LINKS = [
-  { href: "/", label: "Signal Feed" },
   { href: "/trading-signals", label: "Trading Signals" },
   { href: "/chart", label: "Chart" },
   { href: "/backtest", label: "Backtesting" },
@@ -19,9 +18,7 @@ export function SideNav() {
   return (
     <nav className="flex flex-col gap-0.5">
       {LINKS.map(({ href, label }) => {
-        // Exact match only for "/" (every other route starts with "/") -- otherwise "/"
-        // would highlight as active on every page.
-        const active = href === "/" ? pathname === "/" : pathname === href || pathname?.startsWith(`${href}/`);
+        const active = pathname === href || pathname?.startsWith(`${href}/`);
         return (
           <Link
             key={href}

@@ -1,0 +1,37 @@
+name: Reset Mongo (keep candles)
+
+# Manual only (workflow_dispatch, no schedule) -- drops every derived-state collection
+# (signals, backtests, trained ML/RL models, job logs) while leaving candles_collection (and
+# data/candles/*.parquet, untouched by this workflow entirely) intact. See
+# scripts/reset_mongo.py's own docstring for the full collection list and reasoning. Built for
+# the SMC-only migration reset (see PROGRESS.md's rule-engine-removal entry) but reusable for
+# any future "wipe derived state, keep candles" reset -- run with dry_run=true first to see
+# counts without dropping anything.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true to only report doc counts without dropping anything"
+        required: false
+        default: "false"
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install pymongo
+      - name: Reset
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python scripts/reset_mongo.py "${args[@]}"

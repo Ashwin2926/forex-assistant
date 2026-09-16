@@ -38,16 +38,16 @@ from app.core.database import (
     backtest_rebuild_jobs_collection,
 )
 from app.models.schemas import (
-    LoginRequest, RuleConfig, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
+    LoginRequest, RuleConfig, Signal, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
     PPOPolicy, MLTrainResult, BacktestRebuildJob,
 )
 from app.services.data_fetcher import fetch_and_store, backfill_batch
 from app.services.candle_archive import load_full_candle_history, load_archived_candles
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
-from app.services.signal_engine import generate_signal, compute_atr_target_stop, default_config_for, apply_rules
-from app.services.backtester import run_backtest, run_consensus_backtest
+from app.services.signal_engine import compute_atr_target_stop, default_config_for
+from app.services.backtester import run_consensus_backtest
 from app.services.strategies import STRATEGIES
-from app.services.consensus import check_consensus
+from app.services.consensus import check_consensus, direction_confidence
 from app.services.ml_features import extract_features, signal_like_features
 from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.ml_training_data import get_ml_reference_signals
@@ -64,32 +64,12 @@ from app.services.ppo_engine import train_ppo_policy, choose_action_ppo
 from app.services.deriv_client import deriv_session, DerivAuthError
 from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import (
-    score_pending_signals, score_pending_consensus_signals, score_pending_rl_signals,
+    score_pending_consensus_signals, score_pending_rl_signals,
     resolve_rl_signal_real_outcome, LIVE_MAX_LOOKFORWARD_BY_INTERVAL, counterfactual_target_stop,
 )
 
 settings = get_settings()
 app = FastAPI(title="Forex Trading Assistant")
-
-# Default grid for /backtest/optimize when no configs are supplied — covers the knobs
-# backtesting has actually shown to matter (EMA responsiveness, RSI sensitivity, and
-# target/stop — RuleConfig's own 1.5x/1.0x default turned out to have negative expectancy
-# on every EMA/RSI combination on every pair; a closer target with a more generous stop
-# (0.5x/1.25x) is a validated, cross-pair-tested improvement, see signal_engine.PROFILE_DEFAULTS).
-# Both target/stop ratios are included here so a plain "run optimize" has a chance to find
-# the better one instead of only searching a doomed ratio.
-DEFAULT_OPTIMIZE_GRID = [
-    RuleConfig(),
-    RuleConfig(ema_fast=20, ema_slow=100),
-    RuleConfig(ema_fast=10, ema_slow=50),
-    RuleConfig(rsi_oversold=25, rsi_overbought=75),
-    RuleConfig(rsi_oversold=35, rsi_overbought=65),
-    RuleConfig(ema_fast=20, ema_slow=100, rsi_oversold=25, rsi_overbought=75),
-    RuleConfig(ema_fast=10, ema_slow=50, rsi_oversold=25, rsi_overbought=75),
-    RuleConfig(target_atr_mult=0.5, stop_atr_mult=1.25),
-    RuleConfig(ema_fast=20, ema_slow=100, target_atr_mult=0.5, stop_atr_mult=1.25),
-    RuleConfig(rsi_oversold=25, rsi_overbought=75, target_atr_mult=0.5, stop_atr_mult=1.25),
-]
 
 # AuthMiddleware added first so CORSMiddleware ends up outermost (Starlette makes the
 # *last*-added middleware the outermost one) — otherwise a 401 from AuthMiddleware would
@@ -256,182 +236,21 @@ async def prune_candle_history(confirm: bool = False, keep_latest_n: int = CANDL
 GOOD_SIGNAL_ML_THRESHOLD = 0.6
 
 
-@app.post("/signals/{interval}/{profile}")
-async def create_signal(
-    interval: str, profile: str, pair: str,
-    target_atr_mult: Optional[float] = None, stop_atr_mult: Optional[float] = None,
-):
-    """
-    Generate a signal for a pair using stored candle data.
-    profile: always 'intraday' — the one validated ruleset, used across every interval.
-    pair is a query param (e.g. ?pair=EUR/USD) —
-    it contains a literal '/', which breaks Starlette path-parameter matching
-    even when percent-encoded, so it can't live in the URL path.
-
-    Directional signals get an ATR-based target_price/stop_price attached at creation
-    time (same formula the backtester uses) — this is what /signals/score checks stored
-    candles against later to resolve the signal's status from "pending" to hit/miss/expired.
-    target_atr_mult/stop_atr_mult: explicit override; omit to use that profile's config
-    values (RuleConfig.target_atr_mult/stop_atr_mult — see signal_engine.PROFILE_DEFAULTS).
-
-    ML quality gate: a BUY/SELL the rule engine would otherwise fire only actually goes out
-    as one if the ML classifier's calibrated hit-probability for it clears
-    GOOD_SIGNAL_ML_THRESHOLD -- otherwise it's downgraded to HOLD (see Signal.ml_override).
-    Fits fresh on every currently-resolved signal, same as GET /ml/predict -- genuinely live,
-    no lookahead concern to guard against the way rl_engine.py's training-time frozen
-    snapshot does. Fails OPEN (signal passes through ungated) when there isn't enough
-    resolved history yet for predict_hit_probability to return a real number -- "not enough
-    data" isn't evidence of a bad signal, so there's nothing to block on.
-    """
-    config = default_config_for(profile, pair)
-    cursor = candles_collection.find(
-        {"pair": pair, "interval": interval}
-    ).sort("timestamp", -1).limit(500)
-    docs = await cursor.to_list(length=500)
-    docs.reverse()  # find() gave newest-first for the limit to bite correctly; generate_signal wants ascending
-
-    min_needed = config.ema_slow
-    if len(docs) < min_needed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for the slow EMA "
-                    f"({profile} profile). Run /ingest/{interval} first."
-        )
-
-    df = pd.DataFrame(docs)
-    signal = generate_signal(df, pair, interval, profile, config)
-
-    if signal.direction in ("BUY", "SELL"):
-        resolved_signals = await get_ml_reference_signals(signals_collection)
-        features = extract_features(signal.model_dump())
-        signal.ml_hit_probability = predict_hit_probability(resolved_signals, features)
-        if signal.ml_hit_probability is not None and signal.ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
-            signal.ml_override = (
-                f"ML rated this {signal.direction} at only {signal.ml_hit_probability * 100:.0f}% hit "
-                f"probability (below the {GOOD_SIGNAL_ML_THRESHOLD * 100:.0f}% bar for a live signal) "
-                f"-- held instead."
-            )
-            signal.direction = "HOLD"
-
-    if signal.direction in ("BUY", "SELL"):
-        atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
-        signal.target_price, signal.stop_price = compute_atr_target_stop(
-            signal.price_at_signal, atr_val, signal.direction,
-            target_atr_mult if target_atr_mult is not None else config.target_atr_mult,
-            stop_atr_mult if stop_atr_mult is not None else config.stop_atr_mult,
-        )
-
-    # The latest stored candle only advances when /ingest brings in a new one — calling
-    # this endpoint again before that (e.g. every dashboard load) would otherwise insert
-    # an identical duplicate for the same candle, inflating /signals/accuracy's counts.
-    # target_price/stop_price are compared too (not just direction/price) so a repeat call
-    # with different target_atr_mult/stop_atr_mult overrides is treated as a distinct
-    # signal rather than silently returning the first call's target/stop.
-    last = await signals_collection.find_one(
-        {"pair": pair, "interval": interval, "profile": profile, "source": "live"},
-        sort=[("timestamp", -1)],
-    )
-    if (
-        last is not None
-        and last["direction"] == signal.direction
-        and last["price_at_signal"] == signal.price_at_signal
-        and last["target_price"] == signal.target_price
-        and last["stop_price"] == signal.stop_price
-    ):
-        last["_id"] = str(last["_id"])
-        return last
-
-    await signals_collection.insert_one(signal.model_dump())
-    return signal
-
-
-@app.get("/signals")
-async def list_signals(pair: str | None = None, limit: int = 50):
-    query = {"pair": pair} if pair else {}
-    cursor = signals_collection.find(query).sort("timestamp", -1).limit(limit)
-    docs = await cursor.to_list(length=limit)
-    for d in docs:
-        d["_id"] = str(d["_id"])
-    return docs
-
-
-@app.post("/signals/score")
-async def score_signals(max_lookforward: int | None = None):
-    """
-    Checks every pending live signal against candles that have arrived since it fired,
-    resolving status to hit/miss/expired wherever enough real data now exists — the live
-    equivalent of what the backtester does against fixed history. Run this after each
-    /ingest so newly-arrived candles get checked; the .github/workflows/keep-fresh.yml
-    cron does both automatically every 15 minutes, this is for triggering it on demand.
-
-    max_lookforward left unset (the default) uses each signal's own interval-appropriate
-    window (outcome_scoring.LIVE_MAX_LOOKFORWARD_BY_INTERVAL) instead of one flat value for
-    every interval -- pass an explicit value here only to force the same window everywhere
-    (e.g. for a quick manual comparison against the old behavior).
-    """
-    return await score_pending_signals(max_lookforward=max_lookforward)
-
-
-@app.get("/signals/accuracy")
-async def signal_accuracy(pair: str | None = None, profile: str | None = None, limit: int = 100):
-    """
-    Rolling hit-rate over the most recent *resolved* live signals (hit/miss/expired) —
-    excludes still-pending signals and anything from a backtest run. This is what tells
-    you whether live performance is actually tracking what was backtested; it often won't
-    match at first, and that gap is itself useful signal, not a bug to explain away.
-
-    sample_size/hits/misses/expired are capped at `limit` (a rolling window, so hit-rate
-    stays responsive to recent performance instead of getting diluted as history grows
-    forever) and will plateau once enough signals have resolved — the total_* fields are
-    the real, uncapped counts (count_documents per status on the same filter) so "is
-    sample_size stuck" has an actual answer instead of looking like a stalled number.
-    """
-    query: dict = {"source": "live", "status": {"$in": ["hit", "miss", "expired"]}}
-    if pair:
-        query["pair"] = pair
-    if profile:
-        query["profile"] = profile
-    cursor = signals_collection.find(query).sort("timestamp", -1).limit(limit)
-    docs = await cursor.to_list(length=limit)
-
-    hits = sum(1 for d in docs if d["status"] == "hit")
-    misses = sum(1 for d in docs if d["status"] == "miss")
-    expired = sum(1 for d in docs if d["status"] == "expired")
-    total = len(docs)
-
-    total_hits = await signals_collection.count_documents({**query, "status": "hit"})
-    total_misses = await signals_collection.count_documents({**query, "status": "miss"})
-    total_expired = await signals_collection.count_documents({**query, "status": "expired"})
-    total_resolved = total_hits + total_misses + total_expired
-    total_decided = total_hits + total_misses
-
-    return {
-        "pair": pair,
-        "profile": profile,
-        "sample_size": total,
-        "hits": hits,
-        "misses": misses,
-        "expired": expired,
-        "hit_rate_pct": round(hits / total * 100, 1) if total else None,
-        "total_resolved": total_resolved,
-        "total_hits": total_hits,
-        "total_misses": total_misses,
-        "total_expired": total_expired,
-        # see RLSignal accuracy's directional_hit_rate_pct docstring -- same reasoning: this
-        # divides by decided (hit+miss) trades only, so an interval with a lot of "expired"
-        # timeouts doesn't drag the headline number toward 0 for reasons unrelated to whether
-        # the model is directionally right when it actually resolves.
-        "total_hit_rate_pct": round(total_hits / total_resolved * 100, 1) if total_resolved else None,
-        "directional_hit_rate_pct": round(total_hits / total_decided * 100, 1) if total_decided else None,
-    }
+# The rule engine (apply_rules/decide/generate_signal, the old /signals/* CRUD family) was
+# removed entirely -- every decision surface in this project now runs on SMC consensus
+# (below) + ML (ml_model.py) + RL (rl_engine.py/ppo_engine.py) only. See PROGRESS.md for the
+# migration entry. signals_collection/Signal stay (RL's own trade-log persistence in
+# ppo_engine.py builds bare Signal records directly as a generic trade-record shape,
+# independent of which engine decided the trade), but nothing generates a *rule-engine*
+# Signal anymore.
 
 
 @app.get("/candles/{interval}")
 async def get_candles(interval: str, pair: str, profile: str = "intraday", limit: int = 300):
     """
     Stored candles with EMA/RSI/MACD/ATR attached, for charting — computed with the
-    intraday RuleConfig (so the EMA/RSI periods shown match whatever generate_signal
-    actually used). Returns the most recent `limit` candles, ascending
+    intraday RuleConfig (so the EMA/RSI periods shown match whatever the SMC strategies/
+    consensus actually used). Returns the most recent `limit` candles, ascending
     by timestamp. Indicators need config.ema_slow rows of preceding history to be
     meaningful; the earliest rows in a short result may show as null for that reason.
     """
@@ -514,9 +333,32 @@ async def create_consensus_signal(interval: str, pair: str):
     if consensus is None:
         return {"consensus": None, "strategy_calls": [c.model_dump() for c in calls]}
 
+    # ML quality gate: a consensus that clears the strategy-agreement bar still doesn't go out
+    # live unless the ML classifier's calibrated hit-probability for it clears
+    # GOOD_SIGNAL_ML_THRESHOLD. ConsensusSignal has no HOLD direction to downgrade to (unlike
+    # the retired rule engine's Signal model) -- a blocked consensus is simply not persisted or
+    # returned as actionable, same "no consensus right now" shape as check_consensus returning
+    # None, but with the reason visible via ml_blocked_reason rather than looking identical to
+    # plain strategy disagreement. Fails OPEN (same as the retired gate) when there isn't
+    # enough resolved history yet -- "not enough data" isn't evidence of a bad signal.
+    resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
+    features = extract_features(consensus.model_dump())
+    ml_hit_probability = predict_hit_probability(resolved_signals, features)
+    consensus.ml_hit_probability = ml_hit_probability
+    if ml_hit_probability is not None and ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
+        consensus.ml_override = (
+            f"ML rated this {consensus.direction} at only {ml_hit_probability * 100:.0f}% hit "
+            f"probability (below the {GOOD_SIGNAL_ML_THRESHOLD * 100:.0f}% bar for a live signal) "
+            f"-- held instead."
+        )
+        return {
+            "consensus": None, "strategy_calls": [c.model_dump() for c in calls],
+            "ml_blocked_reason": consensus.ml_override,
+        }
+
     # De-dupe against the last stored consensus signal for this pair/interval, same idea as
-    # create_signal's dedup — avoid inserting an identical duplicate when the underlying
-    # candle hasn't advanced since the last check.
+    # the retired rule engine's own dedup — avoid inserting an identical duplicate when the
+    # underlying candle hasn't advanced since the last check.
     last = await consensus_signals_collection.find_one(
         {"pair": pair, "interval": interval, "source": "live"},
         sort=[("timestamp", -1)],
@@ -599,250 +441,6 @@ async def backtest_consensus(interval: str, pair: str, train_frac: float = 0.7, 
     await backtest_runs_collection.insert_one(test_run.model_dump())
 
     return {"train": train_run, "test": test_run}
-
-
-@app.post("/backtest/{interval}/{profile}")
-async def backtest(
-    interval: str,
-    profile: str,
-    pair: str,
-    target_atr_mult: Optional[float] = None,
-    stop_atr_mult: Optional[float] = None,
-    max_lookforward: int = 20,
-    config: Optional[RuleConfig] = Body(default=None),
-):
-    """
-    Replay the rule engine bar-by-bar over stored candle history and score hit-rate.
-
-    Don't trust a live signal until its ruleset has a backtested track record here first.
-    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
-    target_atr_mult / stop_atr_mult: explicit override for take-profit/stop-loss distance
-    (multiple of ATR(14) at signal time) — omit to use config's own target_atr_mult/stop_atr_mult.
-    max_lookforward: max candles to wait for target or stop before calling a signal "expired".
-    config: optional JSON body overriding rule thresholds (EMA/RSI/MACD/ATR periods and
-    cutoffs) — omit to use that profile's default RuleConfig (see signal_engine.PROFILE_DEFAULTS).
-    For comparing several configs against the same data in one call, use /backtest/sweep instead.
-    """
-    config = config or default_config_for(profile, pair)
-    docs = await load_full_candle_history(pair, interval)
-
-    min_needed = config.ema_slow + max_lookforward + 1
-    if len(docs) < min_needed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for a backtest "
-                    f"with ema_slow={config.ema_slow} and max_lookforward={max_lookforward}. "
-                    f"Run /ingest/{interval} first.",
-        )
-
-    df = pd.DataFrame(docs)
-    try:
-        run, signals = run_backtest(
-            df, pair, interval, profile, config,
-            target_atr_mult=target_atr_mult,
-            stop_atr_mult=stop_atr_mult,
-            max_lookforward=max_lookforward,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if signals:
-        await backtest_signals_collection.insert_many([s.model_dump() for s in signals])
-    await backtest_runs_collection.insert_one(run.model_dump())
-
-    return run
-
-
-@app.post("/backtest/sweep/{interval}/{profile}")
-async def backtest_sweep(
-    interval: str,
-    profile: str,
-    pair: str,
-    target_atr_mult: Optional[float] = None,
-    stop_atr_mult: Optional[float] = None,
-    max_lookforward: int = 20,
-    configs: list[RuleConfig] = Body(...),
-):
-    """
-    Run multiple RuleConfig variations against the exact same historical candles in one
-    call, so you can see what actually improves hit-rate instead of tweaking and hoping.
-    Candles are fetched once and reused across every config for a fair comparison.
-    pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
-    target_atr_mult/stop_atr_mult: explicit override applied to every config in the sweep —
-    omit to let each config use its own target_atr_mult/stop_atr_mult instead.
-
-    Body: a JSON array of RuleConfig objects (partial overrides are fine — unset fields
-    fall back to RuleConfig defaults), e.g.
-    [{"rsi_oversold": 25, "rsi_overbought": 75}, {"rsi_oversold": 35, "rsi_overbought": 65}]
-
-    Returns each run's summary sorted by hit_rate_pct descending (runs with no
-    directional signals sort last).
-    """
-    if not configs:
-        raise HTTPException(status_code=400, detail="Provide at least one config to sweep.")
-
-    docs = await load_full_candle_history(pair, interval)
-    if not docs:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.",
-        )
-    df = pd.DataFrame(docs)
-
-    runs = []
-    for config in configs:
-        min_needed = config.ema_slow + max_lookforward + 1
-        if len(docs) < min_needed:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Not enough candle history ({len(docs)} rows) for config with "
-                        f"ema_slow={config.ema_slow} (needs {min_needed}+). Run /ingest/{interval} first.",
-            )
-        try:
-            run, signals = run_backtest(
-                df, pair, interval, profile, config,
-                target_atr_mult=target_atr_mult,
-                stop_atr_mult=stop_atr_mult,
-                max_lookforward=max_lookforward,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        if signals:
-            await backtest_signals_collection.insert_many([s.model_dump() for s in signals])
-        await backtest_runs_collection.insert_one(run.model_dump())
-        runs.append(run)
-
-    runs.sort(key=lambda r: (r.hit_rate_pct is None, -(r.hit_rate_pct or 0)))
-    return runs
-
-
-@app.post("/backtest/optimize/{interval}/{profile}")
-async def backtest_optimize(
-    interval: str,
-    profile: str,
-    pair: str,
-    train_frac: float = 0.7,
-    target_atr_mult: Optional[float] = None,
-    stop_atr_mult: Optional[float] = None,
-    max_lookforward: int = 20,
-    min_directional_signals: int = 20,
-    rank_by: str = "expectancy",
-    configs: Optional[list[RuleConfig]] = Body(default=None),
-):
-    """
-    Grid-search RuleConfig on the first train_frac of history, pick a winner there (among
-    configs with at least min_directional_signals, so a "winner" isn't just 3 lucky
-    signals), then validate that exact winner on the untouched remaining tail. The train
-    and test numbers are reported side by side — a real edge should survive on data the
-    config was never tuned against; a large drop from train to test means the "improvement"
-    was curve-fit noise, not signal.
-
-    rank_by: "expectancy" (default) or "hit_rate". Hit-rate alone can be misleading — a
-    low-hit-rate config with much bigger wins than losses can have better expected value
-    per signal than a high-hit-rate config with tiny wins and occasional large losses.
-    expectancy_pct (mean pct_move across every directional signal, win or lose) answers
-    "is this actually profitable on average"; hit_rate_pct only answers "how often is it
-    right." Both are always returned regardless of which one you rank by.
-
-    target_atr_mult/stop_atr_mult: explicit override applied uniformly to every candidate —
-    omit (recommended) to let each candidate config use its own target_atr_mult/stop_atr_mult,
-    which is what actually lets this search target/stop as part of the grid (they're
-    RuleConfig fields now, so a configs body can vary them same as EMA/RSI/session/vol).
-
-    configs: optional JSON array of RuleConfig overrides to search — omit to use the
-    built-in default grid (varies EMA responsiveness and RSI sensitivity, the two
-    parameters backtesting has actually shown to move hit-rate).
-    """
-    if rank_by not in ("expectancy", "hit_rate"):
-        raise HTTPException(status_code=400, detail="rank_by must be 'expectancy' or 'hit_rate'.")
-    grid = configs or DEFAULT_OPTIMIZE_GRID
-    if not grid:
-        raise HTTPException(status_code=400, detail="Provide at least one config, or omit configs to use the default grid.")
-    if not 0 < train_frac < 1:
-        raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
-
-    docs = await load_full_candle_history(pair, interval)
-    if not docs:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No candle history for {pair}/{interval}. Run /ingest/{interval} first.",
-        )
-
-    df = pd.DataFrame(docs)
-    split_idx = int(len(df) * train_frac)
-
-    max_ema_slow = max(c.ema_slow for c in grid)
-    if split_idx < max_ema_slow + 1:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Train slice ({split_idx} candles) is too short for the largest config's warmup "
-                    f"(ema_slow={max_ema_slow}). Ingest more history or lower train_frac.",
-        )
-    if len(df) - split_idx - max_lookforward < 1:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Test slice is too short ({len(df) - split_idx} candles) for max_lookforward={max_lookforward}. "
-                    f"Ingest more history or raise train_frac.",
-        )
-
-    train_df = df.iloc[:split_idx]
-    train_candidates = []
-    for config in grid:
-        try:
-            run, signals = run_backtest(
-                train_df, pair, interval, profile, config,
-                target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult, max_lookforward=max_lookforward,
-            )
-        except ValueError:
-            continue  # this config's warmup doesn't fit in the train slice — skip, don't fail the whole search
-        train_candidates.append((config, run, signals))
-
-    rank_field = "expectancy_pct" if rank_by == "expectancy" else "hit_rate_pct"
-    eligible = [
-        (c, r, s) for c, r, s in train_candidates
-        if getattr(r, rank_field) is not None and r.directional_signals >= min_directional_signals
-    ]
-    if not eligible:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No config produced at least {min_directional_signals} directional signals on the "
-                    f"train slice ({split_idx} candles) — try a longer train slice or lower min_directional_signals.",
-        )
-    eligible.sort(key=lambda x: -getattr(x[1], rank_field))
-    best_config, best_train_run, best_train_signals = eligible[0]
-
-    try:
-        test_run, test_signals = run_backtest(
-            df, pair, interval, profile, best_config,
-            target_atr_mult=target_atr_mult, stop_atr_mult=stop_atr_mult, max_lookforward=max_lookforward,
-            eval_start_index=split_idx,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if best_train_signals:
-        await backtest_signals_collection.insert_many([s.model_dump() for s in best_train_signals])
-    await backtest_runs_collection.insert_one(best_train_run.model_dump())
-    if test_signals:
-        await backtest_signals_collection.insert_many([s.model_dump() for s in test_signals])
-    await backtest_runs_collection.insert_one(test_run.model_dump())
-
-    return {
-        "winning_config": best_config,
-        "rank_by": rank_by,
-        "train": best_train_run,
-        "test": test_run,
-        "candidates_evaluated": [
-            {
-                "config": c,
-                "hit_rate_pct": r.hit_rate_pct,
-                "expectancy_pct": r.expectancy_pct,
-                "directional_signals": r.directional_signals,
-            }
-            for c, r, _ in train_candidates
-        ],
-    }
 
 
 @app.post("/backtest/prune-history")
@@ -949,7 +547,7 @@ async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
-    signals = await get_ml_reference_signals(signals_collection)
+    signals = await get_ml_reference_signals(consensus_signals_collection)
 
     if not force:
         last_run = await ml_runs_collection.find_one(sort=[("created_at", -1)])
@@ -990,11 +588,12 @@ async def list_ml_runs(limit: int = 20):
 @app.post("/ml/predict/{interval}/{profile}")
 async def predict_signal(interval: str, profile: str, pair: str):
     """
-    Generates a fresh signal the same way create_signal does (reuses generate_signal), but
-    does NOT insert it into signals_collection or touch that endpoint's dedup/history in any
-    way -- purely advisory. Attaches ml_hit_probability from a model trained fresh on every
-    currently resolved signal; null (not a fabricated number) when there isn't enough
-    resolved data yet -- see ml_model.MIN_TRAIN_SIGNALS/MIN_TEST_SIGNALS.
+    Generates a fresh SMC consensus signal the same way create_consensus_signal does, but
+    does NOT insert it into consensus_signals_collection or touch that endpoint's dedup/
+    history in any way -- purely advisory. Attaches ml_hit_probability from a model trained
+    fresh on every currently resolved consensus signal; null (not a fabricated number) when
+    there isn't enough resolved data yet -- see ml_model.MIN_TRAIN_SIGNALS/MIN_TEST_SIGNALS,
+    or when no consensus fired at all (nothing to score -- see the guard below).
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
@@ -1005,44 +604,33 @@ async def predict_signal(interval: str, profile: str, pair: str):
     docs = await cursor.to_list(length=500)
     docs.reverse()
 
-    min_needed = config.ema_slow
+    min_needed = 30  # covers every strategy's own warmup (see run_consensus_backtest)
     if len(docs) < min_needed:
         raise HTTPException(
             status_code=400,
             detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for "
-                    f"{profile}. Run /ingest/{interval} first."
+                    f"consensus. Run /ingest/{interval} first."
         )
 
     df = pd.DataFrame(docs)
-    signal = generate_signal(df, pair, interval, profile, config)
+    indicator_df = add_all_indicators(df, config)
+    calls = [fn(indicator_df, config) for fn in STRATEGIES]
+    latest = indicator_df.iloc[-1]
+    consensus = check_consensus(calls, pair, interval, latest["timestamp"], float(latest["atr"]))
 
-    if signal.direction in ("BUY", "SELL"):
-        atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
-        signal.target_price, signal.stop_price = compute_atr_target_stop(
-            signal.price_at_signal, atr_val, signal.direction,
-            config.target_atr_mult, config.stop_atr_mult,
-        )
+    # No consensus at all (the common case, see check_consensus's own docstring) means there's
+    # no directional call to score -- same "nothing to hit or miss" reasoning create_signal's
+    # retired HOLD guard used, just at the consensus-existence level instead of a direction check.
+    if consensus is not None:
+        resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
+        features = extract_features(consensus.model_dump())
+        consensus.ml_hit_probability = predict_hit_probability(resolved_signals, features)
 
-    # "hit" only means anything for an actual trade -- HOLD signals never get target/stop,
-    # never get scored (see score_pending_signals' direction filter), and so never appear in
-    # the training set at all. Asking the model to score one isn't "not enough data," it's a
-    # different question with no meaning: there's no trade to hit or miss. Skip it rather than
-    # returning a number that looks like a real answer but isn't (the model's direction_buy
-    # feature is 0 for both a real SELL and a HOLD -- without this guard it would silently
-    # score a HOLD as if it were a SELL that never happened).
-    ml_hit_probability = None
-    if signal.direction in ("BUY", "SELL"):
-        resolved_signals = await get_ml_reference_signals(signals_collection)
-        features = extract_features(signal.model_dump())
-        ml_hit_probability = predict_hit_probability(resolved_signals, features)
-
-    response = signal.model_dump()
-    response["ml_hit_probability"] = ml_hit_probability
-    return response
+    return {"consensus": consensus, "strategy_calls": [c.model_dump() for c in calls]}
 
 
 def _rl_state_from_candles(
-    docs: list[dict], config: RuleConfig, pair: str, interval: str, profile: str, resolved_signals: list[dict],
+    docs: list[dict], config: RuleConfig, pair: str, interval: str, resolved_signals: list[dict],
 ) -> tuple[list[float], pd.DataFrame, Optional[float], Optional[float]]:
     """
     Builds the indicator dataframe and the current (latest-bar) market state vector the same
@@ -1052,31 +640,25 @@ def _rl_state_from_candles(
     straight into full_rl_state, same shape train_rl_policy's market_states entries have.
 
     Unlike train_rl_policy's frozen-snapshot fit (see that function's ml_reference_signals
-    docstring), this is genuinely live -- fits on every currently-resolved signal fresh, no
-    lookahead concern, exactly what GET /ml/predict already does for the same reason.
-    resolved_signals is fetched by the caller (async) rather than here, since this function is
-    plain sync.
+    docstring), this is genuinely live -- fits on every currently-resolved consensus signal
+    fresh, no lookahead concern, exactly what create_consensus_signal's own ML gate does for
+    the same reason. resolved_signals is fetched by the caller (async) rather than here, since
+    this function is plain sync.
 
     Also returns the raw (buy_score, sell_score) -- None, not the state vector's 0.5
     placeholder, when there isn't enough resolved history yet -- so create_rl_signal's own ML
-    quality gate can fail OPEN on "not enough data" the same way create_signal's does, rather
-    than reading a placeholder 0.5 as if it were a real (bad) score.
+    quality gate can fail OPEN on "not enough data" the same way create_consensus_signal's does,
+    rather than reading a placeholder 0.5 as if it were a real (bad) score.
     """
     df = pd.DataFrame(docs)
     indicator_df = add_all_indicators(df, config)
     states = compute_strategy_vote_states(indicator_df, config)
 
     latest = indicator_df.iloc[-1]
-    prev = indicator_df.iloc[-2]
-    reasons, _bullish_votes, _bearish_votes, total_rules, rule_votes, rule_strengths = apply_rules(
-        latest, prev, config,
-    )
-    buy_features = signal_like_features(
-        reasons, rule_votes, rule_strengths, total_rules, profile, "BUY", pair, interval,
-    )
-    sell_features = signal_like_features(
-        reasons, rule_votes, rule_strengths, total_rules, profile, "SELL", pair, interval,
-    )
+    calls = [fn(indicator_df, config) for fn in STRATEGIES]
+    atr_pct = float(latest["atr"] / latest["close"] * 100) if pd.notna(latest["atr"]) and latest["close"] else 0.0
+    buy_features = signal_like_features(calls, direction_confidence(calls, "BUY"), atr_pct, "BUY", pair, interval)
+    sell_features = signal_like_features(calls, direction_confidence(calls, "SELL"), atr_pct, "SELL", pair, interval)
     buy_score = predict_hit_probability(resolved_signals, buy_features)
     sell_score = predict_hit_probability(resolved_signals, sell_features)
     market_state = states[-1] + [
@@ -1176,11 +758,11 @@ async def _run_rl_training(
 
     # Fetched here (async, before the threadpool call) rather than inside train_ppo_policy
     # itself -- that function is sync/CPU-bound and runs via run_in_threadpool, which can't
-    # make its own motor (async) DB calls. Every currently-resolved rule-based signal, same
-    # query /ml/predict already uses -- train_ppo_policy filters this down to only the subset
-    # resolved before ITS OWN train/test split boundary once it knows where that falls (see
-    # rl_engine.frozen_ml_snapshot for why that filtering can't happen here).
-    ml_reference_signals = await get_ml_reference_signals(signals_collection)
+    # make its own motor (async) DB calls. Every currently-resolved consensus signal --
+    # train_ppo_policy filters this down to only the subset resolved before ITS OWN
+    # train/test split boundary once it knows where that falls (see rl_engine.frozen_ml_snapshot
+    # for why that filtering can't happen here).
+    ml_reference_signals = await get_ml_reference_signals(consensus_signals_collection)
 
     warm_start_policy_id, warm_start_model_bytes, baseline_return_pct = await _find_warm_start_policy(pair, interval)
 
@@ -1372,11 +954,10 @@ async def _trigger_rebuild_backtests_workflow(job_id: str, max_lookforward: int)
 @app.post("/backtest/rebuild-all")
 async def rebuild_all_backtests(max_lookforward: int = 20):
     """
-    Triggers a fresh rule-engine backtest (today's live default RuleConfig, see
-    signal_engine.PROFILE_DEFAULTS["intraday"]) across every pair x interval on a GitHub
-    Actions runner (.github/workflows/rebuild-backtests.yml) and returns immediately with a
-    job_id -- poll GET /backtest/rebuild-all/{job_id} for progress, same pattern as
-    POST /rl/train-all.
+    Triggers a fresh SMC consensus backtest (today's live default_config_for("intraday"), see
+    consensus.run_consensus_backtest) across every pair x interval on a GitHub Actions runner
+    (.github/workflows/rebuild-backtests.yml) and returns immediately with a job_id -- poll
+    GET /backtest/rebuild-all/{job_id} for progress, same pattern as POST /rl/train-all.
 
     This is what actually populates app/services/ml_training_data.py's Parquet archive
     (data/backtest_signals_archive/*.parquet, git-committed, NOT written to Mongo -- see
@@ -1938,9 +1519,9 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
                     f"Run /ingest/{interval} first."
         )
 
-    resolved_signals = await get_ml_reference_signals(signals_collection)
+    resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
     market_state, df, ml_buy_score, ml_sell_score = _rl_state_from_candles(
-        docs, config, pair, interval, rl_config_profile(interval), resolved_signals,
+        docs, config, pair, interval, resolved_signals,
     )
     state = full_rl_state(market_state, balance, policy.starting_balance)
     try:
@@ -2739,7 +2320,7 @@ async def paper_trade(
     stop_atr_mult: Optional[float] = None,
 ):
     """
-    Generates a fresh live signal from stored candles and, if directional, executes
+    Generates a fresh SMC consensus signal from stored candles and, if one fires, executes
     it as a Deriv Multipliers contract on your DEMO account. Refuses to run at all
     if the authorized Deriv account isn't virtual (see deriv_client.deriv_session).
 
@@ -2753,29 +2334,42 @@ async def paper_trade(
     config = default_config_for(profile, pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
     docs = await cursor.to_list(length=500)
-    docs.reverse()  # find() gave newest-first for the limit to bite correctly; generate_signal wants ascending
+    docs.reverse()  # find() gave newest-first for the limit to bite correctly
 
-    min_needed = config.ema_slow
+    min_needed = 30  # covers every strategy's own warmup (see run_consensus_backtest)
     if len(docs) < min_needed:
         raise HTTPException(
             status_code=400,
-            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ ({profile} profile). "
+            detail=f"Not enough candle history ({len(docs)} rows). Need {min_needed}+ for consensus. "
                     f"Run /ingest/{interval} first.",
         )
 
     df = pd.DataFrame(docs)
-    signal = generate_signal(df, pair, interval, profile, config)
-    await signals_collection.insert_one(signal.model_dump())
+    indicator_df = add_all_indicators(df, config)
+    calls = [fn(indicator_df, config) for fn in STRATEGIES]
+    latest = indicator_df.iloc[-1]
+    consensus = check_consensus(calls, pair, interval, latest["timestamp"], float(latest["atr"]))
 
-    if signal.direction == "HOLD":
-        return {"signal": signal, "paper_trade": None, "note": "Signal was HOLD — nothing executed."}
+    if consensus is None:
+        return {"signal": None, "paper_trade": None, "note": "No consensus right now — nothing executed."}
 
-    atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
-    signal.target_price, signal.stop_price = compute_atr_target_stop(
-        signal.price_at_signal, atr_val, signal.direction,
+    # Signal (not ConsensusSignal) is what execute_paper_trade/paper_trades_collection
+    # expect -- kept as the generic trade-record shape for exactly this kind of consumer
+    # (see PROGRESS.md's rule-engine-removal migration entry). Target/stop always
+    # recomputed from ATR + mult here (default or override) rather than reused from
+    # consensus's own averaged target/stop, matching this endpoint's prior behavior.
+    atr_val = float(latest["atr"])
+    target_price, stop_price = compute_atr_target_stop(
+        consensus.entry_price, atr_val, consensus.direction,
         target_atr_mult if target_atr_mult is not None else config.target_atr_mult,
         stop_atr_mult if stop_atr_mult is not None else config.stop_atr_mult,
     )
+    signal = Signal(
+        pair=pair, profile=profile, interval=interval, timestamp=consensus.timestamp,
+        direction=consensus.direction, confidence=consensus.confidence, reasons=[],
+        price_at_signal=consensus.entry_price, target_price=target_price, stop_price=stop_price,
+    )
+    await signals_collection.insert_one(signal.model_dump())
 
     try:
         trade = await execute_paper_trade(signal, stake=stake, multiplier=multiplier)
@@ -2861,12 +2455,15 @@ async def _run_all_flows_job(job_id: str) -> None:
     previous one.
     """
     results: dict = {
-        "ingest": {}, "rl_training": {}, "signals": {}, "consensus": {}, "rl_signals": {}, "score": {}, "ml_train": None,
+        "ingest": {}, "rl_training": {}, "consensus": {}, "rl_signals": {}, "score": {}, "ml_train": None,
     }
     # 5 ingest checkpoints + 20 RL-training checkpoints + 20 pair/interval checkpoints
-    # (signals+consensus+rl_signals together count as one unit of progress each) + 3 score
-    # checkpoints + 1 ml_train.
-    total_steps = len(RL_INTERVALS) + 2 * (len(RL_INTERVALS) * len(settings.pairs_list)) + 3 + 1
+    # (consensus+rl_signals together count as one unit of progress each) + 2 score
+    # checkpoints (consensus, rl) + 1 ml_train. The rule engine's own "signals" generation
+    # and score step were removed along with the rest of that engine (see PROGRESS.md's
+    # rule-engine-removal entry) -- nothing writes new pending docs into signals_collection
+    # anymore now that create_signal is gone, so there's no third score checkpoint.
+    total_steps = len(RL_INTERVALS) + 2 * (len(RL_INTERVALS) * len(settings.pairs_list)) + 2 + 1
     await run_all_flows_jobs_collection.update_one(
         {"job_id": job_id, "status": "running"}, {"$set": {"total_steps": total_steps}}
     )
@@ -2937,14 +2534,8 @@ async def _run_all_flows_job(job_id: str) -> None:
                 break
 
         for interval in RL_INTERVALS:
-            profile = "intraday"
             for pair in settings.pairs_list:
                 key = f"{pair}/{interval}"
-                try:
-                    await create_signal(interval, profile, pair)
-                    results["signals"][key] = "ok"
-                except Exception as e:
-                    results["signals"][key] = f"error: {e}"
                 try:
                     await create_consensus_signal(interval, pair)
                     results["consensus"][key] = "ok"
@@ -2957,13 +2548,6 @@ async def _run_all_flows_job(job_id: str) -> None:
                     results["rl_signals"][key] = f"error: {e}"
                 if not await _run_all_flows_step(job_id, results, f"signals {key}"):
                     return
-
-        try:
-            results["score"]["signals"] = await score_signals()
-        except Exception as e:
-            results["score"]["signals"] = f"error: {e}"
-        if not await _run_all_flows_step(job_id, results, "score signals"):
-            return
 
         try:
             results["score"]["consensus"] = await score_consensus_signals()

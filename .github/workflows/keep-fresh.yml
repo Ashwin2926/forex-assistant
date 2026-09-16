@@ -22,9 +22,11 @@ name: Keep candle data fresh
 # All five intervals run the same validated RuleConfig now (see
 # signal_engine.PROFILE_DEFAULTS["intraday"]) -- the separate "swing" profile that used
 # to run on 1h/4h/1day was removed (see PROGRESS.md), and this workflow's own 1h/4h/1day
-# steps had been temporarily disabled as part of that same change. Restored here with
-# every /signals/.../swing URL updated to /signals/.../intraday and RL widened back to
-# all 5 intervals -- see PROGRESS.md for the date this was flipped back on.
+# steps had been temporarily disabled as part of that same change, then restored across
+# all 5 intervals. The rule engine's own /signals/.../intraday generate step and
+# /signals/score were removed entirely as part of the SMC-only migration (see
+# PROGRESS.md's rule-engine-removal entry) -- consensus (SMC) and RL are the only live
+# signal sources now, both already covered by their own steps below.
 on:
   schedule:
     - cron: "*/20 * * * *"  # 5min + 15min candles
@@ -63,49 +65,14 @@ jobs:
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1day?output_size=5"
-      # Generation was previously frontend-only (api.generateSignal, called when someone
-      # loads the dashboard) — ingest/score ran unattended but no new signals appeared
-      # unless a human visited the site. These steps make generation unattended too, on
-      # the same per-interval cadence as that interval's own ingest step above. Every
-      # interval uses the same intraday-validated RuleConfig now (see
-      # signal_engine.PROFILE_DEFAULTS) -- create_signal is itself de-duped (see
-      # app/main.py) against the last live signal for the same pair/interval/profile, so
-      # re-running this won't insert duplicates when the underlying candle hasn't advanced.
-      - name: Generate intraday signals (5min, 15min)
-        run: |
-          for interval in 5min 15min; do
-            for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-                "$API_BASE/signals/$interval/intraday?pair=${pair/\//%2F}"
-            done
-          done
-      - name: Generate intraday signals (1h)
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
-        run: |
-          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/1h/intraday?pair=${pair/\//%2F}"
-          done
-      - name: Generate intraday signals (4h)
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
-        run: |
-          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/4h/intraday?pair=${pair/\//%2F}"
-          done
-      - name: Generate intraday signals (1day)
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
-        run: |
-          for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/signals/1day/intraday?pair=${pair/\//%2F}"
-          done
-      # Consensus (app/services/consensus.py) is a separate, additive signal source on top
-      # of the rule engine -- checked on the same per-interval cadence as the generate steps
-      # above, reusing the candles that step already ingested (zero extra Twelve Data calls).
-      # Only fires a stored signal on genuine weighted-majority agreement (see consensus.py's
-      # REQUIRED_WEIGHT_FRACTION), so most of these calls are
-      # expected to return "no consensus" -- that's normal, not a sign anything's broken.
+      # Consensus (app/services/consensus.py, SMC) is the only live signal source now --
+      # the rule engine's own generate-signal step (POST /signals/.../intraday) was removed
+      # along with the rest of that engine, see PROGRESS.md's rule-engine-removal entry.
+      # Checked on the same per-interval cadence as ingest above, reusing the candles that
+      # step already ingested (zero extra Twelve Data calls). Only fires a stored signal on
+      # genuine weighted-majority agreement (see consensus.py's REQUIRED_WEIGHT_FRACTION),
+      # so most of these calls are expected to return "no consensus" -- that's normal, not a
+      # sign anything's broken.
       - name: Check consensus (5min, 15min)
         run: |
           for interval in 5min 15min; do
@@ -135,9 +102,6 @@ jobs:
             curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/consensus/1day?pair=${pair/\//%2F}"
           done
-      - name: Score pending live signals
-        run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/signals/score"
       - name: Score pending consensus signals
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/consensus/score"
@@ -150,7 +114,7 @@ jobs:
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train"
       # RL agent (app/services/rl_engine.py) -- a learned, adaptive alternative to consensus's
-      # fixed weighted-vote threshold over the same 7 strategies. Covers all 5 intervals, one
+      # fixed weighted-vote threshold over the same 5 SMC strategies. Covers all 5 intervals, one
       # independent policy per pair PER interval. Training itself no longer happens here --
       # see .github/workflows/train-rl.yml and PROGRESS.md's 2026-09-10 entry: looping 20
       # sequential ~60-90s synchronous /rl/train calls from this workflow already produced a

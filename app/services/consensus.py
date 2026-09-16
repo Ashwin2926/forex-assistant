@@ -32,6 +32,27 @@ REQUIRED_WEIGHT_FRACTION = 0.6
 PROXIMITY_ATR_MULT = 0.5
 
 
+def direction_confidence(calls: list[StrategyCall], direction: str) -> float:
+    """
+    Weighted agreement strength for a specific direction, using the same STRATEGY_WEIGHTS
+    check_consensus itself votes with -- lets a caller (rl_engine.compute_ml_scores, ML
+    feature extraction in main.py) score "how strongly do these calls support BUY/SELL"
+    without a full check_consensus pass (which also gates on price proximity -- appropriate
+    for a real trade decision, unnecessary overhead for scoring a hypothetical direction).
+    Same "agreeing weight / total weight" shape signal_engine.decide() used to compute for
+    the rule engine, generalized to a caller-chosen direction the way that module's own
+    (now-removed) direction_confidence did.
+    """
+    total_weight = sum(STRATEGY_WEIGHTS.get(c.strategy, 1.0) for c in calls)
+    if total_weight == 0:
+        return 0.0
+    agreeing_weight = sum(
+        STRATEGY_WEIGHTS.get(c.strategy, 1.0) * (c.strength or 0.0)
+        for c in calls if c.direction == direction
+    )
+    return round(min(agreeing_weight / total_weight, 1.0) * 100, 1)
+
+
 def check_consensus(
     calls: list[StrategyCall], pair: str, interval: str, timestamp: datetime, atr: float,
 ) -> Optional[ConsensusSignal]:
@@ -65,12 +86,15 @@ def check_consensus(
         if (max(targets) - min(targets)) > tolerance:
             continue
 
+        mean_entry = sum(entries) / len(entries)
         return ConsensusSignal(
             pair=pair, interval=interval, timestamp=timestamp, direction=direction,
-            entry_price=sum(entries) / len(entries),
+            entry_price=mean_entry,
             target_price=sum(targets) / len(targets),
             stop_price=sum(stops) / len(stops),
             agreeing_count=len(agreeing),  # a real headcount for display, even though the gate above is weighted
+            confidence=direction_confidence(calls, direction),
+            atr_pct=(atr / mean_entry * 100) if mean_entry else 0.0,
             strategy_calls=calls,
         )
 

@@ -1,4 +1,4 @@
-import type { BacktestRebuildJob, BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, OptimizeRankBy, OptimizeResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLSignal, RLTrainAllJob, RuleConfig, RunAllFlowsJob, Signal, SignalAccuracy } from "./types";
+import type { BacktestRebuildJob, BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -48,80 +48,9 @@ export const api = {
     return request<Record<string, string>>(`/ingest/${interval}`, { method: "POST" });
   },
 
-  generateSignal(pair: string, interval: string, profile: string) {
-    // pair goes in the query string, not the path — a literal '/' in a path segment
-    // breaks Starlette's routing even when percent-encoded.
-    return request<Signal>(
-      `/signals/${interval}/${profile}?pair=${encodeURIComponent(pair)}`,
-      { method: "POST" },
-    );
-  },
-
-  listSignals(params: { pair?: string; limit?: number } = {}) {
-    const qs = new URLSearchParams();
-    if (params.pair) qs.set("pair", params.pair);
-    if (params.limit) qs.set("limit", String(params.limit));
-    const query = qs.toString();
-    return request<Signal[]>(`/signals${query ? `?${query}` : ""}`);
-  },
-
-  scoreSignals(maxLookforward?: number) {
-    const qs = maxLookforward !== undefined ? `?max_lookforward=${maxLookforward}` : "";
-    return request<{ hit: number; miss: number; expired: number; still_pending: number; skipped_no_data: number }>(
-      `/signals/score${qs}`, { method: "POST" },
-    );
-  },
-
-  getSignalAccuracy(params: { pair?: string; profile?: string; limit?: number } = {}) {
-    const qs = new URLSearchParams();
-    if (params.pair) qs.set("pair", params.pair);
-    if (params.profile) qs.set("profile", params.profile);
-    if (params.limit) qs.set("limit", String(params.limit));
-    const query = qs.toString();
-    return request<SignalAccuracy>(`/signals/accuracy${query ? `?${query}` : ""}`);
-  },
-
   getCandles(pair: string, interval: string, profile: string, limit = 250) {
     const qs = new URLSearchParams({ pair, profile, limit: String(limit) });
     return request<CandlePoint[]>(`/candles/${interval}?${qs.toString()}`);
-  },
-
-  runBacktest(
-    pair: string,
-    interval: string,
-    profile: string,
-    opts: { target_atr_mult?: number; stop_atr_mult?: number; max_lookforward?: number; config?: Partial<RuleConfig> } = {},
-  ) {
-    const qs = new URLSearchParams({ pair });
-    if (opts.target_atr_mult !== undefined) qs.set("target_atr_mult", String(opts.target_atr_mult));
-    if (opts.stop_atr_mult !== undefined) qs.set("stop_atr_mult", String(opts.stop_atr_mult));
-    if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
-    return request<BacktestRun>(
-      `/backtest/${interval}/${profile}?${qs.toString()}`,
-      { method: "POST", body: opts.config ? JSON.stringify(opts.config) : undefined },
-    );
-  },
-
-  runOptimize(
-    pair: string,
-    interval: string,
-    profile: string,
-    opts: {
-      train_frac?: number; target_atr_mult?: number; stop_atr_mult?: number;
-      max_lookforward?: number; min_directional_signals?: number; rank_by?: OptimizeRankBy; configs?: RuleConfig[];
-    } = {},
-  ) {
-    const qs = new URLSearchParams({ pair });
-    if (opts.train_frac !== undefined) qs.set("train_frac", String(opts.train_frac));
-    if (opts.target_atr_mult !== undefined) qs.set("target_atr_mult", String(opts.target_atr_mult));
-    if (opts.stop_atr_mult !== undefined) qs.set("stop_atr_mult", String(opts.stop_atr_mult));
-    if (opts.max_lookforward !== undefined) qs.set("max_lookforward", String(opts.max_lookforward));
-    if (opts.min_directional_signals !== undefined) qs.set("min_directional_signals", String(opts.min_directional_signals));
-    if (opts.rank_by !== undefined) qs.set("rank_by", opts.rank_by);
-    return request<OptimizeResult>(
-      `/backtest/optimize/${interval}/${profile}?${qs.toString()}`,
-      { method: "POST", body: opts.configs ? JSON.stringify(opts.configs) : undefined },
-    );
   },
 
   listBacktestRuns(params: { pair?: string; profile?: string; limit?: number } = {}) {
@@ -361,11 +290,10 @@ export const api = {
     return request<PaperTrade[]>(`/paper-trade/history${query ? `?${query}` : ""}`);
   },
 
-  // Manually replicates one keep-fresh.yml cron cycle (ingest, generate signals, score,
-  // retrain ML) -- for when the GitHub Actions cron has gone quiet for a while. Excludes RL
-  // training (see POST /rl/train-all separately) -- see the endpoint's own docstring for why.
-  // Runs as a background job (can take well over a minute) -- poll getRunAllFlowsJob for
-  // status/results, same pattern as RL "train all".
+  // Manually replicates one keep-fresh.yml cron cycle (ingest, retrain RL, check consensus,
+  // generate RL signals, score, retrain ML) -- for when the GitHub Actions cron has gone
+  // quiet for a while. Runs as a background job (can take well over a minute) -- poll
+  // getRunAllFlowsJob for status/results, same pattern as RL "train all".
   startRunAllFlows() {
     return request<{ job_id: string; status: string }>("/ops/run-all-flows", { method: "POST" });
   },

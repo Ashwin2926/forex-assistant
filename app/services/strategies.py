@@ -480,3 +480,11 @@ def call_supply_demand(df: pd.DataFrame, config: RuleConfig = RuleConfig()) -> S
 STRATEGIES: list[Callable[..., StrategyCall]] = [
     call_market_structure, call_order_blocks, call_fair_value_gap, call_liquidity_sweep, call_supply_demand,
 ]
+
+# Names in the same order STRATEGIES itself is declared -- derived, not hand-typed, so every
+# consumer (rl_engine.py's state features, ml_features.py's ML feature names,
+# consensus.py's STRATEGY_WEIGHTS) shares one list that can't drift out of sync with
+# STRATEGIES. Lives here (not in rl_engine.py, where it originated) so ml_features.py can
+# import it without an rl_engine.py <-> ml_features.py circular import (rl_engine.py already
+# imports signal_like_features/FEATURE_NAMES from ml_features.py).
+STRATEGY_NAMES: list[str] = [fn.__name__.removeprefix("call_") for fn in STRATEGIES]

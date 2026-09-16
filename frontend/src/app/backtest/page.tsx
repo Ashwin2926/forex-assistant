@@ -12,55 +12,12 @@ import {
   YAxis,
 } from "recharts";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type OptimizeRankBy, type OptimizeResult, type RuleConfig } from "@/lib/types";
-
-// Mirrors PROFILE_DEFAULTS["intraday"] in signal_engine.py. Optimize without an explicit
-// `configs` body falls back to the backend's generic DEFAULT_OPTIMIZE_GRID, which never
-// sets session_filter_enabled -- that grid silently tests an unfiltered strategy that has
-// nothing to do with the live config, and the resulting hit-rate numbers aren't comparable
-// to anything real. Every candidate here keeps the session filter on, varying one or two
-// axes at a time around the actual live baseline (the first entry) instead.
-const INTRADAY_BASELINE: RuleConfig = {
-  ema_fast: 9, ema_slow: 21, rsi_period: 14, rsi_oversold: 30, rsi_overbought: 70,
-  macd_fast: 12, macd_slow: 26, macd_signal: 9, atr_period: 14,
-  volatility_threshold_pct: 0.02, session_filter_enabled: true,
-  session_start_hour_utc: 12, session_end_hour_utc: 16,
-  target_atr_mult: 1.5, stop_atr_mult: 1.0,
-};
-
-const INTRADAY_OPTIMIZE_GRID: RuleConfig[] = [
-  INTRADAY_BASELINE,
-  { ...INTRADAY_BASELINE, ema_fast: 7, ema_slow: 18 },
-  { ...INTRADAY_BASELINE, ema_fast: 12, ema_slow: 26 },
-  { ...INTRADAY_BASELINE, rsi_oversold: 25, rsi_overbought: 75 },
-  { ...INTRADAY_BASELINE, rsi_oversold: 35, rsi_overbought: 65 },
-  { ...INTRADAY_BASELINE, volatility_threshold_pct: 0.01 },
-  { ...INTRADAY_BASELINE, volatility_threshold_pct: 0.03 },
-  { ...INTRADAY_BASELINE, target_atr_mult: 0.5, stop_atr_mult: 1.25 },
-  { ...INTRADAY_BASELINE, ema_fast: 7, ema_slow: 18, rsi_oversold: 25, rsi_overbought: 75 },
-];
+import type { BacktestRun } from "@/lib/types";
 
 export default function BacktestPage() {
   const [runs, setRuns] = useState<BacktestRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  const [pair, setPair] = useState<string>(PAIRS[0]);
-  const [interval, setInterval_] = useState<string>("1h");
-  const [targetAtrMult, setTargetAtrMult] = useState(1.5);
-  const [stopAtrMult, setStopAtrMult] = useState(1.0);
-  const [maxLookforward, setMaxLookforward] = useState(20);
-  const [running, setRunning] = useState(false);
-  const [runError, setRunError] = useState<string | null>(null);
-
-  const [optPair, setOptPair] = useState<string>(PAIRS[0]);
-  const [optInterval, setOptInterval] = useState<string>("15min");
-  const [trainFrac, setTrainFrac] = useState(0.7);
-  const [minSignals, setMinSignals] = useState(20);
-  const [rankBy, setRankBy] = useState<OptimizeRankBy>("expectancy");
-  const [optimizing, setOptimizing] = useState(false);
-  const [optimizeError, setOptimizeError] = useState<string | null>(null);
-  const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(null);
 
   async function loadRuns() {
     setLoading(true);
@@ -79,46 +36,6 @@ export default function BacktestPage() {
     loadRuns();
   }, []);
 
-  async function handleRunBacktest() {
-    setRunning(true);
-    setRunError(null);
-    try {
-      await api.runBacktest(pair, interval, "intraday", {
-        target_atr_mult: targetAtrMult,
-        stop_atr_mult: stopAtrMult,
-        max_lookforward: maxLookforward,
-      });
-      await loadRuns();
-    } catch (e) {
-      setRunError(e instanceof ApiError ? e.message : "Backtest failed.");
-    } finally {
-      setRunning(false);
-    }
-  }
-
-  async function handleRunOptimize() {
-    setOptimizing(true);
-    setOptimizeError(null);
-    setOptimizeResult(null);
-    try {
-      const result = await api.runOptimize(optPair, optInterval, "intraday", {
-        train_frac: trainFrac,
-        min_directional_signals: minSignals,
-        rank_by: rankBy,
-        // The backend's generic default grid never sets session_filter_enabled, so for
-        // the live intraday config it'd silently test an unfiltered strategy that has
-        // nothing to do with what's actually running -- use the real-baseline grid instead.
-        configs: INTRADAY_OPTIMIZE_GRID,
-      });
-      setOptimizeResult(result);
-      await loadRuns();
-    } catch (e) {
-      setOptimizeError(e instanceof ApiError ? e.message : "Optimize failed.");
-    } finally {
-      setOptimizing(false);
-    }
-  }
-
   const chartData = [...runs]
     .filter((r) => r.hit_rate_pct != null)
     .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
@@ -131,181 +48,13 @@ export default function BacktestPage() {
   return (
     <div className="flex flex-col gap-8">
       <section>
-        <h1 className="text-xl font-semibold tracking-tight">Backtesting</h1>
+        <h1 className="text-xl font-semibold tracking-tight">Backtest runs</h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Replay the rule engine bar-by-bar over stored history. No live signal is trusted
-          until its ruleset has a track record here.
+          History of every SMC consensus and PPO agent backtest run. Trigger a new consensus
+          backtest from the <Link href="/consensus" className="underline underline-offset-2">Consensus page</Link>,
+          or an RL evaluation from the <Link href="/rl" className="underline underline-offset-2">PPO Agent page</Link> —
+          both land here.
         </p>
-      </section>
-
-      <section className="card p-4">
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Run a backtest</h2>
-        <div className="mt-3 flex flex-wrap items-end gap-3">
-          <Field label="Pair">
-            <select value={pair} onChange={(e) => setPair(e.target.value)} className="select">
-              {PAIRS.map((p) => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </Field>
-          <Field label="Interval">
-            <select value={interval} onChange={(e) => setInterval_(e.target.value)} className="select">
-              {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
-            </select>
-          </Field>
-          <Field label="Target (x ATR)">
-            <input
-              type="number" step="0.1" value={targetAtrMult}
-              onChange={(e) => setTargetAtrMult(Number(e.target.value))}
-              className="select w-20"
-            />
-          </Field>
-          <Field label="Stop (x ATR)">
-            <input
-              type="number" step="0.1" value={stopAtrMult}
-              onChange={(e) => setStopAtrMult(Number(e.target.value))}
-              className="select w-20"
-            />
-          </Field>
-          <Field label="Max lookforward">
-            <input
-              type="number" step="1" value={maxLookforward}
-              onChange={(e) => setMaxLookforward(Number(e.target.value))}
-              className="select w-24"
-            />
-          </Field>
-          <button onClick={handleRunBacktest} disabled={running} className="btn-primary">
-            {running ? "Running…" : "Run backtest"}
-          </button>
-        </div>
-        {runError && (
-          <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-            {runError}
-          </p>
-        )}
-      </section>
-
-      <section className="card p-4">
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Optimize (train/test validated)</h2>
-        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Grid-searches RuleConfig on the first <code className="font-mono">train_frac</code> of
-          history, picks the best hit-rate there, then re-scores that exact config on the
-          untouched remaining tail. A real improvement survives on data it never saw during
-          tuning — a large drop from train to test means the &quot;winner&quot; was curve-fit noise, not signal.
-        </p>
-        <div className="mt-3 flex flex-wrap items-end gap-3">
-          <Field label="Pair">
-            <select value={optPair} onChange={(e) => setOptPair(e.target.value)} className="select">
-              {PAIRS.map((p) => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </Field>
-          <Field label="Interval">
-            <select value={optInterval} onChange={(e) => setOptInterval(e.target.value)} className="select">
-              {INTERVALS.map((i) => <option key={i} value={i}>{i}</option>)}
-            </select>
-          </Field>
-          <Field label="Train fraction">
-            <input
-              type="number" step="0.05" min="0.1" max="0.9" value={trainFrac}
-              onChange={(e) => setTrainFrac(Number(e.target.value))}
-              className="select w-20"
-            />
-          </Field>
-          <Field label="Min signals">
-            <input
-              type="number" step="1" value={minSignals}
-              onChange={(e) => setMinSignals(Number(e.target.value))}
-              className="select w-24"
-            />
-          </Field>
-          <Field label="Rank by">
-            <select value={rankBy} onChange={(e) => setRankBy(e.target.value as OptimizeRankBy)} className="select">
-              <option value="expectancy">Expectancy (recommended)</option>
-              <option value="hit_rate">Hit rate</option>
-            </select>
-          </Field>
-          <button onClick={handleRunOptimize} disabled={optimizing} className="btn-primary">
-            {optimizing ? "Optimizing…" : "Run optimize"}
-          </button>
-        </div>
-        {optimizeError && (
-          <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-            {optimizeError}
-          </p>
-        )}
-
-        {optimizeResult && (
-          <div className="mt-4 flex flex-col gap-4">
-            <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Ranked by <span className="font-medium">{optimizeResult.rank_by === "expectancy" ? "expectancy" : "hit rate"}</span>.
-              Both metrics are shown below — they can disagree (a lower hit-rate config can still
-              have better expected value if its wins are bigger relative to its losses).
-            </p>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-2">
-              <TrainTestCard label="Train" run={optimizeResult.train} accent="zinc" />
-              <TrainTestCard label="Test (out-of-sample)" run={optimizeResult.test} accent="emerald" />
-            </div>
-
-            <div>
-              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Winning config</p>
-              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-zinc-50 px-3 py-2 text-xs font-mono dark:bg-zinc-800">
-                <span>EMA {optimizeResult.winning_config.ema_fast}/{optimizeResult.winning_config.ema_slow}</span>
-                <span>RSI {optimizeResult.winning_config.rsi_oversold}/{optimizeResult.winning_config.rsi_overbought}</span>
-                <span>target/stop {optimizeResult.winning_config.target_atr_mult}x/{optimizeResult.winning_config.stop_atr_mult}x ATR</span>
-                <span>vol_threshold {optimizeResult.winning_config.volatility_threshold_pct}%</span>
-                <span>
-                  session_filter {optimizeResult.winning_config.session_filter_enabled
-                    ? `${optimizeResult.winning_config.session_start_hour_utc}:00-${optimizeResult.winning_config.session_end_hour_utc}:00 UTC`
-                    : "off"}
-                </span>
-              </div>
-            </div>
-
-            <div>
-              <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">All candidates (train slice)</p>
-              <div className="mt-1 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-                <table className="w-full text-left text-xs">
-                  <thead className="table-head uppercase">
-                    <tr>
-                      <th className="px-3 py-1.5">EMA</th>
-                      <th className="px-3 py-1.5">RSI</th>
-                      <th className="px-3 py-1.5">Target/Stop</th>
-                      <th className="px-3 py-1.5">Session</th>
-                      <th className="px-3 py-1.5">Signals</th>
-                      <th className="px-3 py-1.5">Hit rate</th>
-                      <th className="px-3 py-1.5">Expectancy</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[...optimizeResult.candidates_evaluated]
-                      .sort((a, b) => {
-                        const key = optimizeResult.rank_by === "expectancy" ? "expectancy_pct" : "hit_rate_pct";
-                        return (b[key] ?? -Infinity) - (a[key] ?? -Infinity);
-                      })
-                      .map((c, i) => {
-                        const isWinner = JSON.stringify(c.config) === JSON.stringify(optimizeResult.winning_config);
-                        return (
-                          <tr
-                            key={i}
-                            className={`border-t border-zinc-100 dark:border-zinc-800 ${isWinner ? "bg-emerald-50 dark:bg-emerald-950" : ""}`}
-                          >
-                            <td className="px-3 py-1.5 font-mono">{c.config.ema_fast}/{c.config.ema_slow}</td>
-                            <td className="px-3 py-1.5 font-mono">{c.config.rsi_oversold}/{c.config.rsi_overbought}</td>
-                            <td className="px-3 py-1.5 font-mono">{c.config.target_atr_mult}x/{c.config.stop_atr_mult}x</td>
-                            <td className="px-3 py-1.5">{c.config.session_filter_enabled ? "on" : "off"}</td>
-                            <td className="px-3 py-1.5">{c.directional_signals}</td>
-                            <td className="px-3 py-1.5">{c.hit_rate_pct != null ? `${c.hit_rate_pct}%` : "—"}</td>
-                            <td className="px-3 py-1.5">
-                              {c.expectancy_pct != null ? `${c.expectancy_pct >= 0 ? "+" : ""}${c.expectancy_pct}%` : "—"}
-                              {isWinner && <span className="ml-1 text-emerald-700 dark:text-emerald-400">← winner</span>}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
       </section>
 
       {chartData.length > 1 && (
@@ -334,7 +83,9 @@ export default function BacktestPage() {
         )}
         {loading && !error && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
         {!loading && !error && runs.length === 0 && (
-          <p className="mt-4 text-sm text-zinc-500">No backtests run yet. Use the form above.</p>
+          <p className="mt-4 text-sm text-zinc-500">
+            No backtests run yet. Run one from the Consensus or PPO Agent page.
+          </p>
         )}
         <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
           <table className="w-full text-left text-sm">
@@ -377,36 +128,5 @@ export default function BacktestPage() {
         </div>
       </section>
     </div>
-  );
-}
-
-function TrainTestCard({ label, run, accent }: { label: string; run: BacktestRun; accent: "zinc" | "emerald" }) {
-  const border = accent === "emerald" ? "border-emerald-200 dark:border-emerald-900" : "border-zinc-200 dark:border-zinc-800";
-  const bg = accent === "emerald" ? "bg-emerald-50 dark:bg-emerald-950" : "bg-zinc-50 dark:bg-zinc-800";
-  return (
-    <div className={`rounded-lg border ${border} ${bg} p-3`}>
-      <p className="text-xs text-zinc-500 dark:text-zinc-400">{label}</p>
-      <div className="mt-1 flex items-baseline gap-3">
-        <p className="text-2xl font-semibold">{run.hit_rate_pct != null ? `${run.hit_rate_pct}%` : "—"}</p>
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">
-          hit rate · expectancy{" "}
-          <span className={run.expectancy_pct != null && run.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}>
-            {run.expectancy_pct != null ? `${run.expectancy_pct >= 0 ? "+" : ""}${run.expectancy_pct}%` : "—"}
-          </span>
-        </p>
-      </div>
-      <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-        {run.directional_signals} signals ({run.hits}/{run.misses}/{run.expired}) · {run.candles_evaluated} candles
-      </p>
-    </div>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="flex flex-col gap-1 text-xs text-zinc-500">
-      {label}
-      {children}
-    </label>
   );
 }

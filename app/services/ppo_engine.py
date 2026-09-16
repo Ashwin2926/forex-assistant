@@ -121,7 +121,7 @@ def _build_market_states(
     """Same market-state construction this project's RL training has always used -- reused, not reimplemented."""
     indicator_df = add_all_indicators(df, config)
     ml_model = rl.frozen_ml_snapshot(df, split_idx, ml_reference_signals)
-    ml_scores = rl.compute_ml_scores(indicator_df, config, pair, interval, rl.rl_config_profile(interval), ml_model)
+    ml_scores = rl.compute_ml_scores(indicator_df, config, pair, interval, ml_model)
     market_states = [
         ms + [buy_score, sell_score]
         for ms, (buy_score, sell_score) in zip(rl.compute_strategy_vote_states(indicator_df, config), ml_scores)
