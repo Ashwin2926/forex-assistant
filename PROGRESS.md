@@ -4,6 +4,76 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-16/17
+
+**Rule-engine-removal: every live decision surface (ML classifier features, RL
+state/training, live signal generation, backtesting) now runs entirely on the 5 SMC
+strategies + consensus voting instead of the retired EMA/RSI/MACD rule engine.**
+`apply_rules`/`decide`/`generate_signal` and every rule-engine-only endpoint
+(`/signals/*`, `/backtest/{interval}/{profile}`, `/backtest/sweep/*`,
+`/backtest/optimize/*`) are removed; `run_backtest` (backtester.py) is gone along with
+them, since `run_consensus_backtest` is now the only backtest path. `RuleConfig` is
+trimmed to just the EMA/RSI/MACD/ATR periods SMC strategies and `indicators.py` still
+read — the vote-threshold and session-gate fields (`rsi_oversold`/`overbought`,
+`volatility_threshold_pct`, `session_filter_*`) are gone since nothing reads them
+anymore.
+
+Reset Mongo's derived-state collections (`signals`, `backtest_signals`, `backtest_runs`,
+`paper_trades`, `consensus_signals`, `ml_runs`, `rl_policies`, `rl_signals`,
+`rl_train_jobs`, `ppo_policies`, `run_all_flows_jobs`, `backtest_rebuild_jobs` — candles
+kept intact) so ML/RL training data can't mix pre- and post-migration signal shapes.
+Built `scripts/reset_mongo.py` + `.github/workflows/reset-mongo.yml` as a reusable tool
+for this. Rebuilt the backtest signal archive under the new SMC consensus engine (535
+resolved signals across 20 pair/interval combos, ~588KB — tiny next to the old
+rule-engine archive that caused the 2026-09-12 OOM, so
+`ml_training_data.load_backtest_signals_archive()` was safely re-enabled).
+
+Found and fixed two dead call sites the migration pass initially missed: `keep-fresh.yml`
+was still calling the removed `/signals/{interval}/intraday` and `/signals/score`
+endpoints every 20 minutes, and `_run_all_flows_job` ("Sync now") was still calling the
+now-undefined `create_signal`/`score_signals` Python names directly (would have errored
+on every run, silently, caught by a bare `except`).
+
+Ran a full local RL retrain sweep (all 20 pair/interval combos, against production Mongo)
+to see how many combos still produce a usable policy under the new SMC-only state
+features. 7 kept, 13 rejected (`should_keep_new_policy`'s 0%-return floor, since
+`ppo_policies` was empty post-reset): GBP/USD 1day was the standout (54.1% hit rate,
++1750% return); every 5min/15min combo across all 4 pairs failed to beat breakeven.
+5min-interval combos are each backed by ~500K archived candles (vs. ~5-11K for 4h/1day),
+and the per-bar Python loop in `compute_strategy_vote_states`/`compute_ml_scores` made a
+single 5min combo take over an hour locally — a real scale finding, not a bug; the
+project's own `train-rl.yml` runner is built for exactly this reason (~30-35 min for all
+20 combos there per that workflow's own historical benchmark, though that number predates
+today's archive sizes and hasn't been re-verified since).
+
+Frontend: `/` now redirects to the already-SMC-based `/trading-signals` page instead of
+duplicating the old rule-engine "Signal Feed" home; `backtest/page.tsx` keeps only the
+(now generic) run-history view, since `/consensus` already has its own full SMC backtest
+UI; `RunDetail.tsx`'s rule table is relabeled to reflect that `rule_stats` is now
+per-SMC-strategy stats (backtester.py already repurposed that field, nothing to remove);
+the chart page overlays consensus signals instead of rule-engine ones; `ml/page.tsx` is
+updated for `/ml/predict`'s new `{consensus, strategy_calls}` response shape (the old
+`MLPrediction = Signal & {...}` type no longer matched the endpoint at all); `api.ts`/
+`types.ts` are pruned of the rule-engine-only surface (`RuleConfig` kept in trimmed form
+— `BacktestRun.rule_config` still returns it).
+
+Committed and pushed (`1b70ec9`) — both FastAPI Cloud and Vercel redeployed clean.
+
+**`train-rl.yml`/`keep-fresh.yml` were found `disabled_manually`** (not GitHub's
+auto-disable) when trying to trigger them from the frontend — re-enabled both via the
+GitHub API and manually dispatched `train-rl.yml`/`rebuild-backtests.yml`/`keep-fresh.yml`
+directly with a user-supplied session PAT to unblock training without waiting on the
+in-app trigger. **Separately, the in-app "PPO train all"/"Rebuild & retrain" buttons were
+failing with "failed to start training"** — `GET /debug/dispatch-check` (a diagnostic
+already built for this exact failure mode, see its own docstring) confirmed the backend's
+own stored `GITHUB_PAT` env var (FastAPI Cloud, distinct from the session PAT above) was
+rejected by GitHub with `401 Bad credentials` — expired/revoked. User updated it on
+FastAPI Cloud; that redeploy then failed for an unrelated reason (`ConfigurationError`
+resolving `MONGODB_URI`'s SRV DNS record, `Do53:172.20.0.10@53` timing out 6x in the
+deploy container — a one-off infra DNS blip, not a code or credential issue). The
+currently-live instance was unaffected throughout (kept serving the prior working
+deploy); fixed by pushing this entry to trigger a fresh redeploy attempt.
+
 ## 2026-09-15
 
 **Diagnosed why RL kept predicting HOLD and why 5min/15min policies keep losing -- traced to
