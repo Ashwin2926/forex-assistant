@@ -103,59 +103,6 @@ async def login(body: LoginRequest):
     return {"access_token": create_token(body.username), "token_type": "bearer"}
 
 
-@app.post("/ingest/{interval}")
-async def ingest(interval: str, output_size: int = 300):
-    """
-    Pull latest candles for all configured pairs at the given interval.
-    interval: '5min', '15min', '1h', '4h', '1day'
-    output_size: candles to fetch per pair (Twelve Data allows up to 5000 on the free tier).
-    Backtest optimization (train/test split) needs more history than a single live signal
-    does — raise this when you want a meaningful split, e.g. ?output_size=2000.
-
-    A short pause between pairs (not just between separate /ingest calls) -- confirmed live
-    that firing all 4 pairs back-to-back, repeated across a few intervals in quick
-    succession (e.g. the "Ingest all" dashboard button, or Sync now), can burst past Twelve
-    Data's per-minute rate limit well before the daily credit cap is anywhere close.
-    fetch_candles itself also retries with backoff on a 429 (see data_fetcher.py), so this
-    is belt-and-suspenders: spacing to avoid triggering it, retry in case it happens anyway.
-    """
-    results = {}
-    for i, pair in enumerate(settings.pairs_list):
-        if i > 0:
-            await asyncio.sleep(2)
-        try:
-            count = await fetch_and_store(pair, interval, output_size=output_size)
-            results[pair] = f"{count} candles stored"
-        except Exception as e:
-            results[pair] = f"error: {e}"
-    return results
-
-
-@app.post("/ingest/backfill/{interval}")
-async def ingest_backfill(interval: str, start_date: str = "2010-01-01", max_calls_per_pair: int = 5):
-    """
-    Deep historical backfill for ML/RL training data (candles_collection), separate from
-    /ingest's live-tail pulls. One call only advances each pair by up to max_calls_per_pair
-    pages toward start_date -- a full 2010-> now backfill at finer intervals is hundreds of
-    calls per pair, too long for one synchronous HTTP request. Resumable with no extra state:
-    progress is just "the earliest candle already stored" (see backfill_batch), so call this
-    repeatedly (.github/workflows/backfill-history.yml does) until every pair's "done" is true.
-    """
-    results = {}
-    for i, pair in enumerate(settings.pairs_list):
-        if i > 0:
-            await asyncio.sleep(2)
-        try:
-            results[pair] = await backfill_batch(pair, interval, start_date, max_calls=max_calls_per_pair)
-        except Exception as e:
-            results[pair] = {"error": str(e)}
-    results["all_done"] = all(isinstance(r, dict) and r.get("done") for r in results.values())
-    results["all_reached_start_date"] = all(
-        isinstance(r, dict) and r.get("reached_start_date") for r in results.values()
-    )
-    return results
-
-
 async def _run_candle_catchup_job(job_id: str) -> None:
     """
     The actual work behind POST /ingest/catch-up, run as a BackgroundTasks target the same
@@ -189,6 +136,13 @@ async def _run_candle_catchup_job(job_id: str) -> None:
     )
 
 
+# Registered BEFORE /ingest/{interval} below on purpose -- FastAPI/Starlette matches routes
+# in registration order, and /ingest/{interval} (a path parameter) would otherwise shadow
+# this literal /ingest/catch-up path, matching interval="catch-up" and silently calling
+# Twelve Data with an invalid interval instead of ever reaching this endpoint. Confirmed
+# live: exactly that happened before this got reordered -- POST /ingest/catch-up returned
+# the OLD endpoint's {pair: "error: ..."} shape instead of a CandleCatchupJob, and the
+# frontend crashed reading .results off a response that never had one.
 @app.post("/ingest/catch-up")
 async def start_candle_catchup(background_tasks: BackgroundTasks):
     """
@@ -247,6 +201,59 @@ async def cancel_candle_catchup_job(job_id: str):
     )
     doc = await candle_catchup_jobs_collection.find_one({"job_id": job_id})
     return CandleCatchupJob(**{k: v for k, v in doc.items() if k != "_id"})
+
+
+@app.post("/ingest/{interval}")
+async def ingest(interval: str, output_size: int = 300):
+    """
+    Pull latest candles for all configured pairs at the given interval.
+    interval: '5min', '15min', '1h', '4h', '1day'
+    output_size: candles to fetch per pair (Twelve Data allows up to 5000 on the free tier).
+    Backtest optimization (train/test split) needs more history than a single live signal
+    does — raise this when you want a meaningful split, e.g. ?output_size=2000.
+
+    A short pause between pairs (not just between separate /ingest calls) -- confirmed live
+    that firing all 4 pairs back-to-back, repeated across a few intervals in quick
+    succession (e.g. the "Ingest all" dashboard button, or Sync now), can burst past Twelve
+    Data's per-minute rate limit well before the daily credit cap is anywhere close.
+    fetch_candles itself also retries with backoff on a 429 (see data_fetcher.py), so this
+    is belt-and-suspenders: spacing to avoid triggering it, retry in case it happens anyway.
+    """
+    results = {}
+    for i, pair in enumerate(settings.pairs_list):
+        if i > 0:
+            await asyncio.sleep(2)
+        try:
+            count = await fetch_and_store(pair, interval, output_size=output_size)
+            results[pair] = f"{count} candles stored"
+        except Exception as e:
+            results[pair] = f"error: {e}"
+    return results
+
+
+@app.post("/ingest/backfill/{interval}")
+async def ingest_backfill(interval: str, start_date: str = "2010-01-01", max_calls_per_pair: int = 5):
+    """
+    Deep historical backfill for ML/RL training data (candles_collection), separate from
+    /ingest's live-tail pulls. One call only advances each pair by up to max_calls_per_pair
+    pages toward start_date -- a full 2010-> now backfill at finer intervals is hundreds of
+    calls per pair, too long for one synchronous HTTP request. Resumable with no extra state:
+    progress is just "the earliest candle already stored" (see backfill_batch), so call this
+    repeatedly (.github/workflows/backfill-history.yml does) until every pair's "done" is true.
+    """
+    results = {}
+    for i, pair in enumerate(settings.pairs_list):
+        if i > 0:
+            await asyncio.sleep(2)
+        try:
+            results[pair] = await backfill_batch(pair, interval, start_date, max_calls=max_calls_per_pair)
+        except Exception as e:
+            results[pair] = {"error": str(e)}
+    results["all_done"] = all(isinstance(r, dict) and r.get("done") for r in results.values())
+    results["all_reached_start_date"] = all(
+        isinstance(r, dict) and r.get("reached_start_date") for r in results.values()
+    )
+    return results
 
 
 # Every live read of candles_collection (signal generation, RL inference, GET /candles) caps
