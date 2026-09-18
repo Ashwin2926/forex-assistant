@@ -96,6 +96,7 @@ export function CandleCatchupButton() {
   }
 
   const running = job?.status === "running";
+  const hasResults = !!job && job.results.length > 0;
 
   return (
     <div className="flex flex-col gap-1">
@@ -121,6 +122,32 @@ export function CandleCatchupButton() {
         <span className="text-xs text-zinc-500 dark:text-zinc-400">
           {summarize(job)}
         </span>
+      )}
+      {/* Per-combo results as they land, not just the X/Y count -- newest first so the
+          currently-interesting (most recent) row doesn't require scrolling to see. Sidebar
+          width is narrow, so this is a compact scrollable list, not a full table. */}
+      {hasResults && (
+        <ul className="mt-1 max-h-40 overflow-y-auto rounded-md border border-zinc-200 text-xs dark:border-zinc-700">
+          {[...job.results].reverse().map((r, i) => (
+            <li
+              key={`${r.pair}-${r.interval}-${i}`}
+              className="flex items-center justify-between gap-2 border-t border-zinc-100 px-2 py-1 first:border-t-0 dark:border-zinc-800"
+            >
+              <span className="font-mono text-zinc-500 dark:text-zinc-400">
+                {r.pair} {r.interval}
+              </span>
+              {r.ok ? (
+                <span className={r.caught_up ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"}>
+                  {r.candles_stored ?? 0} candles{r.caught_up ? "" : " (partial)"}
+                </span>
+              ) : (
+                <span className="truncate text-rose-600 dark:text-rose-400" title={r.error ?? undefined}>
+                  error
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
       )}
       {error && <span className="text-xs text-rose-600 dark:text-rose-400">{error}</span>}
     </div>
