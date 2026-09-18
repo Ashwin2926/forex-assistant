@@ -197,6 +197,22 @@ export interface PPOPolicy {
   } | null;
 }
 
+// One row per pair x interval, always all 20 -- see GET /rl/policies/coverage's own
+// docstring for why this differs from PPOPolicy[] (GET /rl/policies): that's a
+// chronological log of the most recently created policies globally, which can miss a combo
+// entirely if it hasn't been retrained recently (or ever, if should_keep_new_policy has
+// rejected every attempt so far) even though this grid should still show it plainly.
+export interface RLPolicyCoverageRow {
+  pair: string;
+  interval: string;
+  has_policy: boolean;
+  policy_id?: string;
+  created_at?: string;
+  hit_rate_pct?: number | null;
+  expectancy_pct?: number | null;
+  total_return_pct?: number | null;
+}
+
 // Proof-of-concept sanity checks POST /rl/train-ppo returns alongside every real training
 // run, not just ppo_engine.py's own synthetic-data smoke test -- see that endpoint's docstring.
 export interface PPOTrainDiagnostics {

@@ -1,4 +1,4 @@
-import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
+import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicyCoverageRow, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -219,6 +219,13 @@ export const api = {
     if (params.limit) qs.set("limit", String(params.limit));
     const query = qs.toString();
     return request<PPOPolicy[]>(`/rl/policies${query ? `?${query}` : ""}`);
+  },
+
+  // Complete 20-combo grid (always all pairs x intervals) of whether a policy currently
+  // exists, distinct from listRLPolicies' chronological log -- see the endpoint's own
+  // docstring.
+  getRLPolicyCoverage() {
+    return request<RLPolicyCoverageRow[]>("/rl/policies/coverage");
   },
 
   generateRLSignal(pair: string, interval: string, balance?: number) {

@@ -1413,6 +1413,41 @@ async def list_rl_policies(pair: str | None = None, interval: str | None = None,
     return docs
 
 
+@app.get("/rl/policies/coverage")
+async def get_rl_policy_coverage():
+    """
+    One row per pair x interval (all 20, always), each either the latest policy's summary
+    or has_policy=False -- unlike GET /rl/policies (a chronological log of the most recent
+    N policy creations globally, which can miss a combo entirely if it just hasn't been
+    retrained recently even though an older policy for it still exists and is still being
+    served), this is a complete, current "what's actually live right now" grid. Built for
+    should_keep_new_policy's rejection behavior: a combo can go a long time -- or forever --
+    with no policy at all if every training attempt for it keeps losing, and there was
+    previously no direct way to see that from the frontend without querying Mongo by hand.
+    """
+    rows = []
+    for pair in settings.pairs_list:
+        for interval in RL_INTERVALS:
+            doc = await ppo_policies_collection.find_one(
+                {"pair": pair, "interval": interval}, {"model_bytes": 0}, sort=[("created_at", -1)]
+            )
+            if doc is None:
+                rows.append({"pair": pair, "interval": interval, "has_policy": False})
+                continue
+            run = await backtest_runs_collection.find_one({"run_id": doc["eval_run_id"]}) if doc.get("eval_run_id") else None
+            rows.append({
+                "pair": pair,
+                "interval": interval,
+                "has_policy": True,
+                "policy_id": doc.get("policy_id"),
+                "created_at": doc.get("created_at"),
+                "hit_rate_pct": run["hit_rate_pct"] if run else None,
+                "expectancy_pct": run["expectancy_pct"] if run else None,
+                "total_return_pct": run.get("total_return_pct") if run else None,
+            })
+    return rows
+
+
 @app.post("/rl/reset")
 async def reset_rl(confirm: bool = False):
     """

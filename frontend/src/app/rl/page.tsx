@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { INTERVALS, PAIRS, type BacktestRun, type PPOPolicy, type PPOTrainDiagnostics, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
+import { INTERVALS, PAIRS, type BacktestRun, type PPOPolicy, type PPOTrainDiagnostics, type RLAccuracy, type RLInsights, type RLLearningCurve, type RLLearningVerdict, type RLMemorySummary, type RLPolicyCoverageRow, type RLSignal, type RLTrainAllJob, type Signal } from "@/lib/types";
 import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
 // How often to poll GET /rl/train-all/{job_id} while a train-all run is in progress.
@@ -111,6 +111,10 @@ export default function RLPage() {
   const [policies, setPolicies] = useState<PPOPolicy[]>([]);
   const [policiesLoading, setPoliciesLoading] = useState(true);
 
+  const [coverage, setCoverage] = useState<RLPolicyCoverageRow[]>([]);
+  const [coverageLoading, setCoverageLoading] = useState(true);
+  const [coverageOpen, setCoverageOpen] = useState(true);
+
   const [currentBalance, setCurrentBalance] = useState(50);
 
   const [recentSignals, setRecentSignals] = useState<RLSignal[]>([]);
@@ -147,6 +151,17 @@ export default function RLPage() {
       // non-critical section -- a failed load here shouldn't block the rest of the page
     } finally {
       setPoliciesLoading(false);
+    }
+  }
+
+  async function loadCoverage() {
+    setCoverageLoading(true);
+    try {
+      setCoverage(await api.getRLPolicyCoverage());
+    } catch {
+      // non-critical section -- a failed load here shouldn't block the rest of the page
+    } finally {
+      setCoverageLoading(false);
     }
   }
 
@@ -187,6 +202,7 @@ export default function RLPage() {
 
   useEffect(() => {
     loadPolicies();
+    loadCoverage();
     loadRecentSignals();
     loadOverallAccuracy();
     loadLearningCurve();
@@ -232,7 +248,7 @@ export default function RLPage() {
         total_timesteps: totalTimesteps, train_frac: trainFrac, starting_balance: startingBalance, ...atrOverride,
       });
       setTrainResult(result);
-      await loadPolicies();
+      await Promise.all([loadPolicies(), loadCoverage()]);
     } catch (e) {
       setTrainError(e instanceof ApiError ? e.message : "Training failed.");
     } finally {
@@ -257,7 +273,7 @@ export default function RLPage() {
         if (job.status !== "running") {
           if (trainAllPollRef.current) clearInterval(trainAllPollRef.current);
           trainAllPollRef.current = null;
-          await loadPolicies();
+          await Promise.all([loadPolicies(), loadCoverage()]);
         }
       } catch {
         // transient poll failure -- try again next tick rather than aborting the whole poll
@@ -902,6 +918,63 @@ export default function RLPage() {
                   </tr>
                   );
                 })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section>
+        <SectionToggle open={coverageOpen} onToggle={() => setCoverageOpen((o) => !o)} title="Policy coverage" />
+        {coverageOpen && (
+          <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+            All 4 pairs &times; 5 intervals, always — unlike Training history below (a
+            chronological log of the most recent trainings, which can miss a combo entirely
+            if it hasn&apos;t been retrained lately), this shows whether a combo has a live
+            policy right now. A combo can show no policy indefinitely if every training
+            attempt for it keeps losing — should_keep_new_policy refuses to serve a policy
+            that back-tested worse than doing nothing.
+          </p>
+        )}
+        {coverageOpen && coverageLoading && <p className="mt-4 text-sm text-zinc-500">Loading…</p>}
+        {coverageOpen && !coverageLoading && coverage.length > 0 && (
+          <div className="mt-4 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+            <table className="w-full text-left text-sm">
+              <thead className="table-head text-xs uppercase">
+                <tr>
+                  <th className="px-4 py-2">Pair</th>
+                  <th className="px-4 py-2">Interval</th>
+                  <th className="px-4 py-2">Status</th>
+                  <th className="px-4 py-2">Hit rate</th>
+                  <th className="px-4 py-2">Expectancy</th>
+                  <th className="px-4 py-2">Return</th>
+                  <th className="px-4 py-2">Trained</th>
+                </tr>
+              </thead>
+              <tbody>
+                {coverage.map((row) => (
+                  <tr key={`${row.pair}-${row.interval}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                    <td className="px-4 py-2">{row.pair}</td>
+                    <td className="px-4 py-2">{row.interval}</td>
+                    <td className="px-4 py-2">
+                      {row.has_policy ? (
+                        <span className="text-emerald-600 dark:text-emerald-400">has policy</span>
+                      ) : (
+                        <span className="text-zinc-400 dark:text-zinc-500">no policy</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2">{row.hit_rate_pct != null ? `${row.hit_rate_pct}%` : "—"}</td>
+                    <td className={`px-4 py-2 ${row.expectancy_pct != null && row.expectancy_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : row.expectancy_pct != null ? "text-rose-600 dark:text-rose-400" : ""}`}>
+                      {row.expectancy_pct != null ? `${row.expectancy_pct >= 0 ? "+" : ""}${row.expectancy_pct}%` : "—"}
+                    </td>
+                    <td className={`px-4 py-2 ${row.total_return_pct != null && row.total_return_pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : row.total_return_pct != null ? "text-rose-600 dark:text-rose-400" : ""}`}>
+                      {row.total_return_pct != null ? `${row.total_return_pct >= 0 ? "+" : ""}${row.total_return_pct}%` : "—"}
+                    </td>
+                    <td className="px-4 py-2 text-xs text-zinc-500">
+                      {row.created_at ? new Date(row.created_at).toLocaleString() : "—"}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
