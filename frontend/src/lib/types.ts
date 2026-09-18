@@ -263,6 +263,29 @@ export interface BacktestRebuildJob {
   results: BacktestRebuildCell[];
 }
 
+export interface CandleCatchupCell {
+  pair: string;
+  interval: string;
+  ok: boolean;
+  error?: string | null;
+  calls_made?: number | null;
+  candles_stored?: number | null;
+  caught_up?: boolean | null;
+}
+
+// The manual "catch candles up to now" batch run (see app/main.py's POST /ingest/catch-up),
+// same job-doc-plus-polling pattern as BacktestRebuildJob -- for when the ingestion cron has
+// gone quiet long enough that /ingest's own single-call auto-widening can't close the gap.
+export interface CandleCatchupJob {
+  job_id: string;
+  status: "running" | "done" | "cancelled";
+  created_at: string;
+  finished_at?: string | null;
+  total: number;
+  completed: number;
+  results: CandleCatchupCell[];
+}
+
 export interface RLSignal {
   _id?: string;
   // Absent on any signal generated before this field existed -- GET /rl/signals returns raw

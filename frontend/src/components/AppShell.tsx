@@ -4,6 +4,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import { AuthGuard } from "@/components/AuthGuard";
 import { AuthNav } from "@/components/AuthNav";
+import { CandleCatchupButton } from "@/components/CandleCatchupButton";
 import { SideNav } from "@/components/SideNav";
 import { SyncNowButton } from "@/components/SyncNowButton";
 
@@ -68,6 +69,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             </div>
             <div className="flex flex-col gap-3 border-t px-3 py-4" style={{ borderColor: "var(--border)" }}>
               <SyncNowButton />
+              <CandleCatchupButton />
               <AuthNav />
             </div>
           </aside>
@@ -89,6 +91,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
         <div className="flex flex-col gap-3 border-t px-3 py-4" style={{ borderColor: "var(--border)" }}>
           <SyncNowButton />
+          <CandleCatchupButton />
           <AuthNav />
         </div>
       </aside>

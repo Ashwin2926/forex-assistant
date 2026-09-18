@@ -36,12 +36,13 @@ from app.core.database import (
     run_all_flows_jobs_collection,
     ppo_policies_collection,
     backtest_rebuild_jobs_collection,
+    candle_catchup_jobs_collection,
 )
 from app.models.schemas import (
     LoginRequest, RuleConfig, Signal, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
-    PPOPolicy, MLTrainResult, BacktestRebuildJob,
+    PPOPolicy, MLTrainResult, BacktestRebuildJob, CandleCatchupJob, CandleCatchupCell,
 )
-from app.services.data_fetcher import fetch_and_store, backfill_batch
+from app.services.data_fetcher import fetch_and_store, backfill_batch, catch_up_batch
 from app.services.candle_archive import load_full_candle_history, load_archived_candles
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import compute_atr_target_stop, default_config_for
@@ -153,6 +154,99 @@ async def ingest_backfill(interval: str, start_date: str = "2010-01-01", max_cal
         isinstance(r, dict) and r.get("reached_start_date") for r in results.values()
     )
     return results
+
+
+async def _run_candle_catchup_job(job_id: str) -> None:
+    """
+    The actual work behind POST /ingest/catch-up, run as a BackgroundTasks target the same
+    way _run_all_flows_job is -- started right after the job doc is created and the response
+    already sent, since catch_up_batch's rate-limit pacing (see data_fetcher.py's
+    BACKFILL_CALL_DELAY_SECONDS) across every pair x interval combo can easily run well past
+    Cloudflare's ~100s proxy timeout for a real multi-day gap.
+
+    Every write filtered on status="running" so a cancel lands even if a write from an
+    already-cancelled combo is still in flight -- same guard _run_all_flows_step uses.
+    """
+    combos = [(pair, interval) for pair in settings.pairs_list for interval in RL_INTERVALS]
+    results: list[dict] = []
+    for pair, interval in combos:
+        doc = await candle_catchup_jobs_collection.find_one({"job_id": job_id, "status": "running"})
+        if doc is None:
+            return  # cancelled (or otherwise no longer running) -- stop here
+        try:
+            outcome = await catch_up_batch(pair, interval)
+            results.append({"pair": pair, "interval": interval, "ok": True, **outcome})
+        except Exception as e:
+            results.append({"pair": pair, "interval": interval, "ok": False, "error": str(e)})
+        await candle_catchup_jobs_collection.update_one(
+            {"job_id": job_id, "status": "running"},
+            {"$set": {"results": results}, "$inc": {"completed": 1}},
+        )
+
+    await candle_catchup_jobs_collection.update_one(
+        {"job_id": job_id, "status": "running"},
+        {"$set": {"status": "done", "finished_at": datetime.utcnow()}},
+    )
+
+
+@app.post("/ingest/catch-up")
+async def start_candle_catchup(background_tasks: BackgroundTasks):
+    """
+    Manually catches every pair x interval combo's candles up to now, from wherever
+    ingestion last left off -- for when keep-fresh.yml's cron has gone quiet for a while
+    (its own scheduler isn't always reliable under load, see CLAUDE.md) and the resulting
+    gap is too wide for /ingest's own single-call auto-widening (fetch_and_store caps at
+    MAX_AUTO_BACKFILL_CANDLES, ~3.5 days at 5min) to close in one shot.
+
+    Runs as a background job (real multi-day gaps across 20 combos, each paced by Twelve
+    Data's rate limit, can take well over a minute) -- returns job_id immediately; poll
+    GET /ingest/catch-up/{job_id} for progress. Each combo is independently try/excepted so
+    one pair/interval failing (a transient Twelve Data error, etc.) doesn't stop the rest.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    job = CandleCatchupJob(
+        job_id=job_id, status="running", created_at=datetime.utcnow(),
+        total=len(settings.pairs_list) * len(RL_INTERVALS),
+    )
+    await candle_catchup_jobs_collection.insert_one(job.model_dump())
+    background_tasks.add_task(_run_candle_catchup_job, job_id)
+    return job
+
+
+@app.get("/ingest/catch-up/{job_id}")
+async def get_candle_catchup_job(job_id: str):
+    doc = await candle_catchup_jobs_collection.find_one({"job_id": job_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No candle catch-up job {job_id}.")
+    return CandleCatchupJob(**{k: v for k, v in doc.items() if k != "_id"})
+
+
+@app.get("/ingest/catch-up-latest")
+async def get_latest_candle_catchup_job():
+    """Lets the frontend rehydrate an in-progress job after a reload -- otherwise there's no
+    way to tell "nothing running" apart from "was running, the tab just reloaded"."""
+    doc = await candle_catchup_jobs_collection.find_one(sort=[("created_at", -1)])
+    if not doc:
+        return None
+    return CandleCatchupJob(**{k: v for k, v in doc.items() if k != "_id"})
+
+
+@app.post("/ingest/catch-up/{job_id}/cancel")
+async def cancel_candle_catchup_job(job_id: str):
+    """Marks a running catch-up job cancelled -- _run_candle_catchup_job checks this between
+    every combo, same cooperative-cancel pattern _run_all_flows_job uses. Already-caught-up
+    combos keep their stored candles; only the remaining ones are skipped."""
+    doc = await candle_catchup_jobs_collection.find_one({"job_id": job_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No candle catch-up job {job_id}.")
+    if doc["status"] != "running":
+        raise HTTPException(status_code=400, detail=f"Job {job_id} is already {doc['status']}, nothing to cancel.")
+    await candle_catchup_jobs_collection.update_one(
+        {"job_id": job_id, "status": "running"},
+        {"$set": {"status": "cancelled", "finished_at": datetime.utcnow()}},
+    )
+    doc = await candle_catchup_jobs_collection.find_one({"job_id": job_id})
+    return CandleCatchupJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 
 # Every live read of candles_collection (signal generation, RL inference, GET /candles) caps

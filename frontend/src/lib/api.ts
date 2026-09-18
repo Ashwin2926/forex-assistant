@@ -1,4 +1,4 @@
-import type { BacktestRebuildJob, BacktestRun, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
+import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -46,6 +46,25 @@ export const api = {
 
   ingest(interval: string) {
     return request<Record<string, string>>(`/ingest/${interval}`, { method: "POST" });
+  },
+
+  // Catches every pair x interval's candles up to now, from wherever ingestion last left
+  // off -- runs as a background job (real gaps across 20 combos, rate-limit-paced, can take
+  // well over a minute), same job-doc-plus-polling pattern as startRebuildBacktests below.
+  startCandleCatchup() {
+    return request<CandleCatchupJob>("/ingest/catch-up", { method: "POST" });
+  },
+
+  getCandleCatchupJob(jobId: string) {
+    return request<CandleCatchupJob>(`/ingest/catch-up/${jobId}`);
+  },
+
+  getLatestCandleCatchupJob() {
+    return request<CandleCatchupJob | null>("/ingest/catch-up-latest");
+  },
+
+  cancelCandleCatchupJob(jobId: string) {
+    return request<CandleCatchupJob>(`/ingest/catch-up/${jobId}/cancel`, { method: "POST" });
   },
 
   getCandles(pair: string, interval: string, profile: string, limit = 250) {

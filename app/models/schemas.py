@@ -455,6 +455,38 @@ class BacktestRebuildCell(BaseModel):
     hits: Optional[int] = None
 
 
+class CandleCatchupCell(BaseModel):
+    """One pair/interval's outcome within a CandleCatchupJob."""
+    pair: str
+    interval: str
+    ok: bool
+    error: Optional[str] = None
+    calls_made: Optional[int] = None
+    candles_stored: Optional[int] = None
+    caught_up: Optional[bool] = None
+
+
+class CandleCatchupJob(BaseModel):
+    """
+    Tracks the manual "catch candles up to now" button (app/main.py's
+    _run_candle_catchup_job background task) -- same Mongo-persisted-job pattern as
+    RLTrainAllJob/BacktestRebuildJob, for the same reason (survives the triggering browser
+    tab closing, and FastAPI Cloud recycling the instance between requests). Unlike those
+    two, this runs as a plain in-process BackgroundTasks job rather than delegating to a
+    GitHub Actions runner -- the work here is I/O-bound (Twelve Data calls + the same
+    rate-limit pacing sleep data_fetcher.backfill_batch already uses), not CPU-heavy like
+    PPO training, so there's no instance-recycle risk worth trading against the extra
+    GitHub Actions round-trip.
+    """
+    job_id: str
+    status: Literal["running", "done", "cancelled"]
+    created_at: datetime
+    finished_at: Optional[datetime] = None
+    total: int
+    completed: int = 0
+    results: list[CandleCatchupCell] = []
+
+
 class BacktestRebuildJob(BaseModel):
     """
     Tracks a "rebuild every pair x interval's default-config backtest" run on

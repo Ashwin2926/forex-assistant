@@ -209,3 +209,59 @@ async def backfill_batch(pair: str, interval: str, start_date: str, max_calls: i
         "candles_stored": candles_stored,
         "oldest": cursor.isoformat() if cursor else None,
     }
+
+
+async def catch_up_batch(pair: str, interval: str, max_calls: int = 30) -> dict:
+    """
+    Mirror image of backfill_batch: instead of walking backward from the EARLIEST stored
+    candle toward a fixed historical start_date, this walks backward from "now" toward the
+    LATEST already-stored candle for this pair/interval -- i.e. it closes a forward gap
+    (candle ingestion having been down for hours/days/weeks) rather than deepening history.
+    fetch_and_store's own gap-detection (a single widened call, capped at
+    MAX_AUTO_BACKFILL_CANDLES) already handles the common case fine, but a call is capped
+    to BACKFILL_PAGE_SIZE candles regardless of requested output_size, so a gap wider than
+    one page needs the same multi-call/rate-limited-pacing/per-page-store pattern
+    backfill_batch already established, just anchored to the opposite end and with no fixed
+    stop date -- "caught up" is defined by reaching whatever's already stored, not a date.
+
+    Same resumability property as backfill_batch: progress is just "the latest timestamp
+    already in candles_collection", so a caller can re-run this after a failed/timed-out
+    call, or after hitting max_calls without finishing, with no separate state to track.
+    """
+    latest = await candles_collection.find_one(
+        {"pair": pair, "interval": interval}, sort=[("timestamp", -1)]
+    )
+    if latest is None:
+        # Nothing stored yet for this pair/interval -- not this function's job (that's
+        # POST /ingest/backfill's deep-history path); just grab one recent page so there's
+        # at least something to catch up from next time.
+        candles = await fetch_candles(pair, interval, output_size=BACKFILL_PAGE_SIZE)
+        stored = await store_candles(candles)
+        return {"caught_up": False, "calls_made": 1, "candles_stored": stored}
+
+    caught_up_point = latest["timestamp"]
+    cursor: datetime | None = None  # None -> Twelve Data's most-recent page (ending at "now")
+    calls_made = 0
+    candles_stored = 0
+    caught_up = False
+    while calls_made < max_calls:
+        end_date_param = cursor.strftime("%Y-%m-%d %H:%M:%S") if cursor else None
+        candles = await fetch_candles(pair, interval, output_size=BACKFILL_PAGE_SIZE, end_date=end_date_param)
+        calls_made += 1
+        if not candles:
+            break
+        candles_stored += await store_candles(candles)
+        oldest_in_page = min(c.timestamp for c in candles)
+        if oldest_in_page <= caught_up_point:
+            caught_up = True
+            break
+        if cursor is not None and oldest_in_page >= cursor:
+            # Same page as last time -- Twelve Data has nothing older to give us before
+            # reaching caught_up_point (shouldn't normally happen since caught_up_point is
+            # itself a candle Twelve Data gave us before).
+            break
+        cursor = oldest_in_page
+        if calls_made < max_calls:
+            await asyncio.sleep(BACKFILL_CALL_DELAY_SECONDS)
+
+    return {"caught_up": caught_up, "calls_made": calls_made, "candles_stored": candles_stored}

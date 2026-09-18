@@ -20,6 +20,7 @@ rl_train_jobs_collection = db["rl_train_jobs"]        # progress/results for a "
 ppo_policies_collection = db["ppo_policies"]          # PPO proof-of-concept policies (Signal Stack v2 phase 3b), model bytes + metadata
 run_all_flows_jobs_collection = db["run_all_flows_jobs"]  # progress/results for the manual "Sync now" catch-up job
 backtest_rebuild_jobs_collection = db["backtest_rebuild_jobs"]  # progress/results for a "rebuild default-config backtests" batch run
+candle_catchup_jobs_collection = db["candle_catchup_jobs"]  # progress/results for a manual "catch candles up to now" batch run
 
 
 async def init_indexes():
@@ -45,3 +46,5 @@ async def init_indexes():
     await rl_train_jobs_collection.create_index([("created_at", -1)])
     await backtest_rebuild_jobs_collection.create_index([("job_id", 1)], unique=True)
     await backtest_rebuild_jobs_collection.create_index([("created_at", -1)])
+    await candle_catchup_jobs_collection.create_index([("job_id", 1)], unique=True)
+    await candle_catchup_jobs_collection.create_index([("created_at", -1)])
