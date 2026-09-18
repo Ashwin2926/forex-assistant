@@ -410,6 +410,24 @@ async def score_consensus_signals(max_lookforward: int | None = None):
     return await score_pending_consensus_signals(max_lookforward=max_lookforward)
 
 
+def _compute_strategy_calls(df: pd.DataFrame, config: RuleConfig) -> tuple[list, "pd.Series"]:
+    """
+    The CPU-bound (synchronous, pandas/numpy) half of a consensus check -- run via
+    asyncio.to_thread by every caller below rather than called directly. FastAPI's single
+    event loop has nothing else running while a plain synchronous call like this executes;
+    under concurrent load (the ingestion cron, RL signal generation, and manual dispatches
+    all hitting the same instance at once, as happened live 2026-09-18: a 16-minute total
+    freeze where even GET / stopped responding) several of these stacking up back-to-back
+    is enough to block the whole process, not just the request that triggered them.
+    to_thread moves the blocking work to a worker thread so the event loop can keep serving
+    other requests while it runs.
+    """
+    indicator_df = add_all_indicators(df, config)
+    calls = [fn(indicator_df, config) for fn in STRATEGIES]
+    latest = indicator_df.iloc[-1]
+    return calls, latest
+
+
 @app.post("/consensus/{interval}")
 async def create_consensus_signal(interval: str, pair: str):
     """
@@ -438,9 +456,7 @@ async def create_consensus_signal(interval: str, pair: str):
         )
 
     df = pd.DataFrame(docs)
-    indicator_df = add_all_indicators(df, config)
-    calls = [fn(indicator_df, config) for fn in STRATEGIES]
-    latest = indicator_df.iloc[-1]
+    calls, latest = await asyncio.to_thread(_compute_strategy_calls, df, config)
     consensus = check_consensus(calls, pair, interval, latest["timestamp"], float(latest["atr"]))
 
     if consensus is None:
@@ -456,7 +472,7 @@ async def create_consensus_signal(interval: str, pair: str):
     # enough resolved history yet -- "not enough data" isn't evidence of a bad signal.
     resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
     features = extract_features(consensus.model_dump())
-    ml_hit_probability = predict_hit_probability(resolved_signals, features)
+    ml_hit_probability = await asyncio.to_thread(predict_hit_probability, resolved_signals, features)
     consensus.ml_hit_probability = ml_hit_probability
     if ml_hit_probability is not None and ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
         consensus.ml_override = (
@@ -726,9 +742,7 @@ async def predict_signal(interval: str, profile: str, pair: str):
         )
 
     df = pd.DataFrame(docs)
-    indicator_df = add_all_indicators(df, config)
-    calls = [fn(indicator_df, config) for fn in STRATEGIES]
-    latest = indicator_df.iloc[-1]
+    calls, latest = await asyncio.to_thread(_compute_strategy_calls, df, config)
     consensus = check_consensus(calls, pair, interval, latest["timestamp"], float(latest["atr"]))
 
     # No consensus at all (the common case, see check_consensus's own docstring) means there's
@@ -737,7 +751,7 @@ async def predict_signal(interval: str, profile: str, pair: str):
     if consensus is not None:
         resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
         features = extract_features(consensus.model_dump())
-        consensus.ml_hit_probability = predict_hit_probability(resolved_signals, features)
+        consensus.ml_hit_probability = await asyncio.to_thread(predict_hit_probability, resolved_signals, features)
 
     return {"consensus": consensus, "strategy_calls": [c.model_dump() for c in calls]}
 
@@ -1668,12 +1682,16 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
         )
 
     resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
-    market_state, df, ml_buy_score, ml_sell_score = _rl_state_from_candles(
-        docs, config, pair, interval, resolved_signals,
+    # Both calls below are synchronous/CPU-bound (pandas indicator computation, XGBoost
+    # inference, and here also a torch model load + forward pass) -- to_thread so this
+    # doesn't block the event loop for unrelated concurrent requests. See
+    # _compute_strategy_calls' own comment for the live incident that motivated this.
+    market_state, df, ml_buy_score, ml_sell_score = await asyncio.to_thread(
+        _rl_state_from_candles, docs, config, pair, interval, resolved_signals,
     )
     state = full_rl_state(market_state, balance, policy.starting_balance)
     try:
-        action, q_values = choose_action_ppo(policy, state)
+        action, q_values = await asyncio.to_thread(choose_action_ppo, policy, state)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     current_price = float(df.iloc[-1]["close"])
