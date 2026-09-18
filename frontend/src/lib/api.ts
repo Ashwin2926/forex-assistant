@@ -63,6 +63,10 @@ export const api = {
     return request<CandleCatchupJob | null>("/ingest/catch-up-latest");
   },
 
+  listCandleCatchupJobs(limit = 20) {
+    return request<CandleCatchupJob[]>(`/ingest/catch-up/jobs?limit=${limit}`);
+  },
+
   cancelCandleCatchupJob(jobId: string) {
     return request<CandleCatchupJob>(`/ingest/catch-up/${jobId}/cancel`, { method: "POST" });
   },

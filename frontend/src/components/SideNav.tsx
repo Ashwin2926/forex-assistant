@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 const LINKS = [
   { href: "/trading-signals", label: "Trading Signals" },
   { href: "/chart", label: "Chart" },
+  { href: "/candles", label: "Candles" },
   { href: "/backtest", label: "Backtesting" },
   { href: "/consensus", label: "Consensus" },
   { href: "/paper-trade", label: "Paper Trading" },

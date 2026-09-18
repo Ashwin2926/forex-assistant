@@ -167,6 +167,18 @@ async def start_candle_catchup(background_tasks: BackgroundTasks):
     return job
 
 
+# Registered BEFORE /ingest/catch-up/{job_id} below -- same route-ordering reasoning as
+# /ingest/catch-up itself vs /ingest/{interval} (see that endpoint's own comment): a literal
+# "/ingest/catch-up/jobs" would otherwise get shadowed by the {job_id} path parameter,
+# matching job_id="jobs" instead of ever reaching this endpoint.
+@app.get("/ingest/catch-up/jobs")
+async def list_candle_catchup_jobs(limit: int = 20):
+    """History for the Candles page -- same list-with-limit pattern GET /ml/runs uses."""
+    cursor = candle_catchup_jobs_collection.find().sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    return [CandleCatchupJob(**{k: v for k, v in d.items() if k != "_id"}) for d in docs]
+
+
 @app.get("/ingest/catch-up/{job_id}")
 async def get_candle_catchup_job(job_id: str):
     doc = await candle_catchup_jobs_collection.find_one({"job_id": job_id})
