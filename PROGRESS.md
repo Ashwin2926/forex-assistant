@@ -4,6 +4,39 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-19
+
+**Phase 2 shipped: learned exits for the PPO RL agent** (`rl_engine.py`/`ppo_engine.py`/
+`main.py`/`schemas.py`, commit `8b4d9dd`) — a new `EXIT` action, bar-by-bar position
+mechanics (`OpenPosition`, `_open_position`/`_close_position`/`_check_bar_backstop`
+replacing the old atomic `_take_action_sized`), and `RL_FEATURE_NAMES` growing from 17 to
+22 features (5 new position-context ones). Every existing policy is stale under the new
+shape (`choose_action_ppo`'s feature_names guard correctly blocks them), so a full 20-combo
+retrain was dispatched as individual per-combo `train-rl.yml` runs (parallel, not one
+sequential sweep — the sequential sweep was cancelled after ~65 min stuck on its first
+combo, since bar-by-bar training/eval is meaningfully slower per combo than the old
+architecture). All 20 completed; results are genuinely mixed (some combos improved hugely
+— GBP/USD/1day hit 1296% return on its test slice — many others lost to the 0% baseline on
+this first cold-start attempt and were correctly rejected, leaving them without a working
+live policy until a future retrain succeeds).
+
+**Bug hunted, root cause still unconfirmed: a freshly-migrated policy got silently
+overwritten with an old-architecture (17-feature) one an hour later.** GBP/USD/1day's great
+new policy (kept at 08:28 UTC) was replaced by a 17-feature doc at 09:28 UTC. Ruled out:
+GitHub Actions (no other workflow run exists in that window on any commit), and both of the
+two places that write `ppo_policies` (`app/main.py`'s `_run_rl_training`,
+`scripts/train_rl.py`'s `run_one`) unconditionally stamp `feature_names=rl.RL_FEATURE_NAMES`
+from current code, so neither can produce a 17-length list post-deploy. Leading theory:
+`_check_and_retrain_degraded_policies` (triggered every `keep-fresh.yml` cron cycle via
+`POST /rl/score`) fired its background retrain on a stale FastAPI Cloud replica that hadn't
+actually been replaced by the redeploy, even though direct API calls were confirmed hitting
+new code. This commit itself is partly a forcing function — pushing to master triggers a
+fresh FastAPI Cloud redeploy, which should kill any lingering old container. Same combos
+(GBP/USD 5min/15min/1day) affected more than once — worth re-checking after this redeploy
+whether the same combos regress again; if so, the stale-replica theory is wrong and needs
+more digging (multiple worker processes within one container? a `_check_and_retrain_degraded_
+policies` guard bug?).
+
 ## 2026-09-16/17
 
 **Rule-engine-removal: every live decision surface (ML classifier features, RL
