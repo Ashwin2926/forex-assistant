@@ -1,4 +1,4 @@
-import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicyCoverageRow, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
+import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, DailySignalsResponse, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicyCoverageRow, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -226,6 +226,12 @@ export const api = {
   // docstring.
   getRLPolicyCoverage() {
     return request<RLPolicyCoverageRow[]>("/rl/policies/coverage");
+  },
+
+  // Today's (or a given day's) full signal log per pair -- see the endpoint's own docstring.
+  getDailySignals(date?: string) {
+    const qs = date ? `?date=${date}` : "";
+    return request<DailySignalsResponse>(`/dashboard/daily-signals${qs}`);
   },
 
   generateRLSignal(pair: string, interval: string, balance?: number) {

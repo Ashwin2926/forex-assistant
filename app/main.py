@@ -1462,6 +1462,69 @@ async def get_rl_policy_coverage():
     return rows
 
 
+@app.get("/dashboard/daily-signals")
+async def get_daily_signals(date: str | None = None):
+    """
+    "Today's trading day at a glance" -- one row per pair, each with every interval's
+    current policy coverage (has_policy, same as GET /rl/policies/coverage) plus every
+    live RLSignal that fired on the given UTC calendar day, in chronological order. No new
+    collection: RLSignal already carries status/outcome_price/outcome_pct_move/entry/
+    target/stop, so this is purely a read/reshape of data create_rl_signal and
+    score_pending_rl_signals already maintain continuously through the day.
+
+    date: optional 'YYYY-MM-DD', defaults to today (UTC). Always returns every pair x
+    interval combo, even ones with zero signals or no policy at all today -- "no edge
+    today" is a real, expected answer for some combos, not an error (see
+    should_keep_new_policy/GET /rl/policies/coverage's own reasoning), so the frontend can
+    show that plainly instead of an empty gap.
+    """
+    if date is not None:
+        try:
+            day_start = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date must be 'YYYY-MM-DD'.")
+    else:
+        day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    rows = []
+    for pair in settings.pairs_list:
+        intervals = []
+        for interval in RL_INTERVALS:
+            policy_doc = await ppo_policies_collection.find_one(
+                {"pair": pair, "interval": interval}, {"model_bytes": 0}, sort=[("created_at", -1)]
+            )
+            signal_docs = await rl_signals_collection.find({
+                "pair": pair, "interval": interval, "source": "live",
+                "timestamp": {"$gte": day_start, "$lt": day_end},
+            }).sort("timestamp", 1).to_list(length=None)
+            signals = []
+            for s in signal_docs:
+                action = f"{s['direction']}_{s['size_tier']}"
+                signals.append({
+                    "signal_id": s.get("signal_id"),
+                    "timestamp": s["timestamp"],
+                    "direction": s["direction"],
+                    "entry_price": s["entry_price"],
+                    "target_price": s["target_price"],
+                    "stop_price": s["stop_price"],
+                    "confidence_pct": round(s["q_values"].get(action, 0.0) * 100, 1),
+                    "size_tier": s["size_tier"],
+                    "status": s["status"],
+                    "outcome_price": s.get("outcome_price"),
+                    "outcome_pct_move": s.get("outcome_pct_move"),
+                    "outcome_timestamp": s.get("outcome_timestamp"),
+                })
+            intervals.append({
+                "interval": interval,
+                "has_policy": policy_doc is not None,
+                "signals": signals,
+            })
+        rows.append({"pair": pair, "intervals": intervals})
+
+    return {"date": day_start.strftime("%Y-%m-%d"), "pairs": rows}
+
+
 @app.post("/rl/reset")
 async def reset_rl(confirm: bool = False):
     """
@@ -2428,7 +2491,15 @@ async def _check_and_retrain_degraded_policies(background_tasks: BackgroundTasks
                 "live_hit_rate_pct": live_hit_rate_pct, "live_decided_trades": decided,
                 "trained_hit_rate_pct": trained_hit_rate_pct, "retrain_triggered": False,
             }
-            if gap >= DEGRADATION_MARGIN_PCT:
+            # Once-per-day cap: the active policy already came from a retrain today (the
+            # nightly cron, or an earlier firing of this same degradation check) -- an
+            # already-fresh policy that's STILL degraded needs a different fix (more
+            # training data, a feature change) than firing yet another same-day retrain,
+            # which would just repeat whatever today's data already produced. This check
+            # is purely additive on top of the once-daily cron either way, never a
+            # substitute for it -- see this function's own docstring.
+            retrained_today = policy_doc["created_at"].date() == datetime.utcnow().date()
+            if gap >= DEGRADATION_MARGIN_PCT and not retrained_today:
                 background_tasks.add_task(_retrain_degraded_policy_background, pair, interval)
                 entry["retrain_triggered"] = True
             results.append(entry)

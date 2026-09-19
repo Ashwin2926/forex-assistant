@@ -213,6 +213,40 @@ export interface RLPolicyCoverageRow {
   total_return_pct?: number | null;
 }
 
+// GET /dashboard/daily-signals -- "today's trading day at a glance," one row per pair.
+// Not a new backend collection -- purely a read/reshape of RLSignal, which already
+// carries status/outcome fields, filtered to one UTC calendar day.
+export interface DailySignal {
+  signal_id?: string;
+  timestamp: string;
+  direction: "BUY" | "SELL";
+  entry_price: number;
+  target_price: number;
+  stop_price: number;
+  confidence_pct: number;
+  size_tier: "SMALL" | "LARGE";
+  status: SignalStatus;
+  outcome_price?: number | null;
+  outcome_pct_move?: number | null;
+  outcome_timestamp?: string | null;
+}
+
+export interface DailyIntervalSignals {
+  interval: string;
+  has_policy: boolean;
+  signals: DailySignal[];
+}
+
+export interface DailyPairSignals {
+  pair: string;
+  intervals: DailyIntervalSignals[];
+}
+
+export interface DailySignalsResponse {
+  date: string;
+  pairs: DailyPairSignals[];
+}
+
 // Proof-of-concept sanity checks POST /rl/train-ppo returns alongside every real training
 // run, not just ppo_engine.py's own synthetic-data smoke test -- see that endpoint's docstring.
 export interface PPOTrainDiagnostics {
