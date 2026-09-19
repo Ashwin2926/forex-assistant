@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 import pandas as pd
 from typing import Optional
 from xgboost import XGBClassifier
@@ -14,7 +15,13 @@ from app.services.ml_model import fit_hit_classifier
 # the original 3 (HOLD/BUY/SELL) rather than 7. Every extra action means fewer training
 # samples per action -- keeping the space small matters for any RL algorithm trained on this
 # project's real, limited candle history, PPO included.
-ACTIONS = ["HOLD", "BUY_SMALL", "BUY_LARGE", "SELL_SMALL", "SELL_LARGE"]
+#
+# EXIT (added for the learned-exit architecture, see PROGRESS.md) is a no-op when flat --
+# only meaningful once a position is open, where it lets the agent close out earlier than
+# the fixed target/stop backstops instead of always riding a trade to one of those two
+# outcomes or expiry. See _check_bar_backstop/_open_position/_close_position below for the
+# per-bar mechanics this enables, replacing the old one-shot _take_action_sized.
+ACTIONS = ["HOLD", "BUY_SMALL", "BUY_LARGE", "SELL_SMALL", "SELL_LARGE", "EXIT"]
 
 # Starting guesses, not backtested -- same caveat as every other unvalidated constant in this
 # project (PROXIMITY_ATR_MULT, SMC_WICK_BODY_MULT, etc.).
@@ -117,7 +124,31 @@ RL_MARKET_FEATURE_NAMES = (
     [f"{name}_vote" for name in STRATEGY_NAMES] + ["atr_pct"] + RL_RAW_FEATURE_NAMES
     + ["ml_hit_probability_buy", "ml_hit_probability_sell"]
 )
-RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"]
+
+# Position-context features -- everything the agent needs to judge "is now a good time to
+# exit this open trade," none of which existed before the learned-exit architecture (a
+# BUY/SELL decision used to atomically resolve the whole trade via label_outcome's blind
+# walk, so there was never a point where the agent needed to reason about an OPEN
+# position at all). All zero when flat -- position_direction=0 is the unambiguous "no
+# position" flag other features don't need to duplicate.
+#   position_direction          -- +1 BUY, -1 SELL, 0 flat
+#   position_bars_held_frac     -- bars_held / max_lookforward, how far through the
+#                                  expiry window this trade already is
+#   position_unrealized_pnl_log_ratio -- log(mark-to-market equity / balance at entry),
+#                                  same encoding balance_log_ratio already uses, so the
+#                                  agent reads "am I currently up or down on this trade"
+#                                  the same way it reads its own account health
+#   position_dist_to_target_atr / position_dist_to_stop_atr -- signed distance to each
+#                                  hard backstop, in ATRs (comparable across pairs at very
+#                                  different price scales, same reasoning the fixed 1.5:1
+#                                  target:stop ratio itself is ATR-denominated) -- shrinks
+#                                  toward 0 as price approaches that backstop
+RL_POSITION_FEATURE_NAMES = [
+    "position_direction", "position_bars_held_frac", "position_unrealized_pnl_log_ratio",
+    "position_dist_to_target_atr", "position_dist_to_stop_atr",
+]
+
+RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"] + RL_POSITION_FEATURE_NAMES
 
 # Fixed, not sourced from RuleConfig -- some validated target/stop ratios elsewhere in this
 # project risk MORE than they target, which is exactly what the user said this agent must
@@ -389,68 +420,154 @@ def compute_ml_scores(
     return scores
 
 
-def full_rl_state(market_state: list[float], balance: float, starting_balance: float) -> list[float]:
+@dataclass
+class OpenPosition:
     """
-    Appends the one balance-dependent feature to an otherwise-precomputed market state --
-    log(balance / starting_balance), 0 at the reference point, positive when ahead, negative
-    when behind. Without this the agent has no way to condition its sizing choice on how the
-    account is actually doing (e.g. sizing down after a drawdown). Guards balance<=0 (already
-    at/past ruin) with a large negative stand-in rather than crashing on log(0).
+    A trade in progress -- didn't need to exist before the learned-exit architecture, since
+    a BUY/SELL decision used to atomically resolve into a finished trade in one call
+    (_take_action_sized, retired). Now a position persists across bars (ForexTradingEnv's
+    own `self._position`, and main.py's live equivalent reconstructed from a pending
+    RLSignal), so its own state needs to be a first-class value both the environment and
+    live serving can pass to position_features/full_rl_state and _close_position.
+    """
+    direction: str  # "BUY" or "SELL"
+    tier: str  # "SMALL" or "LARGE"
+    entry_price: float
+    target_price: float
+    stop_price: float
+    atr_val: float
+    units: float
+    entry_balance: float  # balance at the moment this position was opened
+    pair: str
+    bars_held: int = 0
+
+
+def position_features(
+    position: Optional[OpenPosition], current_price: Optional[float], max_lookforward: int,
+) -> list[float]:
+    """
+    Computes RL_POSITION_FEATURE_NAMES for the current bar -- all zero when flat (no
+    position, or no current_price to mark it against yet). current_price is the latest
+    known close (the same "mark to market against the most recent completed bar" idea
+    balance_log_ratio's own per-decision balance already uses), NOT a fill price -- this is
+    purely what the agent sees when deciding, never used to compute a real P&L itself
+    (_close_position does that, against the bar that actually triggered the close).
+    """
+    if position is None or current_price is None:
+        return [0.0] * len(RL_POSITION_FEATURE_NAMES)
+
+    direction_sign = 1.0 if position.direction == "BUY" else -1.0
+    bars_held_frac = min(position.bars_held / max_lookforward, 1.0) if max_lookforward else 0.0
+
+    pct_move = ((current_price - position.entry_price) / position.entry_price) * 100
+    if position.direction == "SELL":
+        pct_move = -pct_move
+    pct_move -= spread_cost_pct(position.pair, position.entry_price)
+    dollar_pnl = position.units * usd_per_unit(position.pair, position.entry_price) * (pct_move / 100) * position.entry_price
+    equity = position.entry_balance + dollar_pnl
+    pnl_log_ratio = math.log(equity / position.entry_balance) if equity > 0 and position.entry_balance > 0 else -10.0
+
+    atr_val = position.atr_val if position.atr_val else 1e-9
+    if position.direction == "BUY":
+        dist_to_target_atr = (position.target_price - current_price) / atr_val
+        dist_to_stop_atr = (current_price - position.stop_price) / atr_val
+    else:
+        dist_to_target_atr = (current_price - position.target_price) / atr_val
+        dist_to_stop_atr = (position.stop_price - current_price) / atr_val
+
+    return [direction_sign, bars_held_frac, pnl_log_ratio, dist_to_target_atr, dist_to_stop_atr]
+
+
+def full_rl_state(
+    market_state: list[float], balance: float, starting_balance: float,
+    position: Optional[OpenPosition] = None, current_price: Optional[float] = None,
+    max_lookforward: int = 20,
+) -> list[float]:
+    """
+    Appends the balance-dependent feature and the position-context features to an
+    otherwise-precomputed market state. balance_log_ratio = log(balance / starting_balance),
+    0 at the reference point, positive when ahead, negative when behind -- without this the
+    agent has no way to condition its sizing choice on how the account is actually doing
+    (e.g. sizing down after a drawdown). Guards balance<=0 (already at/past ruin) with a
+    large negative stand-in rather than crashing on log(0). position/current_price: see
+    position_features -- both None (the default) when flat, which is every caller before
+    the learned-exit architecture and every still-flat decision point after it.
     """
     balance_log_ratio = math.log(balance / starting_balance) if balance > 0 else -10.0
-    return market_state + [balance_log_ratio]
+    return (
+        market_state + [balance_log_ratio]
+        + position_features(position, current_price, max_lookforward)
+    )
 
 
-def _take_action_sized(
-    df: pd.DataFrame, indicator_df: pd.DataFrame, i: int, action: str, pair: str, max_lookforward: int, balance: float,
+def _open_position(
+    df: pd.DataFrame, indicator_df: pd.DataFrame, i: int, action: str, pair: str, balance: float,
     target_atr_mult: float, stop_atr_mult: float,
-) -> tuple[float, int, float]:
+) -> OpenPosition:
     """
-    Executes one sized action at bar i, returns (reward, bars_to_advance, new_balance). HOLD
-    advances 1 bar, balance unchanged, reward 0.0. A BUY_TIER/SELL_TIER action sizes a real
-    position against the CURRENT balance (position_size_units), resolves it via the same
-    label_outcome/spread_cost_pct every other part of this project uses, and converts the
-    resulting pct_move into a dollar P&L against that position size.
-
-    Reward is log(new_balance / balance) -- the Kelly-criterion-standard objective for
-    compounding growth, which also naturally and severely penalizes ruin (log of a near-zero
-    balance is deeply negative) without needing a bolted-on penalty; RUIN_REWARD is only a
-    guard for the literal balance<=0 edge the log can't represent. Single-position-at-a-time
-    via candles_to_outcome, same as every other trading concept here. Used identically by
-    both a training step (ppo_engine.ForexTradingEnv.step) and greedy evaluation
-    (ppo_engine._evaluate_policy) -- the same reward/balance math either way.
+    Opens a sized position at bar i's close -- entry/target/stop/units only, no resolution.
+    Reward for the bar that opens a position is always 0.0 (the caller's job to apply) --
+    reward only lands when the position later closes via _close_position (target hit, stop
+    hit, max_lookforward expiry, or an agent-chosen EXIT), matching how HOLD already pays
+    zero reward on any bar that doesn't change realized P&L.
     """
-    if action == "HOLD":
-        return 0.0, 1, balance
-
     direction, tier = action.split("_")
     risk_fraction = RISK_FRACTION_BY_TIER[tier]
-
     entry_price = float(df.loc[i, "close"])
     atr_val = float(indicator_df.loc[i, "atr"])
     target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, target_atr_mult, stop_atr_mult)
     units = position_size_units(balance, risk_fraction, entry_price, stop_price, pair)
-
-    future_candles = df.iloc[i + 1: i + 1 + max_lookforward]
-    status, outcome_price, _outcome_ts, candles_to_outcome = label_outcome(
-        future_candles, direction, target_price, stop_price, max_lookforward
+    return OpenPosition(
+        direction=direction, tier=tier, entry_price=entry_price, target_price=target_price,
+        stop_price=stop_price, atr_val=atr_val, units=units, entry_balance=balance, pair=pair,
     )
-    # Callers only ever invoke this with i bounded so max_lookforward future candles exist
-    # (same guarantee run_backtest's last_evaluable bound already relies on).
-    assert status != "pending", "internal error: rl_engine ran out of candles unexpectedly"
 
-    pct_move = ((outcome_price - entry_price) / entry_price) * 100
-    if direction == "SELL":
+
+def _close_position(position: OpenPosition, outcome_price: float, balance: float) -> tuple[float, float]:
+    """
+    Closes an open position at outcome_price -- whatever the reason (target, stop, expiry,
+    or an agent-chosen EXIT, all resolved to a single price by the caller). Returns
+    (reward, new_balance) using the exact same log-balance-growth formula and ruin handling
+    _take_action_sized always used (retired -- this is the same math, just invoked from
+    wherever a close actually happens now instead of unconditionally inside one atomic call).
+    """
+    pct_move = ((outcome_price - position.entry_price) / position.entry_price) * 100
+    if position.direction == "SELL":
         pct_move = -pct_move
-    pct_move -= spread_cost_pct(pair, entry_price)
+    pct_move -= spread_cost_pct(position.pair, position.entry_price)
 
-    dollar_pnl = units * usd_per_unit(pair, entry_price) * (pct_move / 100) * entry_price
+    dollar_pnl = position.units * usd_per_unit(position.pair, position.entry_price) * (pct_move / 100) * position.entry_price
     new_balance = balance + dollar_pnl
 
     if new_balance <= 0:
-        return RUIN_REWARD, candles_to_outcome, 0.0
+        return RUIN_REWARD, 0.0
     reward = math.log(new_balance / balance) if balance > 0 else RUIN_REWARD
-    return reward, candles_to_outcome, new_balance
+    return reward, new_balance
+
+
+def _check_bar_backstop(
+    candle: pd.Series, direction: str, target_price: float, stop_price: float,
+) -> Optional[tuple[str, float]]:
+    """
+    One-candle version of label_outcome's target/stop check, for the per-bar stepping the
+    learned-exit architecture needs (label_outcome itself still walks a whole
+    future_candles window in one call -- this is what replaces that walk one bar at a time
+    so an agent-chosen EXIT can interrupt it). Stop wins a tie (a candle touching both
+    target and stop counts as a miss) -- same worse-case-first reasoning label_outcome's
+    own docstring already documents; OHLC data alone can't tell which was touched first
+    intra-candle. Returns (status, outcome_price), or None if neither was touched this bar.
+    """
+    if direction == "BUY":
+        stop_hit = candle["low"] <= stop_price
+        target_hit = candle["high"] >= target_price
+    else:
+        stop_hit = candle["high"] >= stop_price
+        target_hit = candle["low"] <= target_price
+    if stop_hit:
+        return "miss", stop_price
+    if target_hit:
+        return "hit", target_price
+    return None
 
 
 def chronological_train_test_split(

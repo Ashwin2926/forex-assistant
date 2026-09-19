@@ -45,7 +45,7 @@ from app.models.schemas import (
 from app.services.data_fetcher import fetch_and_store, backfill_batch, catch_up_batch
 from app.services.candle_archive import load_full_candle_history, load_archived_candles
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
-from app.services.signal_engine import compute_atr_target_stop, default_config_for
+from app.services.signal_engine import compute_atr_target_stop, default_config_for, spread_cost_pct
 from app.services.backtester import run_consensus_backtest
 from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus, direction_confidence
@@ -56,7 +56,7 @@ from app.services.rl_engine import (
     compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
     RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT,
-    is_usable_warm_start, should_keep_new_policy,
+    is_usable_warm_start, should_keep_new_policy, OpenPosition,
 )
 from app.services.case_memory import (
     memory_summary, memory_gate, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
@@ -67,6 +67,7 @@ from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import (
     score_pending_consensus_signals, score_pending_rl_signals,
     resolve_rl_signal_real_outcome, LIVE_MAX_LOOKFORWARD_BY_INTERVAL, counterfactual_target_stop,
+    DEFAULT_MAX_LOOKFORWARD,
 )
 
 settings = get_settings()
@@ -1690,36 +1691,28 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     endpoint returns -- the point is making "have we been here before" inspectable, not
     silently overriding the policy's decision with a separate heuristic.
 
-    Single-position-at-a-time, same discipline _take_action_sized already uses during
-    training (it only decides again once a simulated trade has resolved, advancing by
-    candles_to_outcome). If a pending RL signal already exists for this pair/interval, this
-    endpoint does NOT re-decide -- it first checks whether that signal has genuinely resolved
-    against real candles (resolve_rl_signal_real_outcome); if so, that real outcome is recorded
-    and a fresh decision proceeds below as normal, and if not, the still-open pending signal is
-    simply returned as-is, without recomputing state or q_values. This used to instead
-    re-evaluate on every call and mark the old signal "superseded" the moment a new decision
-    disagreed with it (including trivial cases like entry_price ticking a fraction on a moving
-    price) -- that meant live inference was re-deciding far more often than the policy was ever
-    trained to, which is what actually drove the high supersede rate GET /rl/accuracy showed,
-    not policy quality. Waiting for genuine resolution instead keeps live behavior consistent
-    with training and gives every signal a real chance to become a hit/miss/expired data point.
+    Single-position-at-a-time, same discipline the training environment (ppo_engine.
+    ForexTradingEnv) uses. If a pending RL signal already exists for this pair/interval, this
+    endpoint first checks whether it has genuinely resolved against real candles
+    (resolve_rl_signal_real_outcome -- the hard target/stop/expiry backstop, unchanged); if
+    so, that real outcome is recorded and a fresh decision proceeds below as normal. If it's
+    still open per that check, the agent gets one more say: fresh position-context state is
+    built (bars held, unrealized P&L, ATR distance to each backstop -- see
+    rl_engine.OpenPosition/position_features) and passed to choose_action_ppo again. An EXIT
+    action closes the trade early right there (status hit/miss by the sign of the realized
+    move, closed_early=True) and a fresh decision proceeds below; anything else and the
+    still-open pending signal is simply returned as-is. This replaced an earlier design that
+    re-evaluated on every call and marked the old signal "superseded" the moment a new
+    decision disagreed with it (including trivial cases like entry_price ticking a fraction on
+    a moving price) -- that meant live inference was re-deciding far more often than the
+    policy was ever trained to, which is what actually drove the high supersede rate GET
+    /rl/accuracy showed, not policy quality. Waiting for genuine resolution (or a deliberate
+    learned EXIT) instead keeps live behavior consistent with training.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
     if balance <= 0:
         raise HTTPException(status_code=400, detail="balance must be positive.")
-
-    pending = await rl_signals_collection.find_one(
-        {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
-    )
-    if pending is not None:
-        real_outcome, _ = await resolve_rl_signal_real_outcome(pending)
-        if real_outcome is not None:
-            await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": real_outcome})
-        else:
-            # Still genuinely open -- don't re-decide, just hand back the live view as-is.
-            pending["_id"] = str(pending["_id"])
-            return {"signal": pending, "q_values": pending.get("q_values"), "memory": None}
 
     policy_doc = await ppo_policies_collection.find_one(
         {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
@@ -1752,12 +1745,72 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     market_state, df, ml_buy_score, ml_sell_score = await asyncio.to_thread(
         _rl_state_from_candles, docs, config, pair, interval, resolved_signals,
     )
+    current_price = float(df.iloc[-1]["close"])
+    latest_timestamp = df.iloc[-1]["timestamp"]
+
+    pending = await rl_signals_collection.find_one(
+        {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
+    )
+    if pending is not None:
+        real_outcome, _ = await resolve_rl_signal_real_outcome(pending)
+        if real_outcome is not None:
+            await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": real_outcome})
+            pending = None
+        else:
+            # Still open per the hard target/stop/expiry backstop -- give the agent a chance
+            # to exit early anyway (the learned-exit architecture, see rl_engine.OpenPosition).
+            # Position context is reconstructed from the pending signal's own stored fields
+            # rather than a separate persisted collection; atr_val is recomputed fresh off the
+            # latest candles (close enough bar-to-bar, and avoids a new field purely for this).
+            # max_lookforward here is DEFAULT_MAX_LOOKFORWARD (20, flat) -- what every training
+            # run actually used for position_bars_held_frac (see scripts/train_rl.py's own
+            # --max-lookforward default), NOT LIVE_MAX_LOOKFORWARD_BY_INTERVAL, which is a
+            # live-only window for the real-candle backstop check above and would otherwise
+            # feed the agent a bars-held fraction it never saw in training.
+            atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+            bars_held = await candles_collection.count_documents({
+                "pair": pair, "interval": interval,
+                "timestamp": {"$gt": pending["timestamp"], "$lte": latest_timestamp},
+            })
+            position = OpenPosition(
+                direction=pending["direction"], tier=pending["size_tier"], entry_price=pending["entry_price"],
+                target_price=pending["target_price"], stop_price=pending["stop_price"], atr_val=atr_val,
+                units=pending["position_size_units"], entry_balance=pending["balance_at_signal"], pair=pair,
+                bars_held=bars_held,
+            )
+            exit_state = full_rl_state(
+                market_state, balance, policy.starting_balance, position, current_price, DEFAULT_MAX_LOOKFORWARD,
+            )
+            try:
+                exit_action, _exit_q_values = await asyncio.to_thread(choose_action_ppo, policy, exit_state)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            if exit_action != "EXIT":
+                # Still holding -- don't re-decide a new trade, just hand back the live view.
+                pending["_id"] = str(pending["_id"])
+                return {"signal": pending, "q_values": pending.get("q_values"), "memory": None}
+
+            pct_move = ((current_price - pending["entry_price"]) / pending["entry_price"]) * 100
+            if pending["direction"] == "SELL":
+                pct_move = -pct_move
+            pct_move -= spread_cost_pct(pair, pending["entry_price"])
+            await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": {
+                "status": "hit" if pct_move >= 0 else "miss",
+                "outcome_price": round(current_price, 5),
+                "outcome_timestamp": latest_timestamp,
+                "outcome_pct_move": round(pct_move, 5),
+                "candles_to_outcome": bars_held,
+                "closed_early": True,
+            }})
+            pending = None
+            # Falls through to decide a fresh signal below, same as a hard-backstop resolution.
+
     state = full_rl_state(market_state, balance, policy.starting_balance)
     try:
         action, q_values = await asyncio.to_thread(choose_action_ppo, policy, state)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    current_price = float(df.iloc[-1]["close"])
 
     # Live-exclusion gate: a policy whose latest training-time backtest showed a clear losing
     # edge (same STRONG_LOSS_RETURN_PCT threshold GET /rl/insights already flags as

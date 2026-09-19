@@ -316,6 +316,13 @@ class PPOPolicy(BaseModel):
     # tracked for the linear policy, re-added here once PPO gained the same capability. See
     # ppo_engine.train_ppo_policy's own docstring for when each path is taken.
     warm_started_from: Optional[str] = None
+    # True once rl_engine.ACTIONS includes "EXIT" and this policy was trained against the
+    # learned-exit state schema (RL_FEATURE_NAMES including RL_POSITION_FEATURE_NAMES) --
+    # every policy trained before that migration defaults False. Purely for dashboard/
+    # auditability filtering, so an old- and new-architecture policy for the same pair/
+    # interval are never visually confused; choose_action_ppo's own feature_names staleness
+    # guard is what actually blocks a mismatched policy from live serving, not this flag.
+    exit_action_enabled: bool = False
 
 
 class RLSignal(BaseModel):
@@ -382,6 +389,16 @@ class RLSignal(BaseModel):
     outcome_pct_move: Optional[float] = None
     candles_to_outcome: Optional[int] = None
     source: Literal["live", "backtest"] = "live"
+    # True when the agent itself chose EXIT before the hard target/stop/expiry backstop --
+    # the learned-exit architecture (see rl_engine.OpenPosition). Deliberately NOT a new
+    # `status` value: RESOLVED_STATUSES/GET /rl/accuracy and every other query already filter
+    # on the existing hit/miss/expired/superseded set, and closed_early trades should count
+    # toward hit rate by the SIGN of outcome_pct_move (usually a win taken early, per the
+    # user's own "take profit and leave" framing) rather than sit in an uncounted bucket the
+    # way "superseded" does -- so `status` is still plain "hit"/"miss" here, and this flag is
+    # purely for auditability (e.g. distinguishing a learned early exit from a target hit on
+    # GET /rl/signals or the dashboard).
+    closed_early: bool = False
 
 
 class RLInsightFinding(BaseModel):

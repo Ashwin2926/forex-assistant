@@ -41,18 +41,24 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 from app.models.schemas import BacktestRun, PPOPolicy, RuleConfig, Signal
 from app.services.indicators import add_all_indicators
-from app.services.signal_engine import compute_atr_target_stop, label_outcome, spread_cost_pct
+from app.services.signal_engine import spread_cost_pct
 from app.services import rl_engine as rl
 
 
 class ForexTradingEnv(gym.Env):
     """
-    Thin gymnasium adapter around rl_engine's existing sized-action replay mechanics -- NOT a
-    reimplementation. `step` delegates entirely to rl_engine._take_action_sized (log-balance-
-    growth reward, ruin handling, real position sizing via RISK_FRACTION_BY_TIER -- the exact
-    reward logic this project's retired linear Q-learning policy trained against too, see git
-    history); the observation at every step is rl_engine.full_rl_state applied to a
-    precomputed market_states row.
+    Thin gymnasium adapter around rl_engine's position-mechanics functions -- NOT a
+    reimplementation. Stepping is bar-by-bar (the learned-exit architecture -- see
+    rl_engine.OpenPosition's own docstring): while flat, a BUY/SELL action opens a position
+    via rl_engine._open_position and HOLD/EXIT are both no-ops; while a position is open,
+    every bar first checks the hard target/stop backstop (rl_engine._check_bar_backstop) and
+    max_lookforward expiry, closing via rl_engine._close_position if either trips, and
+    otherwise reads the agent's own action -- EXIT closes early at that bar's close, anything
+    else (including a BUY/SELL, since only one position is held at a time) counts as staying
+    in the trade. Reward is 0 on every bar that doesn't close a position and the real
+    log-balance-growth reward (unchanged formula, see _close_position) on the bar that does --
+    a real change from the old one-decision-one-reward shape, since a trade can now span many
+    bars before either the agent or a hard backstop ends it.
 
     market_states/df/indicator_df are precomputed ONCE by the caller (train_and_evaluate_ppo_
     poc) and passed in already -- same "compute once, reuse across every episode" discipline
@@ -85,10 +91,15 @@ class ForexTradingEnv(gym.Env):
         )
         self._i = start_index
         self._balance = starting_balance
+        self._position: Optional[rl.OpenPosition] = None
 
     def _obs(self) -> np.ndarray:
+        current_price = float(self.df.loc[self._i, "close"]) if self._position is not None else None
         return np.asarray(
-            rl.full_rl_state(self.market_states[self._i], self._balance, self.starting_balance),
+            rl.full_rl_state(
+                self.market_states[self._i], self._balance, self.starting_balance,
+                self._position, current_price, self.max_lookforward,
+            ),
             dtype=np.float32,
         )
 
@@ -96,18 +107,48 @@ class ForexTradingEnv(gym.Env):
         super().reset(seed=seed)
         self._i = self.start_index
         self._balance = self.starting_balance
+        self._position = None
         return self._obs(), {}
 
     def step(self, action_idx: int):
         action = rl.ACTIONS[int(action_idx)]
-        reward, advance, new_balance = rl._take_action_sized(
-            self.df, self.indicator_df, self._i, action, self.pair, self.max_lookforward,
-            self._balance, self.target_atr_mult, self.stop_atr_mult,
-        )
-        self._balance = new_balance
-        next_i = self._i + advance
+        reward = 0.0
+
+        if self._position is None:
+            if action not in ("HOLD", "EXIT"):
+                self._position = rl._open_position(
+                    self.df, self.indicator_df, self._i, action, self.pair, self._balance,
+                    self.target_atr_mult, self.stop_atr_mult,
+                )
+        else:
+            candle = self.df.loc[self._i]
+            self._position.bars_held += 1
+            backstop = rl._check_bar_backstop(
+                candle, self._position.direction, self._position.target_price, self._position.stop_price,
+            )
+            if backstop is not None:
+                _status, outcome_price = backstop
+                reward, self._balance = rl._close_position(self._position, outcome_price, self._balance)
+                self._position = None
+            elif self._position.bars_held >= self.max_lookforward or action == "EXIT":
+                outcome_price = float(candle["close"])
+                reward, self._balance = rl._close_position(self._position, outcome_price, self._balance)
+                self._position = None
+            # else: still open -- reward stays 0.0, bars_held already incremented above.
+
+        next_i = self._i + 1
         ruined = self._balance < rl.MIN_VIABLE_BALANCE
         terminated = bool(ruined or next_i > self.end_index)
+        # An episode boundary can land mid-trade now that a trade spans many bars instead of
+        # resolving atomically -- force-close (mark-to-market at the last available close)
+        # rather than silently dropping the position's unrealized P&L from the reward signal,
+        # which would otherwise teach the agent that trades still open at episode-end are free.
+        if terminated and not ruined and self._position is not None:
+            close_reward, self._balance = rl._close_position(
+                self._position, float(self.df.loc[self._i, "close"]), self._balance
+            )
+            reward += close_reward
+            self._position = None
         # Clamp rather than index past end_index -- SB3 still wants a valid observation on the
         # terminal step even though it won't be bootstrapped from (terminated=True).
         self._i = min(next_i, self.end_index) if not ruined else self._i
@@ -154,11 +195,19 @@ def _evaluate_policy(
     target_atr_mult: float, stop_atr_mult: float, starting_balance: float, run_id: str,
 ) -> tuple[BacktestRun, list[Signal]]:
     """
-    Greedy evaluation on the untouched test slice -- same walk-forward, single-position-at-a-
-    time shape and tallying this project's RL eval has always used, factored out so both the
-    PPO policy and the random baseline (train_and_evaluate_ppo_poc's "does it beat random"
-    check) are scored by the exact same yardstick. action_fn(obs: np.ndarray) -> str picks
-    the action for a given observation -- the only thing that differs between callers.
+    Greedy evaluation on the untouched test slice -- same single-position-at-a-time shape and
+    tallying this project's RL eval has always used, factored out so both the PPO policy and
+    the random baseline (train_and_evaluate_ppo_poc's "does it beat random" check) are scored
+    by the exact same yardstick. action_fn(obs: np.ndarray) -> str picks the action for a
+    given observation -- the only thing that differs between callers.
+
+    Bar-by-bar walk mirroring ForexTradingEnv.step's own mechanics (see its docstring): once a
+    position opens, action_fn is re-consulted every subsequent bar it survives, so an EXIT can
+    end it early instead of always riding to target/stop/expiry. A closed-early trade counts
+    toward hit_rate_pct by the sign of its realized pct_move -- usually a win taken early, per
+    the same reasoning app/models/schemas.py's RLSignal.closed_early docstring uses for the
+    live dashboard's own accounting -- rather than being excluded from the denominator the way
+    a "superseded" trade is.
     """
     hold_count = 0
     hits = misses = expired = 0
@@ -168,40 +217,57 @@ def _evaluate_policy(
     trade_signals: list[Signal] = []
 
     balance = starting_balance
+    position: Optional[rl.OpenPosition] = None
+    entry_i: Optional[int] = None
     i = test_start
     while i <= test_last:
-        obs = np.asarray(rl.full_rl_state(market_states[i], balance, starting_balance), dtype=np.float32)
+        current_price = float(df.loc[i, "close"]) if position is not None else None
+        obs = np.asarray(
+            rl.full_rl_state(market_states[i], balance, starting_balance, position, current_price, max_lookforward),
+            dtype=np.float32,
+        )
         action = action_fn(obs)
-        if action == "HOLD":
-            hold_count += 1
+
+        if position is None:
+            if action in ("HOLD", "EXIT"):
+                hold_count += 1
+                i += 1
+                continue
+            position = rl._open_position(df, indicator_df, i, action, pair, balance, target_atr_mult, stop_atr_mult)
+            entry_i = i
             i += 1
             continue
 
-        # _take_action_sized owns the actual reward/balance math (same log-balance-growth
-        # formula and ruin handling every policy is judged by); label_outcome is called again
-        # just below only to recover the raw status/outcome fields a Signal record needs,
-        # which _take_action_sized intentionally doesn't return -- the trade log needs more
-        # detail than the training reward path does.
-        _reward, advance, new_balance = rl._take_action_sized(
-            df, indicator_df, i, action, pair, max_lookforward, balance, target_atr_mult, stop_atr_mult,
-        )
-        direction, tier = action.split("_")
-        entry_price = float(df.loc[i, "close"])
-        atr_val = float(indicator_df.loc[i, "atr"])
-        target_price, stop_price = compute_atr_target_stop(entry_price, atr_val, direction, target_atr_mult, stop_atr_mult)
-        units = rl.position_size_units(balance, rl.RISK_FRACTION_BY_TIER[tier], entry_price, stop_price, pair)
-        future_candles = df.iloc[i + 1: i + 1 + max_lookforward]
-        status, outcome_price, outcome_ts, candles_to_outcome = label_outcome(
-            future_candles, direction, target_price, stop_price, max_lookforward
-        )
+        candle = df.loc[i]
+        position.bars_held += 1
+        backstop = rl._check_bar_backstop(candle, position.direction, position.target_price, position.stop_price)
+        closed_early = False
+        if backstop is not None:
+            status, outcome_price = backstop
+        elif position.bars_held >= max_lookforward:
+            status, outcome_price = "expired", float(candle["close"])
+        elif action == "EXIT":
+            status, outcome_price, closed_early = None, float(candle["close"]), True
+        else:
+            i += 1
+            continue  # still open, reward/outcome not yet determined
+
+        outcome_ts = candle["timestamp"]
+        candles_to_outcome = position.bars_held
+        direction, tier, entry_price = position.direction, position.tier, position.entry_price
 
         pct_move = ((outcome_price - entry_price) / entry_price) * 100
         if direction == "SELL":
             pct_move = -pct_move
         pct_move -= spread_cost_pct(pair, entry_price)
 
+        if closed_early:
+            status = "hit" if pct_move >= 0 else "miss"
+
+        units, target_price, stop_price = position.units, position.target_price, position.stop_price
         balance_before = balance
-        balance = new_balance
+        _reward, balance = rl._close_position(position, outcome_price, balance)
+        position = None
 
         if status == "hit":
             hits += 1
@@ -215,7 +281,7 @@ def _evaluate_policy(
         all_pcts.append(pct_move)
 
         trade_signals.append(Signal(
-            pair=pair, profile="intraday", interval=interval, timestamp=df.loc[i, "timestamp"],
+            pair=pair, profile="intraday", interval=interval, timestamp=df.loc[entry_i, "timestamp"],
             direction=direction, confidence=0.0, reasons=[], price_at_signal=round(entry_price, 5),
             status=status, outcome_price=round(float(outcome_price), 5), outcome_timestamp=outcome_ts,
             outcome_pct_move=round(pct_move, 5), source="backtest", run_id=run_id,
@@ -224,11 +290,11 @@ def _evaluate_policy(
             size_tier=tier, risk_fraction=rl.RISK_FRACTION_BY_TIER[tier], balance_at_signal=round(balance_before, 2),
             position_size_units=round(units, 2),
         ))
+        entry_i = None
 
         if balance < rl.MIN_VIABLE_BALANCE:
             break
-        assert advance == candles_to_outcome, "internal error: _take_action_sized and label_outcome disagree on advance"
-        i += advance
+        i += 1
 
     directional_signals = hits + misses + expired
     ending_balance = round(balance, 2)
@@ -435,6 +501,7 @@ def train_ppo_policy(
         total_timesteps=total_timesteps,
         model_bytes=buffer.getvalue(),
         warm_started_from=warm_start_policy_id if result["warm_started"] else None,
+        exit_action_enabled=True,
     )
     poc_diagnostics = {
         "beats_random": result["beats_random"],
