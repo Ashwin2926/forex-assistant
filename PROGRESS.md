@@ -4,6 +4,30 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-20
+
+**Root-caused "ML isn't improving": `consensus_signals` had zero live documents, ever.**
+Every `ml/runs` entry since at least 09-17 showed byte-identical accuracy/calibration
+numbers -- `train_samples` was frozen at 374, entirely from the static backtest archive,
+because `POST /consensus/{interval}` was returning `"consensus": null` on essentially every
+check (confirmed live in the cron logs across all 4 pairs). A real backtest sweep
+(`app/services/consensus.py`'s `check_consensus`, full history, 1h/4h/1day x all 4 pairs)
+showed why: at the production threshold (3-of-5 strategies agree, price levels within 0.5
+ATR of each other), consensus fired only 34 times across ~430k evaluated bars. The
+bottleneck was `PROXIMITY_ATR_MULT`, not the 3-of-5 agreement bar -- the 5 SMC strategies
+(order blocks, fair value gaps, liquidity sweeps, market structure, supply/demand) detect
+different-scale, largely non-overlapping patterns, so even when 3 genuinely agree on
+direction their specific entry/target levels rarely land within 0.5 ATR of each other.
+Loosening the agreement bar instead (tested down to 2-of-5) multiplies signal volume into
+the thousands but expectancy goes negative -- consistent with no single SMC strategy having
+a reliable edge in isolation, already known from prior single-strategy backtests. Shipped:
+`PROXIMITY_ATR_MULT` 0.5 -> 2.0 (kept `REQUIRED_WEIGHT_FRACTION` at 0.6) -- ~3x more signals
+(98 across the same 430k bars), hit rate 38.9% -> 55.1%, expectancy +0.017% -> +0.035%. Only
+1h/4h/1day were swept (5min/15min take much longer to replay -- each combo's full-history
+strategy-call computation alone ran 75s-580s); revisit if those two intervals' live
+consensus rate still looks off. Still a fundamentally rare-event signal source even after
+this fix -- 98 signals over years of history won't make ML's live training pool grow fast.
+
 ## 2026-09-19
 
 **Phase 2 shipped: learned exits for the PPO RL agent** (`rl_engine.py`/`ppo_engine.py`/

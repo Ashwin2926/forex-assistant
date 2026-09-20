@@ -19,17 +19,34 @@ STRATEGY_WEIGHTS: dict[str, float] = {fn.__name__.removeprefix("call_"): 1.0 for
 # prior 0.6 fraction as a starting point rather than re-derived from scratch, since the
 # original 0.6 was itself chosen (2026-08-24) to avoid an unreachably rare consensus across a
 # philosophically diverse strategy mix, which is equally true of this all-SMC lineup.
-# UNVALIDATED against the new strategies -- re-backtest across all pairs/intervals
-# (backtester.run_consensus_backtest) before trusting this bar, not just a vibe check.
+#
+# Backtest-validated 2026-09-20 (see PROXIMITY_ATR_MULT's own comment, same sweep) -- kept at
+# 0.6 deliberately. Loosening to 2-of-5 was tested and produces thousands more signals but
+# with negative expectancy; the real fix for the rare-consensus problem was PROXIMITY_ATR_MULT,
+# not this.
 REQUIRED_WEIGHT_FRACTION = 0.6
 
 # How close (in ATR multiples) agreeing strategies' entry/exit prices must be to count as
 # genuinely describing the same trade, not just the same direction -- two strategies both
 # saying "BUY" with wildly different entries/targets aren't actually agreeing on anything
-# tradeable. This is a starting guess, not derived from any backtest -- same caveat as
-# TYPICAL_SPREAD_PRICE in signal_engine.py: treat it as tunable and unvalidated until the
-# consensus backtest (backtester.run_consensus_backtest) says otherwise.
-PROXIMITY_ATR_MULT = 0.5
+# tradeable.
+#
+# Backtest-validated 2026-09-20 against real full-history candles (1h/4h/1day, all 4 pairs --
+# see PROGRESS.md's 2026-09-20 entry): the original 0.5 starting guess turned out to be the
+# actual bottleneck, not REQUIRED_WEIGHT_FRACTION. At 0.5 ATR, consensus fired essentially
+# never (34 signals total across ~430k evaluated bars -- this is what silently starved ML's
+# live training pool down to a static backtest-archive-only 374 samples for days). A grid
+# sweep at the current 3-of-5 REQUIRED_WEIGHT_FRACTION found 2.0 ATR gives ~3x the signal
+# volume (98) with BOTH a higher hit rate (55.1% vs 38.9%) and better expectancy (+0.035% vs
+# +0.017%) -- loosening price proximity let genuinely-agreeing strategies count as agreeing
+# instead of being thrown out over each pattern type's different natural scale (an order
+# block and a fair value gap describing the same real move rarely land within 0.5 ATR of each
+# other, even when both are right about direction). Loosening REQUIRED_WEIGHT_FRACTION
+# instead (tested down to 2-of-5) was tried and rejected -- it multiplies signal volume into
+# the thousands but expectancy goes negative, consistent with no single strategy having a
+# reliable edge in isolation. Only 1h/4h/1day were swept (5min/15min take much longer to
+# replay); revisit if those intervals' live behavior looks off after this change.
+PROXIMITY_ATR_MULT = 2.0
 
 
 def direction_confidence(calls: list[StrategyCall], direction: str) -> float:
