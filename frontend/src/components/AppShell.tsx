@@ -6,6 +6,7 @@ import { AuthGuard } from "@/components/AuthGuard";
 import { AuthNav } from "@/components/AuthNav";
 import { SideNav } from "@/components/SideNav";
 import { SyncNowButton } from "@/components/SyncNowButton";
+import { RefreshNowButton } from "@/components/RefreshNowButton";
 
 // Sidebar on desktop, slide-over drawer on mobile -- the old layout was a single fixed
 // w-56 <aside> with zero handling below that width, which just clipped/wrapped on a
@@ -67,6 +68,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               <SideNav />
             </div>
             <div className="flex flex-col gap-3 border-t px-3 py-4" style={{ borderColor: "var(--border)" }}>
+              <RefreshNowButton />
               <SyncNowButton />
               <AuthNav />
             </div>
@@ -88,6 +90,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SideNav />
         </div>
         <div className="flex flex-col gap-3 border-t px-3 py-4" style={{ borderColor: "var(--border)" }}>
+          <RefreshNowButton />
           <SyncNowButton />
           <AuthNav />
         </div>

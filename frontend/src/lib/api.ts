@@ -341,6 +341,13 @@ export const api = {
   cancelRunAllFlows(jobId: string) {
     return request<RunAllFlowsJob>(`/ops/run-all-flows/${jobId}/cancel`, { method: "POST" });
   },
+
+  // Fires one real keep-fresh.yml cycle on GitHub Actions right now -- lighter than "Sync
+  // now" (no in-process RL retrain across all 20 combos, ~1-6 min instead of ~20-30). No
+  // job_id: this either dispatches (204 from GitHub) or throws, nothing to poll.
+  triggerKeepFresh() {
+    return request<{ status: string }>("/ops/keep-fresh", { method: "POST" });
+  },
 };
 
 export { ApiError };

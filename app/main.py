@@ -2876,6 +2876,57 @@ async def _run_all_flows_job(job_id: str) -> None:
         )
 
 
+async def _trigger_keep_fresh_workflow():
+    """
+    Dispatches .github/workflows/keep-fresh.yml directly, the same way
+    _trigger_rl_train_workflow dispatches train-rl.yml -- same settings.github_pat/github_repo
+    requirement, same error handling, same CORS-preserving wrap around httpx's own exceptions
+    (see that function's own docstring). Fire-and-forget: unlike train-rl.yml/
+    rebuild-backtests.yml, keep-fresh.yml's workflow_dispatch takes no inputs and reports no
+    progress into a job doc this backend can poll -- it's the same lightweight per-cycle work
+    the */20 schedule already runs (ingest, consensus check, RL signals, scoring, ML retrain),
+    just fired once, right now, from wherever this is called.
+
+    Exists as a lighter alternative to POST /ops/run-all-flows for the exact same "the cron's
+    own scheduler has gone quiet" situation (GitHub's own scheduled triggers aren't always
+    reliable under load -- confirmed live 2026-08-27 and again 2026-09-20, see PROGRESS.md) --
+    run-all-flows also retrains all 20 RL combos in-process every time (~20-30 min by design,
+    since "Sync now" was built to mean everything); this just re-runs one real cron cycle
+    (~1-6 min) without that.
+    """
+    if not settings.github_pat or not settings.github_repo:
+        raise HTTPException(
+            status_code=500,
+            detail="github_pat/github_repo not configured -- can't dispatch .github/workflows/keep-fresh.yml.",
+        )
+    url = f"https://api.github.com/repos/{settings.github_repo}/actions/workflows/keep-fresh.yml/dispatches"
+    headers = {"Authorization": f"Bearer {settings.github_pat}", "Accept": "application/vnd.github+json"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json={"ref": "master"}, headers=headers)
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502, detail=f"Couldn't reach GitHub's API ({type(e).__name__}): {e}",
+        )
+    if resp.status_code != 204:
+        raise HTTPException(
+            status_code=502, detail=f"GitHub workflow_dispatch failed ({resp.status_code}): {resp.text[:300]}",
+        )
+
+
+@app.post("/ops/keep-fresh")
+async def trigger_keep_fresh():
+    """
+    Manually fires one keep-fresh.yml cycle right now -- see _trigger_keep_fresh_workflow's
+    own docstring. No job_id/polling, unlike /ops/run-all-flows: the dispatch call itself
+    either succeeds (204 from GitHub, the run is now queued) or raises. Nothing here is
+    tracked in Mongo -- check the repo's Actions tab for the run itself if you want to watch
+    it -- this is intentionally the thin, fire-and-forget option.
+    """
+    await _trigger_keep_fresh_workflow()
+    return {"status": "dispatched"}
+
+
 @app.post("/ops/run-all-flows")
 async def run_all_flows(background_tasks: BackgroundTasks):
     """
