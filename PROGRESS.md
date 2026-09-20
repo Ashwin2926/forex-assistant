@@ -6,6 +6,20 @@ Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README
 
 ## 2026-09-20
 
+**Fixed train-rl.yml's nightly cron dying without finishing.** The last two scheduled runs
+(09-19, 09-20) each ran 2+ hours and got cancelled without completing -- the workflow walked
+all 20 pair/interval combos sequentially in one job via `scripts/train_rl.py`'s own for-loop,
+and the Phase 2 learned-exit architecture's bar-by-bar training/eval (see the 2026-09-19
+entries) made that meaningfully slower per combo than before. Confirmed the fix live earlier
+today by hand: dispatching the same 20 combos as separate `workflow_dispatch` calls instead
+of one sweep finished cleanly in parallel. `train-rl.yml` now does this by default -- a new
+`generate-matrix` job decides the combo list (one combo if `workflow_dispatch` was given both
+`pair`+`interval`, all 20 otherwise -- covering the nightly schedule, a blank manual dispatch,
+and `POST /rl/train-all`), and `train` runs as a `strategy: matrix` over it, `fail-fast:
+false`, each combo getting its own runner and 6-hour timeout instead of sharing one. `Prune RL
+history` moved to its own job (`needs: train`) since running it 20x per matrix entry would've
+been redundant.
+
 **Root-caused "ML isn't improving": `consensus_signals` had zero live documents, ever.**
 Every `ml/runs` entry since at least 09-17 showed byte-identical accuracy/calibration
 numbers -- `train_samples` was frozen at 374, entirely from the static backtest archive,
