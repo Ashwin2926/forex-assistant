@@ -163,5 +163,12 @@ jobs:
               "$API_BASE/rl/signal/1day?pair=${pair/\//%2F}" -o /dev/null || true
           done
       - name: Score pending RL signals
+        # || true, matching every "Generate RL signals" step above -- this call works fine in
+        # isolation (confirmed live 2026-09-21, ~6s) but was the sole reason this job showed
+        # "failure" on every recent run: it occasionally exceeds FastAPI Cloud's own gateway
+        # timeout under real cron load (right after the CPU-heavy signal-generation steps
+        # above it), and unlike its siblings had no tolerance for that. Nothing is lost when
+        # this one cycle's score attempt fails -- score_pending_rl_signals just re-checks the
+        # same pending signals against real candles next cycle, same as always.
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/score"
+          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/score" || true
