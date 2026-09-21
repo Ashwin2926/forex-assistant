@@ -1835,7 +1835,14 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
             ),
         }
 
-    if action == "HOLD":
+    # EXIT is only meaningful with an open position (see rl_engine.ACTIONS' own comment) --
+    # nothing stops a trained policy from still greedily preferring it while flat for some
+    # market states, so this has to be treated as a no-op here too, the same way the training
+    # environment (ForexTradingEnv.step) already treats HOLD/EXIT identically when flat.
+    # Without this guard, action.split("_") below crashes on "EXIT" (no underscore to split
+    # on) -- confirmed live 2026-09-21, a 500 on every fresh-decision call whose greedy action
+    # happened to be EXIT.
+    if action in ("HOLD", "EXIT"):
         return {"signal": None, "q_values": q_values}
 
     direction, tier = action.split("_")
