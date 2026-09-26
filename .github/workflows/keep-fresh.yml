@@ -157,7 +157,9 @@ jobs:
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
               resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
                 "$API_BASE/rl/signal/$interval?pair=${pair/\//%2F}" || true)
-              echo "[$interval $pair] HTTP ${resp##*$'\n'} -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+              code=${resp##*$'\n'}
+              echo "[$interval $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+              case "$code" in 5*|000) echo "::warning::/rl/signal/$interval ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
             done
           done
       - name: Generate RL signals (1h)
@@ -166,7 +168,9 @@ jobs:
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}" || true)
-            echo "[1h $pair] HTTP ${resp##*$'\n'} -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+            code=${resp##*$'\n'}
+            echo "[1h $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+            case "$code" in 5*|000) echo "::warning::/rl/signal/1h ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
           done
       - name: Generate RL signals (4h)
         if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
@@ -174,7 +178,9 @@ jobs:
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}" || true)
-            echo "[4h $pair] HTTP ${resp##*$'\n'} -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+            code=${resp##*$'\n'}
+            echo "[4h $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+            case "$code" in 5*|000) echo "::warning::/rl/signal/4h ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
           done
       - name: Generate RL signals (1day)
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
@@ -182,7 +188,9 @@ jobs:
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/rl/signal/1day?pair=${pair/\//%2F}" || true)
-            echo "[1day $pair] HTTP ${resp##*$'\n'} -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+            code=${resp##*$'\n'}
+            echo "[1day $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
+            case "$code" in 5*|000) echo "::warning::/rl/signal/1day ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
           done
       - name: Score pending RL signals
         # || true, matching every "Generate RL signals" step above -- this call works fine in
@@ -193,8 +201,9 @@ jobs:
         # this one cycle's score attempt fails -- score_pending_rl_signals just re-checks the
         # same pending signals against real candles next cycle, same as always.
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/score" || true
-      # Every ingest/consensus/ML call above is soft-failing (|| records SOFT_FAILURES) so one
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/score" || echo "::warning::/rl/score failed (non-blocking, retried next cycle)"
+      # Every ingest/consensus/ML call above (and any 5xx/timeout from /rl/signal -- a 4xx
+      # there, e.g. "no trained policy yet", is an expected state, not a failure) is soft-failing (|| records SOFT_FAILURES) so one
       # slow or failed upstream call -- e.g. Twelve Data dropping the connection for one pair,
       # or FastAPI Cloud's gateway timing out one request -- no longer aborts the whole job
       # before the signal-generation steps below it get to run on the candles already stored.
@@ -202,5 +211,5 @@ jobs:
       - name: Fail if any step above soft-failed
         if: env.SOFT_FAILURES == '1'
         run: |
-          echo "::error::One or more ingest/consensus/ML calls failed -- see the warnings above."
+          echo "::error::One or more ingest/consensus/ML/RL calls failed -- see the warnings above."
           exit 1
