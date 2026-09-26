@@ -41,6 +41,11 @@ jobs:
     env:
       API_BASE: https://forex-assistant.fastapicloud.dev
       AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+      # /rl/signal calls below retry up to twice (40s apart) on 502/503/no-response: when the
+      # FastAPI Cloud replica dies mid-request (seen repeatedly 2026-09-26, silent restart, no
+      # traceback) every following call 502s instantly for ~70s while it reboots, which used
+      # to throw away the rest of that interval's batch. A 524 (request hung past the gateway)
+      # is NOT retried -- that request itself is what's killing the replica.
       # One-line summary of a POST /rl/signal response, so the job log says WHY no signal was
       # stored (HOLD, excluded policy, ML gate, memory gate, 4xx detail, gateway timeout)
       # instead of discarding the body -- the old `-o /dev/null` made every one of those
@@ -155,8 +160,11 @@ jobs:
         run: |
           for interval in 5min 15min; do
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-              resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-                "$API_BASE/rl/signal/$interval?pair=${pair/\//%2F}" || true)
+              for attempt in 1 2 3; do
+                resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                  "$API_BASE/rl/signal/$interval?pair=${pair/\//%2F}" || true)
+                case "${resp##*$'\n'}" in 502|503|000) if [ "$attempt" -lt 3 ]; then echo "  (HTTP ${resp##*$'\n'}, backend restarting -- retry $attempt/2 in 40s)"; sleep 40; fi;; *) break;; esac
+              done
               code=${resp##*$'\n'}
               echo "[$interval $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
               case "$code" in 5*|000) echo "::warning::/rl/signal/$interval ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
@@ -166,8 +174,11 @@ jobs:
         if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}" || true)
+            for attempt in 1 2 3; do
+              resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/rl/signal/1h?pair=${pair/\//%2F}" || true)
+              case "${resp##*$'\n'}" in 502|503|000) if [ "$attempt" -lt 3 ]; then echo "  (HTTP ${resp##*$'\n'}, backend restarting -- retry $attempt/2 in 40s)"; sleep 40; fi;; *) break;; esac
+            done
             code=${resp##*$'\n'}
             echo "[1h $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
             case "$code" in 5*|000) echo "::warning::/rl/signal/1h ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
@@ -176,8 +187,11 @@ jobs:
         if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}" || true)
+            for attempt in 1 2 3; do
+              resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/rl/signal/4h?pair=${pair/\//%2F}" || true)
+              case "${resp##*$'\n'}" in 502|503|000) if [ "$attempt" -lt 3 ]; then echo "  (HTTP ${resp##*$'\n'}, backend restarting -- retry $attempt/2 in 40s)"; sleep 40; fi;; *) break;; esac
+            done
             code=${resp##*$'\n'}
             echo "[4h $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
             case "$code" in 5*|000) echo "::warning::/rl/signal/4h ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
@@ -186,8 +200,11 @@ jobs:
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/rl/signal/1day?pair=${pair/\//%2F}" || true)
+            for attempt in 1 2 3; do
+              resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/rl/signal/1day?pair=${pair/\//%2F}" || true)
+              case "${resp##*$'\n'}" in 502|503|000) if [ "$attempt" -lt 3 ]; then echo "  (HTTP ${resp##*$'\n'}, backend restarting -- retry $attempt/2 in 40s)"; sleep 40; fi;; *) break;; esac
+            done
             code=${resp##*$'\n'}
             echo "[1day $pair] HTTP $code -- $(printf '%s' "${resp%$'\n'*}" | python3 -c "$RL_SUMMARIZE")"
             case "$code" in 5*|000) echo "::warning::/rl/signal/1day ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
