@@ -56,7 +56,7 @@ from app.services.rl_engine import (
     compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
     RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT,
-    is_usable_warm_start, should_keep_new_policy, OpenPosition,
+    is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE, OpenPosition,
 )
 from app.services.case_memory import (
     memory_summary, memory_gate, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
@@ -348,6 +348,15 @@ async def prune_candle_history(confirm: bool = False, keep_latest_n: int = CANDL
 # unvalidated threshold in this project; revisit once enough gated-vs-ungated live outcomes
 # exist to check where the real cutoff should be.
 GOOD_SIGNAL_ML_THRESHOLD = 0.6
+# Both ML quality gates (consensus + RL) are OFF until the classifier shows real out-of-sample
+# skill. Checked live 2026-09-26 (POST /ml/train): trained on 632 backtest-only signals (zero
+# live resolved), test accuracy 53.7%, precision 43.5%, and calibration flat-to-inverted --
+# the 70-100% bucket actually hit 46.2% vs 40.8% for 0-40%. The 60% bar above was set when
+# calibration looked monotonic; on today's model it just discards ~80% of decisions at random.
+# ml_hit_probability is still computed and stored on every signal (and still feeds the RL
+# state), so flipping this back on is a one-line change once /ml/train's test_calibration
+# shows the high buckets genuinely hitting more often than the low ones.
+ML_GATE_ENABLED = False
 
 
 # The rule engine (apply_rules/decide/generate_signal, the old /signals/* CRUD family) was
@@ -475,7 +484,7 @@ async def create_consensus_signal(interval: str, pair: str):
     features = extract_features(consensus.model_dump())
     ml_hit_probability = await asyncio.to_thread(predict_hit_probability, resolved_signals, features)
     consensus.ml_hit_probability = ml_hit_probability
-    if ml_hit_probability is not None and ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
+    if ML_GATE_ENABLED and ml_hit_probability is not None and ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
         consensus.ml_override = (
             f"ML rated this {consensus.direction} at only {ml_hit_probability * 100:.0f}% hit "
             f"probability (below the {GOOD_SIGNAL_ML_THRESHOLD * 100:.0f}% bar for a live signal) "
@@ -816,13 +825,16 @@ async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None,
          is_usable_warm_start's own docstring for why both matter.
     Returns (policy_id, model_bytes, baseline_return_pct) on success -- the caller passes
     policy_id/model_bytes through to train_ppo_policy for warm_started_from tracking, and
-    baseline_return_pct (the prior policy's own total_return_pct, or 0.0/breakeven when
+    baseline_return_pct (the prior policy's own total_return_pct, STALE_POLICY_BASELINE when the
+    latest policy is feature-set-stale and can't serve at all, or 0.0/breakeven when
     there's no usable prior policy) is what this run's own result must match or beat, see
     rl_engine.should_keep_new_policy.
     """
     prev = await ppo_policies_collection.find_one({"pair": pair, "interval": interval}, sort=[("created_at", -1)])
-    if not prev or prev.get("feature_names") != RL_FEATURE_NAMES:
+    if not prev:
         return None, None, 0.0
+    if prev.get("feature_names") != RL_FEATURE_NAMES:
+        return None, None, STALE_POLICY_BASELINE
     eval_run = await backtest_runs_collection.find_one({"run_id": prev.get("eval_run_id")})
     if not is_usable_warm_start(eval_run):
         return None, None, 0.0
@@ -1808,7 +1820,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
 
     state = full_rl_state(market_state, balance, policy.starting_balance)
     try:
-        action, q_values = await asyncio.to_thread(choose_action_ppo, policy, state)
+        action, q_values = await asyncio.to_thread(choose_action_ppo, policy, state, True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1857,7 +1869,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     # raw Q-policy action, same "guaranteed by construction, not left for the agent alone to
     # discover" philosophy as the fixed 1.5:1 target:stop floor.
     ml_score = ml_buy_score if direction == "BUY" else ml_sell_score
-    if ml_score is not None and ml_score < GOOD_SIGNAL_ML_THRESHOLD:
+    if ML_GATE_ENABLED and ml_score is not None and ml_score < GOOD_SIGNAL_ML_THRESHOLD:
         return {
             "signal": None, "q_values": q_values,
             "ml_blocked_reason": (

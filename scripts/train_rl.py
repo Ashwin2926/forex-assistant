@@ -44,7 +44,7 @@ from app.services.ml_training_data import load_backtest_signals_archive
 from app.services.ml_features import is_current_smc_signal
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import (
-    rl_config_profile, RL_FEATURE_NAMES, is_usable_warm_start, should_keep_new_policy,
+    rl_config_profile, RL_FEATURE_NAMES, is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE,
 )
 from app.services.signal_engine import default_config_for
 
@@ -71,8 +71,10 @@ def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, by
     docstring for the full reasoning -- both delegate to rl_engine.is_usable_warm_start so the
     two paths can't drift on what counts as a usable prior policy."""
     prev = db["ppo_policies"].find_one({"pair": pair, "interval": interval}, sort=[("created_at", -1)])
-    if not prev or prev.get("feature_names") != RL_FEATURE_NAMES:
+    if not prev:
         return None, None, 0.0
+    if prev.get("feature_names") != RL_FEATURE_NAMES:
+        return None, None, STALE_POLICY_BASELINE
     eval_run = db["backtest_runs"].find_one({"run_id": prev.get("eval_run_id")})
     if not is_usable_warm_start(eval_run):
         return None, None, 0.0

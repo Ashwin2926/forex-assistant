@@ -4,6 +4,36 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-26
+
+**Why PPO/ML weren't producing signals -- diagnosed live, four fixes.** Nightly `train-rl.yml`
+was actually running fine (all 20 combos green; GitHub just starts the 00:20 UTC schedule
+~4.5h late). The real causes, from a `keep-fresh.yml` dispatch with the new per-call logging:
+
+- **`keep-fresh.yml` aborted before signal generation.** Every ingest/consensus/ML call was
+  `curl -sf` under `bash -e` with no timeout, so one upstream failure (e.g. `/ingest/15min`
+  erroring after ~4 min while Twelve Data dropped AUD/USD) ended the whole job -- that cycle
+  ran no consensus/RL at all. These calls now have `-m 150` and record a soft failure; a final
+  step still turns the run red. The RL signal steps, which used to throw every response away
+  (`-o /dev/null`), now log HTTP status + the reason no signal was stored.
+- **PPO picked HOLD while preferring a direction.** Plain argmax over 6 actions let HOLD beat
+  a direction whose mass was split across SMALL/LARGE (AUD/USD/1day: SELL 0.47 vs HOLD 0.35),
+  and several policies' top action while flat was EXIT (a no-op). New
+  `ppo_engine.select_action` pools per direction while flat; used by BOTH live inference and
+  `_evaluate_policy`, so kept/rejected decisions judge the same rule that trades live.
+- **Stale policies were never replaced.** GBP/USD/5min's latest policy has 17 features vs
+  today's 22, so `/rl/signal` 400s every call -- but a stale prior meant a 0.0 baseline, so
+  every losing retrain was rejected and it stayed stuck. `STALE_POLICY_BASELINE` (-inf) now
+  lets any compatible retrain replace it; the -30% live-exclusion gate still keeps a bad one
+  from trading.
+- **ML gates disabled (`ML_GATE_ENABLED = False`).** Model has no out-of-sample skill (632
+  backtest-only samples, test acc 53.7%, 70-100% bucket hit 46.2% vs 40.8% at 0-40%), so the
+  60% gate was discarding most consensus/RL decisions at random. Probabilities are still
+  computed and stored.
+
+Also seen: FastAPI Cloud degraded from ~09:30 UTC (ingest ~125s/call, then 502/524 on
+`/rl/signal`) -- not diagnosable from the workflow side; check the platform logs if it recurs.
+
 ## 2026-09-20
 
 **Fixed train-rl.yml's nightly cron dying without finishing.** The last two scheduled runs

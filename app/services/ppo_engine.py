@@ -170,7 +170,43 @@ def _build_market_states(
     return indicator_df, market_states
 
 
-def _greedy_ppo_action(model: PPO, obs: np.ndarray) -> tuple[str, dict[str, float]]:
+def select_action(action_probs: dict[str, float], flat: bool) -> str:
+    """
+    Turns PPO's action-probability distribution into one action. While flat, probability is
+    pooled per DIRECTION before picking, instead of a plain argmax over all six actions: the
+    action space splits every direction into two size tiers (BUY_SMALL/BUY_LARGE, ...) and
+    EXIT is a no-op when flat (ForexTradingEnv.step treats it exactly like HOLD), so a plain
+    argmax let HOLD win against a direction the policy actually preferred overall just because
+    that direction's mass was split in two -- confirmed live 2026-09-26, e.g. AUD/USD/1day at
+    SELL_SMALL 0.15 + SELL_LARGE 0.32 = 0.47 vs HOLD 0.35 (+ EXIT 0.08), and several policies
+    whose single largest action while flat was EXIT. Flat choice is among HOLD (HOLD+EXIT),
+    BUY (both tiers) and SELL (both tiers), ties going to HOLD; a chosen direction takes
+    whichever of its two tiers is itself more probable. With a position open, plain argmax
+    (unchanged) -- only EXIT vs. not-EXIT matters there.
+
+    Used by BOTH live inference (choose_action_ppo) and the test-slice evaluation
+    (_evaluate_policy via train_ppo_policy), so a policy is judged by exactly the rule it
+    trades with live.
+    """
+    if not flat:
+        return max(action_probs, key=action_probs.get)
+    hold = action_probs["HOLD"] + action_probs["EXIT"]
+    buy = action_probs["BUY_SMALL"] + action_probs["BUY_LARGE"]
+    sell = action_probs["SELL_SMALL"] + action_probs["SELL_LARGE"]
+    if hold >= buy and hold >= sell:
+        return "HOLD"
+    direction = "BUY" if buy > sell else "SELL"
+    return f"{direction}_LARGE" if action_probs[f"{direction}_LARGE"] > action_probs[f"{direction}_SMALL"] else f"{direction}_SMALL"
+
+
+def _action_probs(model: PPO, obs: np.ndarray) -> dict[str, float]:
+    obs_tensor, _ = model.policy.obs_to_tensor(obs.reshape(1, -1))
+    distribution = model.policy.get_distribution(obs_tensor)
+    probs = distribution.distribution.probs.detach().cpu().numpy().flatten()
+    return {a: float(p) for a, p in zip(rl.ACTIONS, probs)}
+
+
+def _greedy_ppo_action(model: PPO, obs: np.ndarray, flat: bool = False) -> tuple[str, dict[str, float]]:
     """
     Interpretability replacement for the retired linear policy's per-feature weight table
     (see "Signal Stack v2" phase 3, section 04's interpretability decision) -- PPO's policy
@@ -181,12 +217,9 @@ def _greedy_ppo_action(model: PPO, obs: np.ndarray) -> tuple[str, dict[str, floa
     choose_action's (action, q_values) return so a caller can display it the same way --
     RLSignal.q_values holds this dict now regardless of caller.
     """
-    obs_tensor, _ = model.policy.obs_to_tensor(obs.reshape(1, -1))
-    distribution = model.policy.get_distribution(obs_tensor)
-    probs = distribution.distribution.probs.detach().cpu().numpy().flatten()
-    action_probs = {a: round(float(p), 4) for a, p in zip(rl.ACTIONS, probs)}
-    action = max(action_probs, key=action_probs.get)
-    return action, action_probs
+    action_probs = _action_probs(model, obs)
+    action = select_action(action_probs, flat)
+    return action, {a: round(p, 4) for a, p in action_probs.items()}
 
 
 def _evaluate_policy(
@@ -198,8 +231,8 @@ def _evaluate_policy(
     Greedy evaluation on the untouched test slice -- same single-position-at-a-time shape and
     tallying this project's RL eval has always used, factored out so both the PPO policy and
     the random baseline (train_and_evaluate_ppo_poc's "does it beat random" check) are scored
-    by the exact same yardstick. action_fn(obs: np.ndarray) -> str picks the action for a
-    given observation -- the only thing that differs between callers.
+    by the exact same yardstick. action_fn(obs: np.ndarray, flat: bool) -> str picks the action for
+    a given observation (flat: no position open -- see select_action) -- the only thing that differs between callers.
 
     Bar-by-bar walk mirroring ForexTradingEnv.step's own mechanics (see its docstring): once a
     position opens, action_fn is re-consulted every subsequent bar it survives, so an EXIT can
@@ -226,7 +259,7 @@ def _evaluate_policy(
             rl.full_rl_state(market_states[i], balance, starting_balance, position, current_price, max_lookforward),
             dtype=np.float32,
         )
-        action = action_fn(obs)
+        action = action_fn(obs, position is None)
 
         if position is None:
             if action in ("HOLD", "EXIT"):
@@ -395,9 +428,8 @@ def train_and_evaluate_ppo_poc(
         model.learn(total_timesteps=total_timesteps)
 
     # Greedy (deterministic) PPO evaluation on the untouched test slice.
-    def ppo_action_fn(obs: np.ndarray) -> str:
-        action, _ = model.predict(obs, deterministic=True)
-        return rl.ACTIONS[int(action)]
+    def ppo_action_fn(obs: np.ndarray, flat: bool) -> str:
+        return select_action(_action_probs(model, obs), flat)
 
     ppo_run_id = uuid.uuid4().hex[:12]
     ppo_eval_run, ppo_trade_signals = _evaluate_policy(
@@ -409,7 +441,7 @@ def train_and_evaluate_ppo_poc(
     # action choice instead of a trained policy. This is the actual "beats random" gate.
     rng = np.random.default_rng(random_seed)
 
-    def random_action_fn(_obs: np.ndarray) -> str:
+    def random_action_fn(_obs: np.ndarray, _flat: bool) -> str:
         return rng.choice(rl.ACTIONS)
 
     random_run_id = uuid.uuid4().hex[:12]
@@ -513,7 +545,7 @@ def train_ppo_policy(
     return policy, result["ppo_eval_run"], result["ppo_trade_signals"], poc_diagnostics
 
 
-def choose_action_ppo(policy: PPOPolicy, state: list[float]) -> tuple[str, dict[str, float]]:
+def choose_action_ppo(policy: PPOPolicy, state: list[float], flat: bool = False) -> tuple[str, dict[str, float]]:
     """
     Live-inference for a persisted PPOPolicy -- called by main.py's POST /rl/signal/{interval}.
     Same staleness guard this project's retired linear choose_action used (a policy trained
@@ -535,4 +567,4 @@ def choose_action_ppo(policy: PPOPolicy, state: list[float]) -> tuple[str, dict[
         )
     model = PPO.load(io.BytesIO(policy.model_bytes), device="cpu")
     obs = np.asarray(state, dtype=np.float32)
-    return _greedy_ppo_action(model, obs)
+    return _greedy_ppo_action(model, obs, flat)

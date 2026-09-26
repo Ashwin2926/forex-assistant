@@ -57,6 +57,17 @@ def is_usable_warm_start(eval_run: Optional[dict]) -> bool:
     return return_pct is None or return_pct > STRONG_LOSS_RETURN_PCT
 
 
+# baseline_return_pct for when the latest stored policy can't be served at all -- trained under
+# an older state feature set, so choose_action_ppo rejects it and POST /rl/signal 400s on every
+# call. Any newly trained, compatible policy beats a policy that can't run, so it must always
+# be kept; the old 0.0 baseline meant a stale policy was never replaced unless a retrain
+# happened to come out profitable (confirmed live 2026-09-26: GBP/USD/5min stuck on a
+# 17-feature policy vs today's 22, every nightly retrain rejected). A kept-but-losing
+# replacement is still held back from live trading by POST /rl/signal's own
+# STRONG_LOSS_RETURN_PCT exclusion gate, and becomes a compatible base for future retrains.
+STALE_POLICY_BASELINE = float("-inf")
+
+
 def should_keep_new_policy(new_return_pct: Optional[float], baseline_return_pct: float) -> bool:
     """
     The actual fix for the warm-start-drift pattern PROGRESS.md's 2026-09-15 entry documents:
