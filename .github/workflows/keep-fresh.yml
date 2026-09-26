@@ -69,20 +69,20 @@ jobs:
       - name: Ingest 5min + 15min candles
         run: |
           for interval in 5min 15min; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5"
+            curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5" || { echo "::warning::/ingest/$interval failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
           done
       - name: Ingest 1h candles
         if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5"
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5" || { echo "::warning::/ingest/1h failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       - name: Ingest 4h candles
         if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/4h?output_size=5"
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/4h?output_size=5" || { echo "::warning::/ingest/4h failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       - name: Ingest 1day candles
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1day?output_size=5"
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1day?output_size=5" || { echo "::warning::/ingest/1day failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       # Consensus (app/services/consensus.py, SMC) is the only live signal source now --
       # the rule engine's own generate-signal step (POST /signals/.../intraday) was removed
       # along with the rest of that engine, see PROGRESS.md's rule-engine-removal entry.
@@ -95,34 +95,34 @@ jobs:
         run: |
           for interval in 5min 15min; do
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-              curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-                "$API_BASE/consensus/$interval?pair=${pair/\//%2F}"
+              curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+                "$API_BASE/consensus/$interval?pair=${pair/\//%2F}" || { echo "::warning::/consensus/$interval ($pair) failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
             done
           done
       - name: Check consensus (1h)
         if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/consensus/1h?pair=${pair/\//%2F}"
+            curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/consensus/1h?pair=${pair/\//%2F}" || { echo "::warning::/consensus/1h ($pair) failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
           done
       - name: Check consensus (4h)
         if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/consensus/4h?pair=${pair/\//%2F}"
+            curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/consensus/4h?pair=${pair/\//%2F}" || { echo "::warning::/consensus/4h ($pair) failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
           done
       - name: Check consensus (1day)
         if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
-            curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
-              "$API_BASE/consensus/1day?pair=${pair/\//%2F}"
+            curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
+              "$API_BASE/consensus/1day?pair=${pair/\//%2F}" || { echo "::warning::/consensus/1day ($pair) failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
           done
       - name: Score pending consensus signals
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/consensus/score"
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/consensus/score" || { echo "::warning::/consensus/score failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       # Retrains the supervised hit/miss classifier (app/services/ml_model.py) on every
       # resolved live signal -- right after scoring above, so it sees whatever just got
       # resolved this cycle. Unconditional/every firing like scoring, not gated by interval:
@@ -130,7 +130,7 @@ jobs:
       # there's no reason to run it less often than the data it depends on actually changes.
       - name: Retrain ML model
         run: |
-          curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train"
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train" || { echo "::warning::/ml/train failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       # RL agent (app/services/rl_engine.py) -- a learned, adaptive alternative to consensus's
       # fixed weighted-vote threshold over the same 5 SMC strategies. Covers all 5 intervals, one
       # independent policy per pair PER interval. Training itself no longer happens here --
@@ -194,3 +194,13 @@ jobs:
         # same pending signals against real candles next cycle, same as always.
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/score" || true
+      # Every ingest/consensus/ML call above is soft-failing (|| records SOFT_FAILURES) so one
+      # slow or failed upstream call -- e.g. Twelve Data dropping the connection for one pair,
+      # or FastAPI Cloud's gateway timing out one request -- no longer aborts the whole job
+      # before the signal-generation steps below it get to run on the candles already stored.
+      # This step keeps those failures visible by still turning the run red at the very end.
+      - name: Fail if any step above soft-failed
+        if: env.SOFT_FAILURES == '1'
+        run: |
+          echo "::error::One or more ingest/consensus/ML calls failed -- see the warnings above."
+          exit 1
