@@ -1,0 +1,71 @@
+name: Catch up candles, score signals, retrain ML
+
+# Manual only. For when keep-fresh.yml has been failing or GitHub's scheduler has gone quiet
+# long enough that candles have gaps: open signals can't resolve against candles that were
+# never ingested, and anything trained afterwards learns from those gaps. In order:
+#   1. POST /ingest/catch-up (background job: every pair x interval caught up from wherever
+#      it stopped, paced for Twelve Data's rate limit), then poll it until done
+#   2. score pending consensus + RL signals against the now-complete candles
+#   3. POST /ml/train?force=true -- forced so it refits even when the row count is unchanged
+# PPO retraining is separate (train-rl.yml) -- dispatch it after this finishes.
+#
+# Don't run this at the same time as backfill-history.yml -- both hit Twelve Data's shared
+# per-minute limit.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  catch-up:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      API_BASE: https://forex-assistant.fastapicloud.dev
+      AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+    steps:
+      - name: Start candle catch-up and wait for it
+        run: |
+          JOB=$(curl -sf -m 60 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/catch-up")
+          JOB_ID=$(echo "$JOB" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          echo "catch-up job $JOB_ID started"
+          last_completed=-1; stalled_polls=0
+          while true; do
+            sleep 20
+            STATE=$(curl -s -m 60 -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/catch-up/$JOB_ID" || true)
+            read -r status completed total < <(echo "$STATE" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin); print(d['status'], d['completed'], d['total'])
+          except Exception:
+              print('unreachable -1 -1')")
+            echo "  $status: $completed/$total combos"
+            [ "$status" != "running" ] && [ "$status" != "unreachable" ] && break
+            # The job runs in-process on the backend; if the replica is recycled mid-job it
+            # stays "running" forever with no progress. 10 minutes without a single combo
+            # completing means it died -- fail loudly instead of polling until the timeout.
+            if [ "$completed" = "$last_completed" ]; then stalled_polls=$((stalled_polls+1)); else stalled_polls=0; fi
+            last_completed=$completed
+            if [ "$stalled_polls" -ge 30 ]; then
+              echo "::error::catch-up job $JOB_ID made no progress for 10 minutes -- backend likely restarted mid-job. Re-run this workflow; already-caught-up combos are skipped quickly."
+              exit 1
+            fi
+          done
+          echo "$STATE" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          failed = 0
+          for r in d.get('results', []):
+              extra = {k: v for k, v in r.items() if k not in ('pair', 'interval', 'ok')}
+              print(f\"{r['pair']:8} {r['interval']:6} {'ok ' if r.get('ok') else 'FAIL'} {extra}\")
+              failed += not r.get('ok')
+          if d['status'] != 'done' or failed:
+              print(f\"::error::catch-up ended {d['status']} with {failed} failed combo(s)\")
+              sys.exit(1)"
+      - name: Score pending consensus signals
+        run: |
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/consensus/score"
+      - name: Score pending RL signals
+        run: |
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/score"
+      - name: Retrain ML model
+        run: |
+          curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ml/train?force=true"
