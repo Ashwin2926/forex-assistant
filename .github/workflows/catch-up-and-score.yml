@@ -3,8 +3,8 @@ name: Catch up candles, score signals, retrain ML
 # Manual only. For when keep-fresh.yml has been failing or GitHub's scheduler has gone quiet
 # long enough that candles have gaps: open signals can't resolve against candles that were
 # never ingested, and anything trained afterwards learns from those gaps. In order:
-#   1. POST /ingest/catch-up (background job: every pair x interval caught up from wherever
-#      it stopped, paced for Twelve Data's rate limit), then poll it until done
+#   1. POST /ingest/{interval} for every interval (each call fills the gap since the last
+#      stored candle -- see that step's comment)
 #   2. score pending consensus + RL signals against the now-complete candles
 #   3. POST /ml/train?force=true -- forced so it refits even when the row count is unchanged
 # PPO retraining is separate (train-rl.yml) -- dispatch it after this finishes.
@@ -22,44 +22,27 @@ jobs:
       API_BASE: https://forex-assistant.fastapicloud.dev
       AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
     steps:
-      - name: Start candle catch-up and wait for it
+      # Per-interval /ingest, not POST /ingest/catch-up: that endpoint runs as an in-process
+      # background job, and on its first live use (2026-09-28) it sat at 0/20 combos until
+      # the replica restarted and the job was orphaned. /ingest is synchronous and already
+      # auto-widens to fill any gap since the last stored candle (up to
+      # data_fetcher.MAX_AUTO_BACKFILL_CANDLES = 1000 candles, ~3.5 days at 5min), which
+      # covers a weekend plus a few failed keep-fresh cycles. Retried on 5xx/timeouts.
+      - name: Catch up candles (all intervals)
         run: |
-          JOB=$(curl -sf -m 60 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/catch-up")
-          JOB_ID=$(echo "$JOB" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
-          echo "catch-up job $JOB_ID started"
-          last_completed=-1; stalled_polls=0
-          while true; do
-            sleep 20
-            STATE=$(curl -s -m 60 -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/catch-up/$JOB_ID" || true)
-            read -r status completed total < <(echo "$STATE" | python3 -c "
-          import sys, json
-          try:
-              d = json.load(sys.stdin); print(d['status'], d['completed'], d['total'])
-          except Exception:
-              print('unreachable -1 -1')")
-            echo "  $status: $completed/$total combos"
-            [ "$status" != "running" ] && [ "$status" != "unreachable" ] && break
-            # The job runs in-process on the backend; if the replica is recycled mid-job it
-            # stays "running" forever with no progress. 10 minutes without a single combo
-            # completing means it died -- fail loudly instead of polling until the timeout.
-            if [ "$completed" = "$last_completed" ]; then stalled_polls=$((stalled_polls+1)); else stalled_polls=0; fi
-            last_completed=$completed
-            if [ "$stalled_polls" -ge 30 ]; then
-              echo "::error::catch-up job $JOB_ID made no progress for 10 minutes -- backend likely restarted mid-job. Re-run this workflow; already-caught-up combos are skipped quickly."
-              exit 1
-            fi
+          failed=0
+          for interval in 5min 15min 1h 4h 1day; do
+            for attempt in 1 2 3; do
+              if out=$(curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5"); then
+                echo "$interval: $out"; break
+              fi
+              echo "  $interval attempt $attempt failed"
+              if [ "$attempt" -eq 3 ]; then failed=1; else sleep 40; fi
+            done
+            # Per-pair errors come back inside a 200 ({"AUD/USD": "error: ..."}), so check the body too.
+            if echo "$out" | grep -q '"error'; then echo "::warning::$interval had a per-pair ingest error"; failed=1; fi
           done
-          echo "$STATE" | python3 -c "
-          import sys, json
-          d = json.load(sys.stdin)
-          failed = 0
-          for r in d.get('results', []):
-              extra = {k: v for k, v in r.items() if k not in ('pair', 'interval', 'ok')}
-              print(f\"{r['pair']:8} {r['interval']:6} {'ok ' if r.get('ok') else 'FAIL'} {extra}\")
-              failed += not r.get('ok')
-          if d['status'] != 'done' or failed:
-              print(f\"::error::catch-up ended {d['status']} with {failed} failed combo(s)\")
-              sys.exit(1)"
+          if [ "$failed" = 1 ]; then echo "::error::candle catch-up incomplete -- see above"; exit 1; fi
       - name: Score pending consensus signals
         run: |
           curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/consensus/score"

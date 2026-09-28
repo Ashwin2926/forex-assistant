@@ -1810,6 +1810,15 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
                 "pair": pair, "interval": interval,
                 "timestamp": {"$gt": pending["timestamp"], "$lte": latest_timestamp},
             })
+            if bars_held == 0:
+                # No new candle since entry -- this call landed on the same bar the trade
+                # opened on (keep-fresh.yml re-checks 4h/1day many times per bar). The
+                # training env only ever consults EXIT from the bar AFTER entry, so letting
+                # the agent exit here was out-of-distribution, and it did so constantly
+                # (confirmed live 2026-09-28: EUR/USD/1day opened and "closed early" 4x on the
+                # same 09-26 candle, each a ~-0.01% spread-only "miss" polluting accuracy).
+                pending["_id"] = str(pending["_id"])
+                return {"signal": pending, "q_values": pending.get("q_values"), "memory": None}
             position = OpenPosition(
                 direction=pending["direction"], tier=pending["size_tier"], entry_price=pending["entry_price"],
                 target_price=pending["target_price"], stop_price=pending["stop_price"], atr_val=atr_val,
