@@ -38,6 +38,7 @@ from app.core.config import get_settings
 from app.core.auth import AuthMiddleware, create_token, verify_credentials
 from app.core.database import (
     db,
+    ingest_state_collection,
     init_indexes,
     candles_collection,
     signals_collection,
@@ -57,7 +58,7 @@ from app.models.schemas import (
     LoginRequest, RuleConfig, Signal, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
     PPOPolicy, MLTrainResult, BacktestRebuildJob, CandleCatchupJob, CandleCatchupCell,
 )
-from app.services.data_fetcher import fetch_and_store, backfill_batch, catch_up_batch
+from app.services.data_fetcher import fetch_and_store, backfill_batch, catch_up_batch, interval_due
 from app.services.candle_archive import load_full_candle_history, load_archived_candles
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import compute_atr_target_stop, default_config_for, spread_cost_pct
@@ -159,6 +160,31 @@ async def _run_candle_catchup_job(job_id: str) -> None:
 # live: exactly that happened before this got reordered -- POST /ingest/catch-up returned
 # the OLD endpoint's {pair: "error: ..."} shape instead of a CandleCatchupJob, and the
 # frontend crashed reading .results off a response that never had one.
+@app.get("/ingest/due")
+async def get_due_intervals():
+    """
+    Which intervals have a new bar that hasn't been fetched yet (see data_fetcher.interval_due)
+    -- read-only, DB-only, costs no Twelve Data credits. keep-fresh.yml calls this first and
+    only ingests/scores/generates signals for the due intervals. "latest_candle" is the
+    OLDEST of each pair's newest candle, so one pair lagging behind still makes it due.
+    """
+    now = datetime.utcnow()
+    out = {}
+    for interval in RL_INTERVALS:
+        latest_per_pair = []
+        for pair in settings.pairs_list:
+            doc = await candles_collection.find_one(
+                {"pair": pair, "interval": interval}, sort=[("timestamp", -1)], projection={"timestamp": 1},
+            )
+            latest_per_pair.append(doc["timestamp"] if doc else None)
+        latest = None if any(t is None for t in latest_per_pair) else min(latest_per_pair)
+        state = await ingest_state_collection.find_one({"interval": interval})
+        last_attempt = state.get("last_attempt_at") if state else None
+        due, reason = interval_due(now, latest, last_attempt, interval)
+        out[interval] = {"due": due, "reason": reason, "latest_candle": latest, "last_attempt": last_attempt}
+    return out
+
+
 @app.post("/ingest/catch-up")
 async def start_candle_catchup(background_tasks: BackgroundTasks):
     """
@@ -256,6 +282,12 @@ async def ingest(interval: str, output_size: int = 300):
             results[pair] = f"{count} candles stored"
         except Exception as e:
             results[pair] = f"error: {e}"
+    # Recorded even when some pairs errored: GET /ingest/due uses this to fetch each interval
+    # at most once per bar, and a failed pair is re-covered by fetch_and_store's own gap
+    # auto-widening on the next bar's attempt.
+    await ingest_state_collection.update_one(
+        {"interval": interval}, {"$set": {"last_attempt_at": datetime.utcnow()}}, upsert=True,
+    )
     return results
 
 

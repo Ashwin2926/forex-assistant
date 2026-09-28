@@ -4,6 +4,26 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-28
+
+**keep-fresh.yml now handles whichever intervals are due, not whichever cron fired.** GitHub
+delivered only ~17 of ~103 scheduled firings in 24h, and the 1h/4h/1day steps only ran when
+their own cron entry was the one delivered -- so they were skipped for whole slots (1day could
+miss a day). New `GET /ingest/due` (DB-only) compares each interval's newest stored bar with
+its last `/ingest` attempt (now recorded in `ingest_state`) via `data_fetcher.interval_due`;
+the workflow's first step turns that into `DUE_*` env vars that gate every ingest/consensus/
+RL step. At most one fetch per bar per interval keeps Twelve Data usage bounded even if every
+firing arrived. Manual dispatches still run everything.
+
+**Also today:** `/rl/signal` hangs fixed by single-threading torch/XGBoost/OpenMP in the web
+process (first call after each restart worked, the next hung past the gateway); PPO no
+longer exits a trade on the bar it opened (was creating spread-only "misses" several times
+per candle); new manual `catch-up-and-score.yml` (ingest all intervals, score, force ML
+retrain) since `/ingest/catch-up`'s in-process background job stalled at 0/20 on first use.
+Full PPO retrain: only AUD/USD/4h replaced (+58.7% test return); GBP/USD/1day's +2610% test
+return (rejected -- the prior scored higher) looks like a compounding artifact worth a look;
+USD/JPY/15min still has no policy (-98%).
+
 ## 2026-09-26
 
 **Why PPO/ML weren't producing signals -- diagnosed live, four fixes.** Nightly `train-rl.yml`

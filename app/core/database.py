@@ -21,6 +21,7 @@ ppo_policies_collection = db["ppo_policies"]          # PPO proof-of-concept pol
 run_all_flows_jobs_collection = db["run_all_flows_jobs"]  # progress/results for the manual "Sync now" catch-up job
 backtest_rebuild_jobs_collection = db["backtest_rebuild_jobs"]  # progress/results for a "rebuild default-config backtests" batch run
 candle_catchup_jobs_collection = db["candle_catchup_jobs"]  # progress/results for a manual "catch candles up to now" batch run
+ingest_state_collection = db["ingest_state"]          # per-interval last /ingest attempt time, for GET /ingest/due
 
 
 async def init_indexes():

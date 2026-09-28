@@ -15,9 +15,10 @@ name: Keep candle data fresh
 # 20 min instead of 15, brings this down to ~700/day (5min+15min: 576, 1h: 96, 4h: 24,
 # 1day: 4) — comfortably under the cap while keeping the fastest possible refresh for
 # 5min/15min, the two intervals whose signal quality depends on it most. Each entry is
-# minute-offset from the others so they don't collide on the same wall-clock minute;
-# github.event.schedule (only set on schedule-triggered runs, not workflow_dispatch)
-# tells each step which cron fired it.
+# minute-offset from the others so they don't collide on the same wall-clock minute.
+# Which intervals a run actually handles no longer depends on which entry fired -- see the
+# "Decide which intervals are due" step; the extra entries now just give GitHub's lossy
+# scheduler more chances to start a run at all.
 #
 # All five intervals run the same validated RuleConfig now (see
 # signal_engine.PROFILE_DEFAULTS["intraday"]) -- the separate "swing" profile that used
@@ -71,21 +72,51 @@ jobs:
       # on FastAPI Cloud (named to match what's already there, not related to the JWT
       # signing key AUTH_SECRET_KEY despite the similar name). The secret is named
       # AUTOMATION_TOKEN here on the GitHub side; only the value has to match, not the name.
+      # Decides which intervals this run handles, from GET /ingest/due (DB-only, no Twelve
+      # Data credits): an interval is due once a new bar should exist that hasn't been fetched
+      # since its last /ingest attempt -- see data_fetcher.interval_due. This replaced gating
+      # each interval on which cron entry fired (github.event.schedule): GitHub delivered only
+      # ~17 of ~103 scheduled firings/day on 2026-09-27/28, so whenever the one entry meant
+      # for 1h/4h/1day was dropped, that interval simply wasn't checked until its next slot
+      # (the 1day check could miss a whole day). Now ANY run picks up whatever is due. Each
+      # interval is fetched at most once per bar however many runs arrive, which is what keeps
+      # Twelve Data usage bounded (~700/day even if every firing were delivered). Manual
+      # (workflow_dispatch) runs still do everything. If the due check itself fails, every
+      # interval is treated as due -- a missed check is worse than a few extra credits.
+      - name: Decide which intervals are due
+        run: |
+          set_all_due() { for i in 5MIN 15MIN 1H 4H 1DAY; do echo "DUE_$i=true" >> "$GITHUB_ENV"; done; }
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ]; then
+            echo "$GITHUB_EVENT_NAME run -- all intervals"; set_all_due; exit 0
+          fi
+          if ! resp=$(curl -sf -m 60 -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/due"); then
+            echo "::warning::GET /ingest/due failed -- treating every interval as due"; set_all_due; exit 0
+          fi
+          echo "$resp" | python3 -c "
+          import json, os, sys
+          d = json.load(sys.stdin)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              for interval in ('5min', '15min', '1h', '4h', '1day'):
+                  info = d.get(interval) or {'due': True, 'reason': 'missing from /ingest/due response'}
+                  print(f\"{interval:5} {'DUE ' if info['due'] else 'skip'}  {info['reason']}\")
+                  env.write(f\"DUE_{interval.upper()}={'true' if info['due'] else 'false'}\\n\")"
       - name: Ingest 5min + 15min candles
+        if: env.DUE_5MIN == 'true' || env.DUE_15MIN == 'true'
         run: |
           for interval in 5min 15min; do
+            v=DUE_${interval^^}; if [ "${!v}" != true ]; then echo "$interval not due -- skipped"; continue; fi
             curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/$interval?output_size=5" || { echo "::warning::/ingest/$interval failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
           done
       - name: Ingest 1h candles
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        if: env.DUE_1H == 'true'
         run: |
           curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1h?output_size=5" || { echo "::warning::/ingest/1h failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       - name: Ingest 4h candles
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        if: env.DUE_4H == 'true'
         run: |
           curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/4h?output_size=5" || { echo "::warning::/ingest/4h failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       - name: Ingest 1day candles
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        if: env.DUE_1DAY == 'true'
         run: |
           curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/ingest/1day?output_size=5" || { echo "::warning::/ingest/1day failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
       # Consensus (app/services/consensus.py, SMC) is the only live signal source now --
@@ -97,29 +128,31 @@ jobs:
       # so most of these calls are expected to return "no consensus" -- that's normal, not a
       # sign anything's broken.
       - name: Check consensus (5min, 15min)
+        if: env.DUE_5MIN == 'true' || env.DUE_15MIN == 'true'
         run: |
           for interval in 5min 15min; do
+            v=DUE_${interval^^}; if [ "${!v}" != true ]; then echo "$interval not due -- skipped"; continue; fi
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
               curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
                 "$API_BASE/consensus/$interval?pair=${pair/\//%2F}" || { echo "::warning::/consensus/$interval ($pair) failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
             done
           done
       - name: Check consensus (1h)
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        if: env.DUE_1H == 'true'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/consensus/1h?pair=${pair/\//%2F}" || { echo "::warning::/consensus/1h ($pair) failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
           done
       - name: Check consensus (4h)
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        if: env.DUE_4H == 'true'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
               "$API_BASE/consensus/4h?pair=${pair/\//%2F}" || { echo "::warning::/consensus/4h ($pair) failed"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV"; }
           done
       - name: Check consensus (1day)
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        if: env.DUE_1DAY == 'true'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             curl -sf -m 150 -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
@@ -157,8 +190,10 @@ jobs:
       # real failure worth turning the whole job red for; it just means "check again after
       # today's training step has run."
       - name: Generate RL signals (5min, 15min)
+        if: env.DUE_5MIN == 'true' || env.DUE_15MIN == 'true'
         run: |
           for interval in 5min 15min; do
+            v=DUE_${interval^^}; if [ "${!v}" != true ]; then echo "$interval not due -- skipped"; continue; fi
             for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
               for attempt in 1 2 3; do
                 resp=$(curl -s -m 150 -w '\n%{http_code}' -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" \
@@ -171,7 +206,7 @@ jobs:
             done
           done
       - name: Generate RL signals (1h)
-        if: github.event_name != 'schedule' || github.event.schedule == '3 * * * *'
+        if: env.DUE_1H == 'true'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             for attempt in 1 2 3; do
@@ -184,7 +219,7 @@ jobs:
             case "$code" in 5*|000) echo "::warning::/rl/signal/1h ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
           done
       - name: Generate RL signals (4h)
-        if: github.event_name != 'schedule' || github.event.schedule == '7 */4 * * *'
+        if: env.DUE_4H == 'true'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             for attempt in 1 2 3; do
@@ -197,7 +232,7 @@ jobs:
             case "$code" in 5*|000) echo "::warning::/rl/signal/4h ($pair) returned $code"; echo "SOFT_FAILURES=1" >> "$GITHUB_ENV";; esac
           done
       - name: Generate RL signals (1day)
-        if: github.event_name != 'schedule' || github.event.schedule == '11 0 * * *'
+        if: env.DUE_1DAY == 'true'
         run: |
           for pair in "EUR/USD" "GBP/USD" "USD/JPY" "AUD/USD"; do
             for attempt in 1 2 3; do

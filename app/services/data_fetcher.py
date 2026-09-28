@@ -1,6 +1,6 @@
 import asyncio
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta
 from pymongo import UpdateOne
 from app.core.config import get_settings
 from app.core.database import candles_collection
@@ -110,6 +110,35 @@ INTERVAL_MINUTES = {
 # that motivated this was ~2 hours). A genuinely bigger deliberate backfill still works the
 # same way it always has: call /ingest with an explicit larger output_size.
 MAX_AUTO_BACKFILL_CANDLES = 1000
+
+
+def interval_due(now: datetime, latest_candle: datetime | None, last_attempt: datetime | None,
+                 interval: str) -> tuple[bool, str]:
+    """
+    Whether a new candle for this interval should exist that hasn't been fetched yet --
+    what keep-fresh.yml uses to decide which intervals to ingest/score on a given run,
+    instead of trusting that the one cron entry meant for that interval actually fired
+    (GitHub dropped ~83% of scheduled firings on 2026-09-27/28).
+
+    latest_candle is the OPEN time of the newest stored candle, which is normally the
+    still-forming bar (fetch_and_store stores it). A new bar opens -- and the one we hold
+    finishes -- at latest_candle + interval, then every interval after that. Due exactly
+    when one of those boundaries has passed since the last ingest attempt, so each interval
+    is fetched at most once per bar (which is what keeps Twelve Data usage bounded no matter
+    how many runs GitHub delivers), and a weekend/holiday with no new bars still only costs
+    one attempt per boundary rather than one per run.
+    """
+    if latest_candle is None:
+        return True, "no candles stored yet"
+    if last_attempt is None:
+        return True, "no recorded ingest attempt yet"
+    step = timedelta(minutes=INTERVAL_MINUTES[interval])
+    if now < latest_candle + step:
+        return False, f"current bar (opened {latest_candle:%m-%d %H:%M}) still forming"
+    last_boundary = latest_candle + ((now - latest_candle) // step) * step
+    if last_attempt < last_boundary:
+        return True, f"bar boundary {last_boundary:%m-%d %H:%M} passed since last attempt {last_attempt:%m-%d %H:%M}"
+    return False, f"already attempted at {last_attempt:%m-%d %H:%M}, after boundary {last_boundary:%m-%d %H:%M}"
 
 
 async def fetch_and_store(pair: str, interval: str, output_size: int = 100) -> int:
