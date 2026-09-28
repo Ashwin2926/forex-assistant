@@ -78,6 +78,10 @@ def _make_model(y_train: list[int]) -> XGBClassifier:
     return XGBClassifier(
         n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH, learning_rate=LEARNING_RATE,
         scale_pos_weight=_scale_pos_weight(y_train), eval_metric="logloss",
+        # n_jobs=1: a few hundred rows fit in milliseconds single-threaded, and a thread pool
+        # sized to the host's cores is exactly what's under suspicion for the live /rl/signal
+        # hangs -- see the thread-limit comment at the top of app/main.py.
+        n_jobs=1,
     )
 
 

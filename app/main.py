@@ -5,7 +5,22 @@
 # `import pandas; import torch` crashes, `import torch; import pandas` doesn't). Only matters
 # for local Windows dev; FastAPI Cloud's Linux deploy has never hit this. torch is already a
 # hard dependency via ppo_engine.py -- this only controls WHEN it first loads, not whether.
+# Single-threaded native math for the web process, set before torch (or anything using
+# OpenMP/MKL) loads. Found live 2026-09-28: on FastAPI Cloud the FIRST POST /rl/signal after
+# every process start answered in ~10-20s, and the very next one hung past the gateway (524)
+# until the replica was recycled -- repeatedly, for whichever pair/interval happened to come
+# second. Every native call on this path is tiny (one PPO forward pass on one observation, an
+# XGBoost fit on ~600 rows), so thread pools buy nothing here, while torch's and XGBoost's
+# pools -- each sized to the HOST's core count, not the container's CPU quota -- are the prime
+# suspect for a request that stalls only once both have been initialized. scripts/train_rl.py
+# never imports this module, so PPO training on the GitHub runner keeps its normal threading.
+import os
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import torch  # noqa: F401
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -1726,6 +1741,13 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     if balance <= 0:
         raise HTTPException(status_code=400, detail="balance must be positive.")
 
+    # Per-stage timing to stdout (FastAPI Cloud logs) -- added 2026-09-28 to pin down which
+    # stage the live hangs described at the top of this file are stuck in, if they recur.
+    t_start = time.monotonic()
+
+    def _stage(name: str) -> None:
+        print(f"[rl/signal {pair}/{interval}] {name} +{time.monotonic() - t_start:.1f}s", flush=True)
+
     policy_doc = await ppo_policies_collection.find_one(
         {"pair": pair, "interval": interval}, sort=[("created_at", -1)],
     )
@@ -1735,6 +1757,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
             detail=f"No trained RL policy yet for {pair}/{interval}. Call POST /rl/train/{interval}?pair={pair} first.",
         )
     policy = PPOPolicy(**{k: v for k, v in policy_doc.items() if k != "_id"})
+    _stage("policy loaded")
 
     config = default_config_for(rl_config_profile(interval), pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
@@ -1749,7 +1772,9 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
                     f"Run /ingest/{interval} first."
         )
 
+    _stage("candles loaded")
     resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
+    _stage("ML reference signals loaded")
     # Both calls below are synchronous/CPU-bound (pandas indicator computation, XGBoost
     # inference, and here also a torch model load + forward pass) -- to_thread so this
     # doesn't block the event loop for unrelated concurrent requests. See
@@ -1759,6 +1784,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     )
     current_price = float(df.iloc[-1]["close"])
     latest_timestamp = df.iloc[-1]["timestamp"]
+    _stage("state computed (indicators + ML scores)")
 
     pending = await rl_signals_collection.find_one(
         {"pair": pair, "interval": interval, "status": "pending"}, sort=[("timestamp", -1)],
@@ -1818,11 +1844,13 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
             pending = None
             # Falls through to decide a fresh signal below, same as a hard-backstop resolution.
 
+    _stage("pending-signal check done")
     state = full_rl_state(market_state, balance, policy.starting_balance)
     try:
         action, q_values = await asyncio.to_thread(choose_action_ppo, policy, state, True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _stage(f"PPO action chosen: {action}")
 
     # Live-exclusion gate: a policy whose latest training-time backtest showed a clear losing
     # edge (same STRONG_LOSS_RETURN_PCT threshold GET /rl/insights already flags as
