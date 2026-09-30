@@ -72,6 +72,7 @@ class ForexTradingEnv(gym.Env):
         self, df: pd.DataFrame, indicator_df: pd.DataFrame, market_states: list[list[float]],
         pair: str, start_index: int, end_index: int, max_lookforward: int,
         target_atr_mult: float, stop_atr_mult: float, starting_balance: float,
+        episode_bars: Optional[int] = None,
     ):
         super().__init__()
         self.df = df
@@ -84,6 +85,11 @@ class ForexTradingEnv(gym.Env):
         self.target_atr_mult = target_atr_mult
         self.stop_atr_mult = stop_atr_mult
         self.starting_balance = starting_balance
+        # None = one episode walks the whole slice from start_index (the eval-style walk).
+        # Set, each reset picks a random start so training timesteps cover the whole slice
+        # instead of replaying its first total_timesteps bars -- see rl.EPISODE_BARS.
+        self.episode_bars = episode_bars
+        self._episode_end = end_index
 
         self.action_space = spaces.Discrete(len(rl.ACTIONS))
         self.observation_space = spaces.Box(
@@ -106,6 +112,10 @@ class ForexTradingEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._i = self.start_index
+        self._episode_end = self.end_index
+        if self.episode_bars is not None and self.end_index - self.start_index > self.episode_bars:
+            self._i = int(self.np_random.integers(self.start_index, self.end_index - self.episode_bars + 1))
+            self._episode_end = self._i + self.episode_bars
         self._balance = self.starting_balance
         self._position = None
         return self._obs(), {}
@@ -138,7 +148,7 @@ class ForexTradingEnv(gym.Env):
 
         next_i = self._i + 1
         ruined = self._balance < rl.MIN_VIABLE_BALANCE
-        terminated = bool(ruined or next_i > self.end_index)
+        terminated = bool(ruined or next_i > self._episode_end)
         # An episode boundary can land mid-trade now that a trade spans many bars instead of
         # resolving atomically -- force-close (mark-to-market at the last available close)
         # rather than silently dropping the position's unrealized P&L from the reward signal,
@@ -151,7 +161,7 @@ class ForexTradingEnv(gym.Env):
             self._position = None
         # Clamp rather than index past end_index -- SB3 still wants a valid observation on the
         # terminal step even though it won't be bootstrapped from (terminated=True).
-        self._i = min(next_i, self.end_index) if not ruined else self._i
+        self._i = min(next_i, self._episode_end) if not ruined else self._i
         return self._obs(), float(reward), terminated, False, {}
 
 
@@ -350,7 +360,7 @@ def _evaluate_policy(
 
 def train_and_evaluate_ppo_poc(
     df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
-    total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: int = 20,
+    total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: Optional[int] = None,
     starting_balance: float = rl.DEFAULT_STARTING_BALANCE,
     ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = 0,
     ppo_kwargs: Optional[dict] = None,
@@ -396,7 +406,9 @@ def train_and_evaluate_ppo_poc(
     # investigating a high-expired-rate interval/pair via GET /rl/resolution-stats first.
     if target_atr_mult is None or stop_atr_mult is None:
         target_atr_mult, stop_atr_mult = rl.rl_atr_mults(interval, pair)
-    df = df.reset_index(drop=True)
+    if max_lookforward is None:
+        max_lookforward = rl.rl_max_lookforward(interval)
+    df = rl.trim_history(df.reset_index(drop=True), interval)
     min_warmup = max(config.ema_slow, rl.MIN_WARMUP_BARS)
     split_idx = int(len(df) * train_frac)
     train_last, test_start, test_last = rl.chronological_train_test_split(df, train_frac, max_lookforward, min_warmup)
@@ -407,10 +419,15 @@ def train_and_evaluate_ppo_poc(
         return ForexTradingEnv(
             df, indicator_df, market_states, pair, min_warmup, train_last,
             max_lookforward, target_atr_mult, stop_atr_mult, starting_balance,
+            episode_bars=rl.EPISODE_BARS,
         )
 
     vec_env = DummyVecEnv([make_env])
-    kwargs = dict(ppo_kwargs or {})
+    # ent_coef: SB3's default is 0.0 (no exploration bonus). HOLD pays exactly 0 while any
+    # trade's reward is noisy and spread-negative on average, so without a bonus the policy
+    # collapses onto HOLD early and never gets enough trades to learn which setups pay --
+    # the "every short-interval policy is ~all HOLD" pattern (e.g. AUD/USD/15min 97% HOLD).
+    kwargs = {"ent_coef": 0.01, **(ppo_kwargs or {})}
     # warm_start_model_bytes: continue training an existing policy instead of starting a
     # fresh randomly-initialized one every call -- stable-baselines3's documented resume
     # pattern (PPO.load then .learn(reset_num_timesteps=False)), the "real analog to the
@@ -476,7 +493,7 @@ def train_and_evaluate_ppo_poc(
 
 def train_ppo_policy(
     df: pd.DataFrame, pair: str, interval: str, config: RuleConfig = RuleConfig(),
-    total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: int = 20,
+    total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: Optional[int] = None,
     starting_balance: float = rl.DEFAULT_STARTING_BALANCE,
     ml_reference_signals: Optional[list[dict]] = None, random_seed: Optional[int] = None,
     ppo_kwargs: Optional[dict] = None,
@@ -534,6 +551,7 @@ def train_ppo_policy(
         model_bytes=buffer.getvalue(),
         warm_started_from=warm_start_policy_id if result["warm_started"] else None,
         exit_action_enabled=True,
+        max_lookforward=result["ppo_eval_run"].max_lookforward,
     )
     poc_diagnostics = {
         "beats_random": result["beats_random"],
@@ -545,6 +563,10 @@ def train_ppo_policy(
     return policy, result["ppo_eval_run"], result["ppo_trade_signals"], poc_diagnostics
 
 
+_LOADED_MODELS: dict[str, PPO] = {}
+_MAX_LOADED_MODELS = 32  # 20 pair/interval combos plus headroom for freshly replaced policies
+
+
 def choose_action_ppo(policy: PPOPolicy, state: list[float], flat: bool = False) -> tuple[str, dict[str, float]]:
     """
     Live-inference for a persisted PPOPolicy -- called by main.py's POST /rl/signal/{interval}.
@@ -552,11 +574,9 @@ def choose_action_ppo(policy: PPOPolicy, state: list[float], flat: bool = False)
     under an older/different state schema raises rather than silently producing a meaningless
     result), same (action, action -> float) return shape.
 
-    Loads the model fresh from policy.model_bytes on every call rather than caching a loaded
-    model across requests -- see train_and_evaluate_ppo_poc's own save/load latency
-    measurement (tens of milliseconds) for why this is workable for a live signal endpoint
-    that's called at most a few times a minute, not a hot path needing a persistent in-memory
-    model cache.
+    Loaded models are cached by policy_id (a policy's bytes never change once stored), so
+    each call doesn't re-deserialize and re-allocate a torch model -- up to one per
+    pair/interval, and a newer policy simply gets a new key.
     """
     if policy.feature_names != rl.RL_FEATURE_NAMES:
         raise ValueError(
@@ -565,6 +585,11 @@ def choose_action_ppo(policy: PPOPolicy, state: list[float], flat: bool = False)
             f"current code produces {len(rl.RL_FEATURE_NAMES)}) -- stale after a feature-set "
             f"change, retrain via POST /rl/train/{policy.interval}?pair={policy.pair} first."
         )
-    model = PPO.load(io.BytesIO(policy.model_bytes), device="cpu")
+    model = _LOADED_MODELS.get(policy.policy_id)
+    if model is None:
+        model = PPO.load(io.BytesIO(policy.model_bytes), device="cpu")
+        if len(_LOADED_MODELS) >= _MAX_LOADED_MODELS:
+            _LOADED_MODELS.pop(next(iter(_LOADED_MODELS)))
+        _LOADED_MODELS[policy.policy_id] = model
     obs = np.asarray(state, dtype=np.float32)
     return _greedy_ppo_action(model, obs, flat)

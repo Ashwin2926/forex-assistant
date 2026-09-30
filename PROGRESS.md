@@ -4,6 +4,46 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-09-30
+
+**Why short-interval RL (5min/15min/1h) was all HOLD or "Failed" -- three causes, fixed.**
+
+- **Training never saw recent data.** Every PPO episode started at the train slice's first bar
+  and ran 50k timesteps, but 5min has ~500k bars (2020-) and 15min ~170k: those policies only
+  ever trained on roughly the first 50k bars (mid/late 2020) and were then judged on a
+  2024-2026 test slice. Now `rl_engine.trim_history` keeps the most recent 100k (5min) / 70k
+  (15min) bars, and `ForexTradingEnv` starts each episode (`EPISODE_BARS` = 2000) at a random
+  bar in the train slice. Newly ingested Mongo candles were always loaded
+  (`load_full_candle_history*` merges archive + Mongo); they just weren't reached.
+- **Spread made trading a guaranteed loss, so HOLD was the right answer.** Measured over each
+  pair's last 50k bars, the fixed spread is 36-78% of one ATR on 5min and 11-35% on 15min.
+  With a 1-ATR stop the average trade was negative, so PPO correctly converged on HOLD (reward
+  exactly 0). 5min is now 3.0/2.0 ATR and 15min 2.25/1.5 (same 1.5:1 ratio); the 5min/15min
+  pair overrides that tightened stops further were removed. Position lifetime is now per
+  interval (`LOOKFORWARD_BY_INTERVAL`: 48/32/24/20/20 bars) and stored on each policy
+  (`PPOPolicy.max_lookforward`) so live uses the value that policy was trained with. Live
+  signals also take target/stop from the policy's own eval run, and live positions now close
+  at that lookforward (status `expired`) the same way training does.
+- **No exploration bonus.** SB3's `ent_coef` default is 0, so policies collapsed onto HOLD
+  before learning anything; now 0.01.
+
+A prior policy trained under different target/stop/lookforward settings
+(`rl_engine.policy_config_matches`) is treated as stale: no warm start, and any retrain
+replaces it (the -30% live-exclusion gate still applies). So **every 5min/15min/1h combo needs
+a retrain** after deploy (4h/1day settings are unchanged).
+
+**`/rl/signal` hang, second attempt.** After the 09-28 single-threading change, the first call
+after a restart still worked and later ones 524'd (keep-fresh runs today; frontend "Generate
+all" gave 1 HOLD + 19 "Failed"). All live torch/XGBoost/indicator work now runs on one
+dedicated thread (`_run_native`) instead of `asyncio.to_thread`'s pool (suspected cause:
+XGBoost's and torch's OpenMP runtimes re-entered from different threads), with a 90s timeout
+that returns a JSON 503 instead of a gateway 524. Loaded PPO models are cached per policy_id,
+and the ML classifier fit is cached while its reference set is unchanged (it used to be refit
+twice per call). **Unverified until deployed**: the FastAPI Cloud stage-timing logs
+(`[rl/signal ...]` lines) will show whether it's fixed. The frontend now retries a
+no-response call once after 20s and says "backend timed out or restarting" instead of
+"Failed".
+
 ## 2026-09-28
 
 **keep-fresh.yml now handles whichever intervals are due, not whichever cron fired.** GitHub

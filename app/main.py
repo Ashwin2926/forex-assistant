@@ -26,8 +26,10 @@ from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import asyncio
+import functools
 import time
 import traceback
 import uuid
@@ -73,6 +75,7 @@ from app.services.rl_engine import (
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
     RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT,
     is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE, OpenPosition,
+    policy_config_matches,
 )
 from app.services.case_memory import (
     memory_summary, memory_gate, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
@@ -83,10 +86,37 @@ from app.services.paper_trading import execute_paper_trade, sync_open_trade
 from app.services.outcome_scoring import (
     score_pending_consensus_signals, score_pending_rl_signals,
     resolve_rl_signal_real_outcome, LIVE_MAX_LOOKFORWARD_BY_INTERVAL, counterfactual_target_stop,
-    DEFAULT_MAX_LOOKFORWARD,
 )
 
 settings = get_settings()
+
+# Every live-request call into torch/XGBoost/pandas-indicator code runs on this ONE dedicated
+# thread instead of asyncio.to_thread's shared pool. Single-threading the native pools
+# (2026-09-28, top of file) didn't stop the hang: POST /rl/signal still answers the first call
+# after a restart, then the next one stalls past the gateway (524) -- 2026-09-30 keep-fresh
+# runs and the frontend's "Generate all" (1 HOLD, then 19 "Failed"). Under to_thread each call
+# lands on whichever pool thread is free, so XGBoost's and torch's separate OpenMP runtimes
+# get initialized on, and then re-entered from, different threads -- a known source of
+# deadlocks when two OpenMP runtimes share a process. Pinning all of it to one long-lived
+# thread removes that cross-thread re-entry and also stops concurrent requests from stacking
+# native work on top of each other.
+_NATIVE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="native")
+# Under the ~125s gateway limit, so a stuck call comes back as a JSON 503 the frontend and
+# keep-fresh.yml can show, not an opaque 524 without CORS headers.
+NATIVE_CALL_TIMEOUT_S = 90
+
+
+async def _run_native(fn, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(_NATIVE_EXECUTOR, functools.partial(fn, *args, **kwargs))
+    try:
+        return await asyncio.wait_for(future, timeout=NATIVE_CALL_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{getattr(fn, '__name__', 'native call')} took over {NATIVE_CALL_TIMEOUT_S}s "
+                   f"-- backend busy or stuck; retry shortly.",
+        )
 app = FastAPI(title="Forex Trading Assistant")
 
 # AuthMiddleware added first so CORSMiddleware ends up outermost (Starlette makes the
@@ -470,7 +500,7 @@ async def score_consensus_signals(max_lookforward: int | None = None):
 def _compute_strategy_calls(df: pd.DataFrame, config: RuleConfig) -> tuple[list, "pd.Series"]:
     """
     The CPU-bound (synchronous, pandas/numpy) half of a consensus check -- run via
-    asyncio.to_thread by every caller below rather than called directly. FastAPI's single
+    _run_native by every caller below rather than called directly. FastAPI's single
     event loop has nothing else running while a plain synchronous call like this executes;
     under concurrent load (the ingestion cron, RL signal generation, and manual dispatches
     all hitting the same instance at once, as happened live 2026-09-18: a 16-minute total
@@ -513,7 +543,7 @@ async def create_consensus_signal(interval: str, pair: str):
         )
 
     df = pd.DataFrame(docs)
-    calls, latest = await asyncio.to_thread(_compute_strategy_calls, df, config)
+    calls, latest = await _run_native(_compute_strategy_calls, df, config)
     consensus = check_consensus(calls, pair, interval, latest["timestamp"], float(latest["atr"]))
 
     if consensus is None:
@@ -529,7 +559,7 @@ async def create_consensus_signal(interval: str, pair: str):
     # enough resolved history yet -- "not enough data" isn't evidence of a bad signal.
     resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
     features = extract_features(consensus.model_dump())
-    ml_hit_probability = await asyncio.to_thread(predict_hit_probability, resolved_signals, features)
+    ml_hit_probability = await _run_native(predict_hit_probability, resolved_signals, features)
     consensus.ml_hit_probability = ml_hit_probability
     if ML_GATE_ENABLED and ml_hit_probability is not None and ml_hit_probability < GOOD_SIGNAL_ML_THRESHOLD:
         consensus.ml_override = (
@@ -799,7 +829,7 @@ async def predict_signal(interval: str, profile: str, pair: str):
         )
 
     df = pd.DataFrame(docs)
-    calls, latest = await asyncio.to_thread(_compute_strategy_calls, df, config)
+    calls, latest = await _run_native(_compute_strategy_calls, df, config)
     consensus = check_consensus(calls, pair, interval, latest["timestamp"], float(latest["atr"]))
 
     # No consensus at all (the common case, see check_consensus's own docstring) means there's
@@ -808,7 +838,7 @@ async def predict_signal(interval: str, profile: str, pair: str):
     if consensus is not None:
         resolved_signals = await get_ml_reference_signals(consensus_signals_collection)
         features = extract_features(consensus.model_dump())
-        consensus.ml_hit_probability = await asyncio.to_thread(predict_hit_probability, resolved_signals, features)
+        consensus.ml_hit_probability = await _run_native(predict_hit_probability, resolved_signals, features)
 
     return {"consensus": consensus, "strategy_calls": [c.model_dump() for c in calls]}
 
@@ -875,7 +905,9 @@ async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None,
     baseline_return_pct (the prior policy's own total_return_pct, STALE_POLICY_BASELINE when the
     latest policy is feature-set-stale and can't serve at all, or 0.0/breakeven when
     there's no usable prior policy) is what this run's own result must match or beat, see
-    rl_engine.should_keep_new_policy.
+    rl_engine.should_keep_new_policy. A latest policy trained under different target/stop/
+    lookforward settings (rl_engine.policy_config_matches) is treated like a feature-set-stale
+    one: its return isn't comparable and it learned a different trade geometry.
     """
     prev = await ppo_policies_collection.find_one({"pair": pair, "interval": interval}, sort=[("created_at", -1)])
     if not prev:
@@ -883,13 +915,17 @@ async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None,
     if prev.get("feature_names") != RL_FEATURE_NAMES:
         return None, None, STALE_POLICY_BASELINE
     eval_run = await backtest_runs_collection.find_one({"run_id": prev.get("eval_run_id")})
+    if not policy_config_matches(eval_run, interval, pair):
+        # Trained under different target/stop/lookforward settings -- live serving would
+        # size its trades with geometry it never learned, so treat it like a stale policy.
+        return None, None, STALE_POLICY_BASELINE
     if not is_usable_warm_start(eval_run):
         return None, None, 0.0
     return prev["policy_id"], prev["model_bytes"], eval_run.get("total_return_pct") or 0.0
 
 
 async def _run_rl_training(
-    pair: str, interval: str, total_timesteps: int, train_frac: float, max_lookforward: int, starting_balance: float,
+    pair: str, interval: str, total_timesteps: int, train_frac: float, max_lookforward: int | None, starting_balance: float,
     random_seed: int | None = None, target_atr_mult: float | None = None, stop_atr_mult: float | None = None,
 ):
     """
@@ -977,7 +1013,7 @@ async def _run_rl_training(
 
 @app.post("/rl/train/{interval}")
 async def train_rl(
-    interval: str, pair: str, total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: int = 20,
+    interval: str, pair: str, total_timesteps: int = 50_000, train_frac: float = 0.7, max_lookforward: int | None = None,
     starting_balance: float = DEFAULT_STARTING_BALANCE, random_seed: int | None = None,
     target_atr_mult: float | None = None, stop_atr_mult: float | None = None,
 ):
@@ -1811,7 +1847,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     # inference, and here also a torch model load + forward pass) -- to_thread so this
     # doesn't block the event loop for unrelated concurrent requests. See
     # _compute_strategy_calls' own comment for the live incident that motivated this.
-    market_state, df, ml_buy_score, ml_sell_score = await asyncio.to_thread(
+    market_state, df, ml_buy_score, ml_sell_score = await _run_native(
         _rl_state_from_candles, docs, config, pair, interval, resolved_signals,
     )
     current_price = float(df.iloc[-1]["close"])
@@ -1832,11 +1868,12 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
             # Position context is reconstructed from the pending signal's own stored fields
             # rather than a separate persisted collection; atr_val is recomputed fresh off the
             # latest candles (close enough bar-to-bar, and avoids a new field purely for this).
-            # max_lookforward here is DEFAULT_MAX_LOOKFORWARD (20, flat) -- what every training
-            # run actually used for position_bars_held_frac (see scripts/train_rl.py's own
-            # --max-lookforward default), NOT LIVE_MAX_LOOKFORWARD_BY_INTERVAL, which is a
-            # live-only window for the real-candle backstop check above and would otherwise
-            # feed the agent a bars-held fraction it never saw in training.
+            # max_lookforward here is policy.max_lookforward -- what this policy's own training
+            # run used for position_bars_held_frac (rl_engine.LOOKFORWARD_BY_INTERVAL at the
+            # time, 20 for every policy trained before that existed), NOT
+            # LIVE_MAX_LOOKFORWARD_BY_INTERVAL, which is a live-only window for the real-candle
+            # backstop check above and would otherwise feed the agent a bars-held fraction it
+            # never saw in training.
             atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
             bars_held = await candles_collection.count_documents({
                 "pair": pair, "interval": interval,
@@ -1858,12 +1895,19 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
                 bars_held=bars_held,
             )
             exit_state = full_rl_state(
-                market_state, balance, policy.starting_balance, position, current_price, DEFAULT_MAX_LOOKFORWARD,
+                market_state, balance, policy.starting_balance, position, current_price, policy.max_lookforward,
             )
-            try:
-                exit_action, _exit_q_values = await asyncio.to_thread(choose_action_ppo, policy, exit_state)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+            # Training closes a position at market once it has been open max_lookforward bars
+            # (ForexTradingEnv.step / _evaluate_policy's "expired") -- do the same live, rather
+            # than holding for the much longer LIVE_MAX_LOOKFORWARD_BY_INTERVAL window with a
+            # bars_held_frac pinned at 1.0 the policy never saw past.
+            timed_out = bars_held >= policy.max_lookforward
+            exit_action = "EXIT"
+            if not timed_out:
+                try:
+                    exit_action, _exit_q_values = await _run_native(choose_action_ppo, policy, exit_state)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
 
             if exit_action != "EXIT":
                 # Still holding -- don't re-decide a new trade, just hand back the live view.
@@ -1875,12 +1919,12 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
                 pct_move = -pct_move
             pct_move -= spread_cost_pct(pair, pending["entry_price"])
             await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": {
-                "status": "hit" if pct_move >= 0 else "miss",
+                "status": "expired" if timed_out else ("hit" if pct_move >= 0 else "miss"),
                 "outcome_price": round(current_price, 5),
                 "outcome_timestamp": latest_timestamp,
                 "outcome_pct_move": round(pct_move, 5),
                 "candles_to_outcome": bars_held,
-                "closed_early": True,
+                "closed_early": not timed_out,
             }})
             pending = None
             # Falls through to decide a fresh signal below, same as a hard-backstop resolution.
@@ -1888,7 +1932,7 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     _stage("pending-signal check done")
     state = full_rl_state(market_state, balance, policy.starting_balance)
     try:
-        action, q_values = await asyncio.to_thread(choose_action_ppo, policy, state, True)
+        action, q_values = await _run_native(choose_action_ppo, policy, state, True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     _stage(f"PPO action chosen: {action}")
@@ -2002,7 +2046,12 @@ async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_ST
     latest = df.iloc[-1]
     entry_price = current_price
     atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+    # The target/stop this policy was trained and evaluated with (its eval_run), not today's
+    # rl_atr_mults -- after RL_ATR_MULTS_BY_INTERVAL changes, a not-yet-retrained policy must
+    # keep trading the trade geometry it actually learned.
     target_atr_mult, stop_atr_mult = rl_atr_mults(interval, pair)
+    if eval_run and eval_run.get("target_atr_mult") and eval_run.get("stop_atr_mult"):
+        target_atr_mult, stop_atr_mult = eval_run["target_atr_mult"], eval_run["stop_atr_mult"]
     target_price, stop_price = compute_atr_target_stop(
         entry_price, atr_val, direction, target_atr_mult, stop_atr_mult,
     )
@@ -2583,7 +2632,7 @@ async def _retrain_degraded_policy_background(pair: str, interval: str) -> None:
     proves otherwise in practice.
     """
     try:
-        await _run_rl_training(pair, interval, 50_000, 0.7, 20, DEFAULT_STARTING_BALANCE)
+        await _run_rl_training(pair, interval, 50_000, 0.7, None, DEFAULT_STARTING_BALANCE)
     except ValueError:
         pass
 

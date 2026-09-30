@@ -349,16 +349,31 @@ export default function RLPage() {
     setGenerateAllProgress(0);
     const combos = PAIRS.flatMap((p) => INTERVALS.map((i) => ({ pair: p, interval: i })));
     const results: GenerateAllCell[] = [];
+    // A request with no HTTP response at all (TypeError from fetch) is the backend timing out
+    // at the gateway or restarting -- retry that once after a pause instead of recording
+    // "Failed" straight away. Real API errors (ApiError: no policy yet, 503 busy) aren't retried.
+    const generateWithRetry = async (p: string, i: string) => {
+      try {
+        return await api.generateRLSignal(p, i, currentBalance);
+      } catch (e) {
+        if (e instanceof ApiError) throw e;
+        await new Promise((r) => setTimeout(r, 20_000));
+        return api.generateRLSignal(p, i, currentBalance);
+      }
+    };
     for (const { pair: p, interval: i } of combos) {
       try {
-        const result = await api.generateRLSignal(p, i, currentBalance);
+        const result = await generateWithRetry(p, i);
         results.push({
           pair: p, interval: i, signal: result.signal, qValues: result.q_values,
           memory: result.memory ?? null, memoryOverride: result.memory_override ?? null,
           excludedReason: result.excluded_reason ?? null, mlBlockedReason: result.ml_blocked_reason ?? null,
         });
       } catch (e) {
-        results.push({ pair: p, interval: i, signal: null, qValues: null, error: e instanceof ApiError ? e.message : "Failed" });
+        results.push({
+          pair: p, interval: i, signal: null, qValues: null,
+          error: e instanceof ApiError ? e.message : "No response -- backend timed out or restarting",
+        });
       }
       setGenerateAllProgress(results.length);
       setGenerateAllResults([...results]);

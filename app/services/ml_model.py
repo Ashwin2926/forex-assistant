@@ -172,13 +172,34 @@ def fit_hit_classifier(resolved_signals: list[dict]) -> Optional[XGBClassifier]:
     return model
 
 
+_fit_cache: dict = {"key": None, "model": None}
+
+
+def _cached_fit(resolved_signals: list[dict]) -> Optional[XGBClassifier]:
+    """
+    fit_hit_classifier, reusing the last fit while the reference set is unchanged. POST
+    /rl/signal scores both directions per call and /consensus scores again, and the reference
+    set (static backtest archive + a slowly growing handful of live signals) almost never
+    changes between calls, so refitting XGBoost every time was pure repeated native work.
+    """
+    key = (
+        len(resolved_signals),
+        max((str(s.get("timestamp")) for s in resolved_signals), default=""),
+        sum(1 for s in resolved_signals if s.get("status") == "hit"),
+    )
+    if _fit_cache["key"] != key:
+        _fit_cache["model"] = fit_hit_classifier(resolved_signals)
+        _fit_cache["key"] = key
+    return _fit_cache["model"]
+
+
 def predict_hit_probability(resolved_signals: list[dict], new_features: dict[str, float]) -> Optional[float]:
     """
     Best-effort probability for one new, real signal -- see fit_hit_classifier's docstring for
     why this doesn't hold out a test set. Returns None when there isn't enough data to bother
     -- surfaced to the caller as "not enough data yet," not a fabricated number.
     """
-    model = fit_hit_classifier(resolved_signals)
+    model = _cached_fit(resolved_signals)
     if model is None:
         return None
 

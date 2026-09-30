@@ -323,6 +323,10 @@ class PPOPolicy(BaseModel):
     # interval are never visually confused; choose_action_ppo's own feature_names staleness
     # guard is what actually blocks a mismatched policy from live serving, not this flag.
     exit_action_enabled: bool = False
+    # Bars a position may stay open (rl_engine.LOOKFORWARD_BY_INTERVAL at training time) --
+    # live inference scales the bars_held_frac position feature by this, so it matches what
+    # the policy was trained on. Policies trained before this field existed all used 20.
+    max_lookforward: int = 20
 
 
 class RLSignal(BaseModel):

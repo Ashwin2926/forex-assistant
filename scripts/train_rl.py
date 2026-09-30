@@ -45,6 +45,7 @@ from app.services.ml_features import is_current_smc_signal
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import (
     rl_config_profile, RL_FEATURE_NAMES, is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE,
+    policy_config_matches,
 )
 from app.services.signal_engine import default_config_for
 
@@ -76,6 +77,8 @@ def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, by
     if prev.get("feature_names") != RL_FEATURE_NAMES:
         return None, None, STALE_POLICY_BASELINE
     eval_run = db["backtest_runs"].find_one({"run_id": prev.get("eval_run_id")})
+    if not policy_config_matches(eval_run, interval, pair):
+        return None, None, STALE_POLICY_BASELINE
     if not is_usable_warm_start(eval_run):
         return None, None, 0.0
     return prev["policy_id"], prev["model_bytes"], eval_run.get("total_return_pct") or 0.0
@@ -93,7 +96,7 @@ def get_ml_reference_signals_sync(db) -> list[dict]:
 
 
 def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: float,
-            max_lookforward: int, starting_balance: float, random_seed: int | None,
+            max_lookforward: int | None, starting_balance: float, random_seed: int | None,
             target_atr_mult: float | None = None, stop_atr_mult: float | None = None):
     """Mirrors app/main.py's _run_rl_training exactly (same query, same training call, same
     warm-start selection, same persistence) but against a sync pymongo db instead of the
@@ -141,7 +144,7 @@ def main():
     parser.add_argument("--interval", default=None, help="Single interval (e.g. '5min'). Omit together with --pair to sweep every pair x interval.")
     parser.add_argument("--total-timesteps", type=int, default=50_000)
     parser.add_argument("--train-frac", type=float, default=0.7)
-    parser.add_argument("--max-lookforward", type=int, default=20)
+    parser.add_argument("--max-lookforward", type=int, default=None, help="Bars a position may stay open; omit for rl_engine.rl_max_lookforward(interval).")
     parser.add_argument("--starting-balance", type=float, default=DEFAULT_STARTING_BALANCE)
     parser.add_argument("--random-seed", type=int, default=None)
     parser.add_argument("--target-atr-mult", type=float, default=None, help="Override rl_atr_mults(interval, pair)'s target ATR multiple -- must be given with --stop-atr-mult and a single --pair/--interval combo, see main.py's POST /rl/train/{interval} for the same override.")

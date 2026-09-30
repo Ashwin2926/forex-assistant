@@ -184,9 +184,17 @@ RL_FEATURE_NAMES = RL_MARKET_FEATURE_NAMES + ["balance_log_ratio"] + RL_POSITION
 # requires -- e.g. halving both to 1.0/0.667 preserves the ratio while changing how much price
 # movement is needed to resolve within max_lookforward candles; changing the ratio itself would
 # reopen the "risks more than it targets" problem this constant was written to prevent.
+#
+# 5min/15min widened 2026-09-30 (were 1.5/1.0, same as 1h): measured over each pair's last 50k
+# bars, TYPICAL_SPREAD_PRICE is 36-78% of one median ATR(14) on 5min and 11-35% on 15min (vs
+# 6-13% on 1h, 3-6% on 4h). With a 1-ATR stop, spread alone turned the average trade negative,
+# so PPO correctly learned that never trading (reward exactly 0) beats trading -- the live
+# "always HOLD" on short intervals. Wider stops (same 1.5:1 ratio) cut spread to roughly
+# 18-39% (5min) and 7-23% (15min) of the stop; LOOKFORWARD_BY_INTERVAL gives those wider
+# targets enough bars to resolve.
 RL_ATR_MULTS_BY_INTERVAL: dict[str, tuple[float, float]] = {
-    "5min": (1.5, 1.0),
-    "15min": (1.5, 1.0),
+    "5min": (3.0, 2.0),
+    "15min": (2.25, 1.5),
     "1h": (1.5, 1.0),
     "4h": (3.75, 2.5),
     "1day": (1.5, 1.0),
@@ -229,10 +237,13 @@ RL_ATR_MULTS_BY_INTERVAL: dict[str, tuple[float, float]] = {
 # Same lesson as GBP/USD's own (0.75, 0.5) failure above: this is a per-(interval, pair)
 # empirical question, not a formula -- don't extrapolate one pair's working override to
 # another without sweeping it separately.
+#
+# 2026-09-30: the ("15min", "GBP/USD") (1.0, 0.667) and ("5min", "USD/JPY") (0.75, 0.5)
+# overrides above were removed -- both tightened the stop further on exactly the intervals
+# where spread already dominates (USD/JPY 5min's 0.5-ATR stop paid ~72% of it in spread), and
+# both were tuned against the retired linear policy, not PPO. See RL_ATR_MULTS_BY_INTERVAL.
 RL_ATR_MULT_PAIR_OVERRIDES: dict[tuple[str, str], tuple[float, float]] = {
     ("4h", "GBP/USD"): (1.5, 1.0),
-    ("15min", "GBP/USD"): (1.0, 0.667),
-    ("5min", "USD/JPY"): (0.75, 0.5),
 }
 
 
@@ -245,6 +256,65 @@ def rl_atr_mults(interval: str, pair: str) -> tuple[float, float]:
     if override is not None:
         return override
     return RL_ATR_MULTS_BY_INTERVAL[interval]
+
+
+# Max bars a position may stay open before it's closed at market (training env, test-slice
+# eval, and the bars_held_frac position feature live). Was a flat 20 for every interval --
+# 100 minutes on 5min, too short for the wider RL_ATR_MULTS_BY_INTERVAL targets above to
+# resolve. Stored on each PPOPolicy (PPOPolicy.max_lookforward) so live inference always feeds
+# a policy the same bars_held_frac scale it was trained with, even after this table changes.
+LOOKFORWARD_BY_INTERVAL: dict[str, int] = {
+    "5min": 48,   # 4 hours
+    "15min": 32,  # 8 hours
+    "1h": 24,     # 1 day
+    "4h": 20,
+    "1day": 20,
+}
+
+
+def rl_max_lookforward(interval: str) -> int:
+    return LOOKFORWARD_BY_INTERVAL.get(interval, 20)
+
+
+# Most recent N bars RL trains/evaluates on. 5min has ~500k bars of archive history (2020-) and
+# 15min ~170k -- with the default 50k PPO timesteps and every episode starting at the first
+# bar, the agent only ever saw roughly the first 50k bars (mid-2020 for 5min) and was then
+# judged on a 2024-2026 test slice. Capping history keeps the train window recent and the
+# bar-by-bar test-slice eval fast; ForexTradingEnv's random episode starts (EPISODE_BARS) then
+# spread the timesteps across the whole train window.
+MAX_HISTORY_BARS_BY_INTERVAL: dict[str, int] = {
+    "5min": 100_000,  # ~16 months
+    "15min": 70_000,  # ~2.7 years
+}
+
+
+def trim_history(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    cap = MAX_HISTORY_BARS_BY_INTERVAL.get(interval)
+    if cap is None or len(df) <= cap:
+        return df
+    return df.iloc[-cap:].reset_index(drop=True)
+
+
+# Bars per training episode. ForexTradingEnv.reset starts each episode at a random bar in the
+# train slice instead of always its first bar, so total_timesteps covers the whole window.
+EPISODE_BARS = 2_000
+
+
+def policy_config_matches(eval_run: Optional[dict], interval: str, pair: str) -> bool:
+    """
+    Whether a prior policy was trained under the current target/stop/lookforward settings.
+    If not, its total_return_pct isn't comparable with a new run's (different trade geometry),
+    and its weights learned a different reward -- so it's neither a warm-start source nor a
+    baseline a new policy must beat. Old eval runs predating a field count as mismatched.
+    """
+    if not eval_run:
+        return False
+    target, stop = rl_atr_mults(interval, pair)
+    return (
+        eval_run.get("target_atr_mult") == target
+        and eval_run.get("stop_atr_mult") == stop
+        and eval_run.get("max_lookforward") == rl_max_lookforward(interval)
+    )
 
 
 # How many rows of tail context each bar's strategy evaluation gets -- comfortably covers
