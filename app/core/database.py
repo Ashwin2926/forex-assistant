@@ -21,6 +21,7 @@ ppo_policies_collection = db["ppo_policies"]          # PPO proof-of-concept pol
 run_all_flows_jobs_collection = db["run_all_flows_jobs"]  # progress/results for the manual "Sync now" catch-up job
 backtest_rebuild_jobs_collection = db["backtest_rebuild_jobs"]  # progress/results for a "rebuild default-config backtests" batch run
 candle_catchup_jobs_collection = db["candle_catchup_jobs"]  # progress/results for a manual "catch candles up to now" batch run
+rl_decisions_collection = db["rl_decisions"]          # latest POST /rl/signal outcome per pair/interval (incl. HOLD/errors), for the dashboard
 ingest_state_collection = db["ingest_state"]          # per-interval last /ingest attempt time, for GET /ingest/due
 
 

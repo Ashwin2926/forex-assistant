@@ -1,4 +1,4 @@
-import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, DailySignalsResponse, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicyCoverageRow, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
+import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, DailySignalsResponse, LiveDashboardResponse, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicyCoverageRow, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -226,6 +226,12 @@ export const api = {
   // docstring.
   getRLPolicyCoverage() {
     return request<RLPolicyCoverageRow[]>("/rl/policies/coverage");
+  },
+
+  // Open signals (any day), per-combo latest decision, recent results -- read-only, see
+  // get_live_dashboard in app/main.py.
+  getLiveDashboard() {
+    return request<LiveDashboardResponse>("/dashboard/live");
   },
 
   // Today's (or a given day's) full signal log per pair -- see the endpoint's own docstring.

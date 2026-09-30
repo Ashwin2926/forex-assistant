@@ -6,6 +6,19 @@ Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README
 
 ## 2026-09-30
 
+**Dashboard is now the landing page, built for "open it and trade".** `/` redirects to
+`/dashboard` (was `/trading-signals`, which fired 20 fresh consensus POSTs in parallel on every
+visit and was almost always empty). New read-only `GET /dashboard/live`:
+- every still-pending RL and consensus signal, whatever day it fired (the old
+  `/dashboard/daily-signals` view only showed signals whose candle fell on today's UTC date, so an
+  open trade from yesterday disappeared), with the latest close, progress vs entry in R, and an
+  "at entry / ran / near stop" hint;
+- one cell per pair/interval saying why there's no signal (no policy / paused by backtest /
+  HOLD x% / blocked / error) and when it was last checked. That comes from the new `rl_decisions`
+  collection, upserted by `POST /rl/signal` on every call;
+- signals resolved in the last 24h.
+Lot sizes use the balance and risk % entered on the page (kept in localStorage).
+
 **Why short-interval RL (5min/15min/1h) was all HOLD or "Failed" -- three causes, fixed.**
 
 - **Training never saw recent data.** Every PPO episode started at the train slice's first bar

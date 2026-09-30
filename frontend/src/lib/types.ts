@@ -594,3 +594,57 @@ export interface CandlePoint {
 export const PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"] as const;
 export const INTERVALS = ["5min", "15min", "1h", "4h", "1day"] as const;
 export const PROFILES: Profile[] = ["intraday"];
+
+// GET /dashboard/live -- see get_live_dashboard in app/main.py.
+export interface LiveOpenSignal {
+  source: "rl" | "consensus";
+  signal_id: string;
+  pair: string;
+  interval: string;
+  direction: "BUY" | "SELL";
+  size_tier: "SMALL" | "LARGE" | null;
+  timestamp: string;
+  age_minutes: number;
+  entry_price: number;
+  target_price: number;
+  stop_price: number;
+  current_price: number | null;
+  // Price now vs entry in multiples of the stop distance, + = in the trade's favour.
+  progress_r: number | null;
+  confidence_pct: number | null;
+  agreeing_count: number | null;
+}
+
+export interface LiveComboStatus {
+  pair: string;
+  interval: string;
+  policy_state: "none" | "stale" | "excluded" | "outdated" | "active";
+  policy_eval: { total_return_pct: number | null; hit_rate_pct: number | null; trades: number | null } | null;
+  last_candle_at: string | null;
+  decision: {
+    outcome: "signal" | "hold" | "blocked" | "excluded" | "error";
+    detail: string | null;
+    q_values: Record<string, number> | null;
+    signal_id: string | null;
+    checked_at: string;
+  } | null;
+}
+
+export interface LiveRecentResult {
+  source: "rl" | "consensus";
+  pair: string;
+  interval: string;
+  direction: "BUY" | "SELL";
+  timestamp: string;
+  status: "hit" | "miss" | "expired";
+  outcome_timestamp: string;
+  outcome_pct_move: number | null;
+  closed_early: boolean;
+}
+
+export interface LiveDashboardResponse {
+  generated_at: string;
+  open: LiveOpenSignal[];
+  combos: LiveComboStatus[];
+  recent: LiveRecentResult[];
+}

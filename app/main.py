@@ -41,6 +41,7 @@ from app.core.auth import AuthMiddleware, create_token, verify_credentials
 from app.core.database import (
     db,
     ingest_state_collection,
+    rl_decisions_collection,
     init_indexes,
     candles_collection,
     signals_collection,
@@ -1621,6 +1622,108 @@ async def get_daily_signals(date: str | None = None):
     return {"date": day_start.strftime("%Y-%m-%d"), "pairs": rows}
 
 
+def _live_signal_row(s: dict, source: str, current_price: Optional[float], now: datetime) -> dict:
+    """Shared shape for an open RL or consensus signal on GET /dashboard/live."""
+    entry, stop, target = s["entry_price"], s["stop_price"], s["target_price"]
+    sign = 1 if s["direction"] == "BUY" else -1
+    risk = abs(entry - stop) or None
+    # Where price is now relative to entry, in multiples of the stop distance (R), signed so
+    # positive = in the trade's favour. Near 0 = still close to the planned entry; a trade
+    # already most of the way to target (or stop) is no longer the setup it was.
+    progress_r = round(sign * (current_price - entry) / risk, 2) if current_price is not None and risk else None
+    q_values = s.get("q_values") or {}
+    confidence = q_values.get(f"{s['direction']}_{s.get('size_tier')}") if source == "rl" else s.get("ml_hit_probability")
+    return {
+        "source": source,
+        "signal_id": s.get("signal_id") or str(s.get("_id")),
+        "pair": s["pair"], "interval": s["interval"], "direction": s["direction"],
+        "size_tier": s.get("size_tier"),
+        "timestamp": s["timestamp"],
+        "age_minutes": round((now - s["timestamp"]).total_seconds() / 60),
+        "entry_price": entry, "target_price": target, "stop_price": stop,
+        "current_price": current_price, "progress_r": progress_r,
+        "confidence_pct": round(confidence * 100, 1) if confidence is not None else None,
+        "agreeing_count": s.get("agreeing_count"),
+    }
+
+
+@app.get("/dashboard/live")
+async def get_live_dashboard(recent_hours: int = 24):
+    """
+    The "open it and see what I can trade" view -- read-only, no signal generation, so it
+    answers in one quick round-trip however busy the backend is:
+      open    -- every still-pending RL and consensus signal, whatever day it fired (GET
+                 /dashboard/daily-signals only shows signals whose candle falls on today's UTC
+                 date, so a trade opened yesterday and still running vanished from it), with
+                 the latest candle close and how far price has moved from entry.
+      combos  -- every pair x interval: policy state (none / excluded by its own backtest /
+                 trained under outdated settings) and the latest POST /rl/signal outcome
+                 (rl_decisions: hold/blocked/excluded/error/signal + when), so an empty combo
+                 says why it's empty and how fresh that answer is.
+      recent  -- RL and consensus signals resolved in the last recent_hours, newest first.
+    """
+    now = datetime.utcnow()
+    latest_close: dict[tuple[str, str], tuple[Optional[float], Optional[datetime]]] = {}
+    combos = []
+    for pair in settings.pairs_list:
+        for interval in RL_INTERVALS:
+            candle = await candles_collection.find_one(
+                {"pair": pair, "interval": interval}, {"close": 1, "timestamp": 1}, sort=[("timestamp", -1)]
+            )
+            latest_close[(pair, interval)] = (
+                (float(candle["close"]), candle["timestamp"]) if candle else (None, None)
+            )
+            policy_doc = await ppo_policies_collection.find_one(
+                {"pair": pair, "interval": interval}, {"model_bytes": 0}, sort=[("created_at", -1)]
+            )
+            policy_state, eval_summary = "none", None
+            if policy_doc is not None:
+                eval_run = await backtest_runs_collection.find_one({"run_id": policy_doc.get("eval_run_id")})
+                if policy_doc.get("feature_names") != RL_FEATURE_NAMES:
+                    policy_state = "stale"
+                elif eval_run and (eval_run.get("total_return_pct") or 0) <= STRONG_LOSS_RETURN_PCT:
+                    policy_state = "excluded"
+                elif not policy_config_matches(eval_run, interval, pair):
+                    policy_state = "outdated"  # still serves, but needs a retrain under current settings
+                else:
+                    policy_state = "active"
+                if eval_run:
+                    eval_summary = {
+                        "total_return_pct": eval_run.get("total_return_pct"),
+                        "hit_rate_pct": eval_run.get("hit_rate_pct"),
+                        "trades": eval_run.get("directional_signals"),
+                    }
+            decision = await rl_decisions_collection.find_one({"pair": pair, "interval": interval}, {"_id": 0})
+            combos.append({
+                "pair": pair, "interval": interval,
+                "policy_state": policy_state, "policy_eval": eval_summary,
+                "last_candle_at": latest_close[(pair, interval)][1],
+                "decision": decision,
+            })
+
+    open_rows = []
+    async for s in rl_signals_collection.find({"source": "live", "status": "pending"}):
+        open_rows.append(_live_signal_row(s, "rl", latest_close.get((s["pair"], s["interval"]), (None,))[0], now))
+    async for s in consensus_signals_collection.find({"source": "live", "status": "pending"}):
+        open_rows.append(_live_signal_row(s, "consensus", latest_close.get((s["pair"], s["interval"]), (None,))[0], now))
+    open_rows.sort(key=lambda r: r["timestamp"], reverse=True)
+
+    since = now - timedelta(hours=recent_hours)
+    recent = []
+    for source, coll in (("rl", rl_signals_collection), ("consensus", consensus_signals_collection)):
+        async for s in coll.find({
+            "source": "live", "status": {"$in": ["hit", "miss", "expired"]}, "outcome_timestamp": {"$gte": since},
+        }):
+            recent.append({
+                "source": source, "pair": s["pair"], "interval": s["interval"], "direction": s["direction"],
+                "timestamp": s["timestamp"], "status": s["status"], "outcome_timestamp": s.get("outcome_timestamp"),
+                "outcome_pct_move": s.get("outcome_pct_move"), "closed_early": s.get("closed_early", False),
+            })
+    recent.sort(key=lambda r: r["outcome_timestamp"], reverse=True)
+
+    return {"generated_at": now, "open": open_rows, "combos": combos, "recent": recent}
+
+
 @app.post("/rl/reset")
 async def reset_rl(confirm: bool = False):
     """
@@ -1765,8 +1868,44 @@ async def prune_rl_history(confirm: bool = False, keep_latest_n: int = 1):
     return result
 
 
+async def _record_rl_decision(pair: str, interval: str, outcome: str, detail=None, q_values=None, signal_id=None) -> None:
+    """Upserts this pair/interval's latest /rl/signal outcome -- HOLDs and errors included, which
+    never become an RLSignal -- so GET /dashboard/live can say why a combo has nothing to trade."""
+    await rl_decisions_collection.update_one(
+        {"pair": pair, "interval": interval},
+        {"$set": {
+            "pair": pair, "interval": interval, "outcome": outcome, "detail": detail,
+            "q_values": q_values, "signal_id": signal_id, "checked_at": datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+
+
 @app.post("/rl/signal/{interval}")
 async def create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_STARTING_BALANCE):
+    """Records the outcome of _create_rl_signal (below) for the dashboard, then returns it unchanged."""
+    try:
+        result = await _create_rl_signal(interval, pair, balance)
+    except HTTPException as e:
+        await _record_rl_decision(pair, interval, "error", detail=str(e.detail))
+        raise
+    signal = result.get("signal")
+    q_values = result.get("q_values")
+    if signal is not None:
+        signal_id = signal.get("signal_id") if isinstance(signal, dict) else signal.signal_id
+        await _record_rl_decision(pair, interval, "signal", q_values=q_values, signal_id=signal_id)
+    elif result.get("excluded_reason"):
+        await _record_rl_decision(pair, interval, "excluded", result["excluded_reason"], q_values)
+    elif result.get("ml_blocked_reason"):
+        await _record_rl_decision(pair, interval, "blocked", result["ml_blocked_reason"], q_values)
+    elif result.get("memory_override"):
+        await _record_rl_decision(pair, interval, "blocked", result["memory_override"], q_values)
+    else:
+        await _record_rl_decision(pair, interval, "hold", q_values=q_values)
+    return result
+
+
+async def _create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_STARTING_BALANCE):
     """
     Loads the most recently trained PPOPolicy for this pair/interval, computes the current
     state from live strategy calls on the latest candles PLUS the supplied `balance` (same

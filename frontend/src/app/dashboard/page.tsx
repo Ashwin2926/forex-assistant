@@ -2,25 +2,84 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { DailyPairSignals, DailySignalsResponse } from "@/lib/types";
+import type { LiveComboStatus, LiveDashboardResponse, LiveOpenSignal } from "@/lib/types";
 import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
-// Auto-refresh cadence -- signals resolve and new ones fire continuously through the day
-// (create_rl_signal/score_pending_rl_signals both run on keep-fresh.yml's own cron), so
-// this page should reflect that without the user having to manually reload.
+// Read-only page (GET /dashboard/live never generates signals), so refreshing often is cheap.
+// New signals come from keep-fresh.yml's cron as candles close.
 const REFRESH_MS = 60_000;
+const SETTINGS_KEY = "dashboard-sizing";
+
+// Same sizing convention as /trading-signals and rl_engine.usd_per_unit: USD account, and
+// USD/JPY is the only one of the 4 pairs not quoted in USD.
+function lotSize(pair: string, entry: number, stop: number, riskUsd: number): number {
+  const stopDistance = Math.abs(entry - stop);
+  if (stopDistance === 0) return 0;
+  const usdPerUnit = pair === "USD/JPY" ? 1 / entry : 1;
+  return riskUsd / (stopDistance * usdPerUnit) / 100_000;
+}
+
+function priceDigits(pair: string): number {
+  return pair.includes("JPY") ? 3 : 5;
+}
+
+function ago(iso: string | null): string {
+  if (!iso) return "never";
+  const minutes = Math.round((Date.now() - new Date(iso.endsWith("Z") ? iso : `${iso}Z`).getTime()) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 48 * 60) return `${Math.round(minutes / 60)}h ago`;
+  return `${Math.round(minutes / 1440)}d ago`;
+}
+
+function formatAge(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 48 * 60) return `${Math.round(minutes / 60)}h`;
+  return `${Math.round(minutes / 1440)}d`;
+}
+
+// A trade that has already covered most of the way to target (or is close to its stop) is no
+// longer the setup it was at entry -- flag it instead of presenting it as fresh.
+function entryVerdict(s: LiveOpenSignal): { label: string; tone: string } {
+  if (s.progress_r == null) return { label: "no price", tone: "text-zinc-400" };
+  const rr = Math.abs(s.target_price - s.entry_price) / Math.abs(s.entry_price - s.stop_price || 1);
+  if (s.progress_r <= -0.5) return { label: "near stop — skip", tone: "text-rose-600 dark:text-rose-400" };
+  if (s.progress_r >= rr * 0.5) return { label: "ran — skip", tone: "text-zinc-500" };
+  if (Math.abs(s.progress_r) <= 0.25) return { label: "at entry", tone: "text-emerald-600 dark:text-emerald-400" };
+  return { label: s.progress_r > 0 ? "moved in favour" : "slightly against", tone: "text-amber-600 dark:text-amber-400" };
+}
 
 export default function DashboardPage() {
-  const [data, setData] = useState<DailySignalsResponse | null>(null);
+  const [data, setData] = useState<LiveDashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [balance, setBalance] = useState(10_000);
+  const [riskPct, setRiskPct] = useState(1);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "null");
+      if (saved?.balance > 0) setBalance(saved.balance);
+      if (saved?.riskPct > 0) setRiskPct(saved.riskPct);
+    } catch {
+      // storage unavailable -- defaults are fine
+    }
+  }, []);
+
+  function saveSizing(next: { balance: number; riskPct: number }) {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+  }
 
   async function load() {
     try {
       setError(null);
-      setData(await api.getDailySignals());
+      setData(await api.getLiveDashboard());
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load today's signals. Is the API running?");
+      setError(e instanceof ApiError ? e.message : "Couldn't reach the backend -- it may be restarting. Retrying every minute.");
     } finally {
       setLoading(false);
     }
@@ -32,113 +91,221 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, []);
 
+  const riskUsd = balance * (riskPct / 100);
+  const tradeable = data?.open.filter((s) => {
+    const v = entryVerdict(s).label;
+    return v !== "ran — skip" && v !== "near stop — skip";
+  }) ?? [];
+
   return (
     <div className="flex flex-col gap-8">
-      <section>
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">Dashboard</h1>
-            <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-              Today&apos;s trading day, one trained RL policy per pair/interval, checked
-              continuously as each new candle closes. A pair/interval with no policy has
-              genuinely found no edge yet — that&apos;s an honest answer, not an error, and
-              nothing here is ever forced.
-            </p>
-          </div>
+      <section className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">Dashboard</h1>
+          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+            Open signals you can act on now, sized to your account. Updates every minute.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label="Balance (USD)">
+            <input
+              type="number" min="0" step="100" value={balance} className="select w-28"
+              onChange={(e) => { const b = Number(e.target.value); setBalance(b); saveSizing({ balance: b, riskPct }); }}
+            />
+          </Field>
+          <Field label="Risk / trade (%)">
+            <input
+              type="number" min="0.1" max="10" step="0.1" value={riskPct} className="select w-20"
+              onChange={(e) => { const r = Number(e.target.value); setRiskPct(r); saveSizing({ balance, riskPct: r }); }}
+            />
+          </Field>
           {data && (
-            <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{data.date} UTC</span>
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">Updated {ago(data.generated_at)}</span>
           )}
         </div>
       </section>
 
       {error && (
-        <p className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-          {error}
-        </p>
+        <p className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-300">{error}</p>
       )}
       {loading && !error && <p className="text-sm text-zinc-500">Loading…</p>}
 
-      {data && !loading && (
-        <div className="flex flex-col gap-6">
-          {data.pairs.map((pair) => (
-            <PairCard key={pair.pair} pair={pair} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function PairCard({ pair }: { pair: DailyPairSignals }) {
-  const totalSignals = pair.intervals.reduce((sum, iv) => sum + iv.signals.length, 0);
-  const activeIntervals = pair.intervals.filter((iv) => iv.has_policy).length;
-
-  return (
-    <section className="card p-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">{pair.pair}</h2>
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">
-          {activeIntervals}/{pair.intervals.length} intervals trained · {totalSignals} signal{totalSignals === 1 ? "" : "s"} today
-        </span>
-      </div>
-
-      <div className="mt-3 flex flex-col gap-4">
-        {pair.intervals.map((iv) => (
-          <div key={iv.interval}>
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-xs font-medium text-zinc-600 dark:text-zinc-300">{iv.interval}</span>
-              {!iv.has_policy && (
-                <span className="text-xs text-zinc-400 dark:text-zinc-500">— no edge yet, not trading</span>
-              )}
-            </div>
-            {iv.has_policy && iv.signals.length === 0 && (
-              <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">Nothing fired today so far.</p>
-            )}
-            {iv.signals.length > 0 && (
-              <div className="mt-1 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-                <table className="w-full text-left text-xs">
-                  <thead className="table-head uppercase">
+      {data && (
+        <>
+          <section>
+            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+              Open signals <span className="font-normal text-zinc-500">· {tradeable.length} still near entry, {data.open.length} open</span>
+            </h2>
+            {data.open.length === 0 ? (
+              <p className="mt-2 rounded-md bg-zinc-50 px-4 py-3 text-sm text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                Nothing open right now. The table below shows what each pair/interval last decided and why.
+              </p>
+            ) : (
+              <div className="mt-2 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+                <table className="w-full text-left text-sm">
+                  <thead className="table-head text-xs uppercase">
                     <tr>
-                      <th className="px-3 py-1.5">Time</th>
-                      <th className="px-3 py-1.5">Direction</th>
-                      <th className="px-3 py-1.5">Entry</th>
-                      <th className="px-3 py-1.5">Target</th>
-                      <th className="px-3 py-1.5">Stop</th>
-                      <th className="px-3 py-1.5">Confidence</th>
-                      <th className="px-3 py-1.5">Size</th>
-                      <th className="px-3 py-1.5">Status</th>
-                      <th className="px-3 py-1.5">Outcome</th>
+                      <th className="px-3 py-2">Pair · TF</th>
+                      <th className="px-3 py-2">Side</th>
+                      <th className="px-3 py-2">Entry</th>
+                      <th className="px-3 py-2">Now</th>
+                      <th className="px-3 py-2">Target</th>
+                      <th className="px-3 py-2">Stop</th>
+                      <th className="px-3 py-2">Lots</th>
+                      <th className="px-3 py-2">Risk / reward</th>
+                      <th className="px-3 py-2">Age</th>
+                      <th className="px-3 py-2">Source</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {iv.signals.map((s, i) => (
-                      <tr key={s.signal_id ?? i} className="border-t border-zinc-100 dark:border-zinc-800">
-                        <td className="num px-3 py-1.5">
-                          {new Date(s.timestamp).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+                    {data.open.map((s) => {
+                      const d = priceDigits(s.pair);
+                      const verdict = entryVerdict(s);
+                      const reward = riskUsd * (Math.abs(s.target_price - s.entry_price) / Math.abs(s.entry_price - s.stop_price || 1));
+                      return (
+                        <tr key={`${s.source}-${s.signal_id}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                          <td className="px-3 py-2 font-mono">{s.pair} · {s.interval}</td>
+                          <td className="px-3 py-2"><DirectionBadge direction={s.direction} /></td>
+                          <td className="num px-3 py-2">{s.entry_price.toFixed(d)}</td>
+                          <td className="num px-3 py-2">
+                            {s.current_price?.toFixed(d) ?? "—"}
+                            <div className={`text-xs ${verdict.tone}`}>{verdict.label}</div>
+                          </td>
+                          <td className="num px-3 py-2">{s.target_price.toFixed(d)}</td>
+                          <td className="num px-3 py-2">{s.stop_price.toFixed(d)}</td>
+                          <td className="num px-3 py-2">{lotSize(s.pair, s.entry_price, s.stop_price, riskUsd).toFixed(2)}</td>
+                          <td className="px-3 py-2 text-xs">
+                            <span className="text-rose-600 dark:text-rose-400">-${riskUsd.toFixed(0)}</span>
+                            {" / "}
+                            <span className="text-emerald-600 dark:text-emerald-400">+${reward.toFixed(0)}</span>
+                          </td>
+                          <td className="px-3 py-2 text-xs">{formatAge(s.age_minutes)}</td>
+                          <td className="px-3 py-2 text-xs text-zinc-500">
+                            {s.source === "rl" ? `RL ${s.size_tier ?? ""}` : `Consensus ${s.agreeing_count ?? ""}/5`}
+                            {s.confidence_pct != null && ` · ${s.confidence_pct.toFixed(0)}%`}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section>
+            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">What each pair/interval is saying</h2>
+            <ComboGrid combos={data.combos} />
+          </section>
+
+          <section>
+            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Closed in the last 24h</h2>
+            {data.recent.length === 0 ? (
+              <p className="mt-2 text-sm text-zinc-500">No signals resolved in the last 24 hours.</p>
+            ) : (
+              <div className="mt-2 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+                <table className="w-full text-left text-sm">
+                  <thead className="table-head text-xs uppercase">
+                    <tr>
+                      <th className="px-3 py-2">Pair · TF</th>
+                      <th className="px-3 py-2">Side</th>
+                      <th className="px-3 py-2">Result</th>
+                      <th className="px-3 py-2">Move</th>
+                      <th className="px-3 py-2">Closed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.recent.map((r, i) => (
+                      <tr key={i} className="border-t border-zinc-100 dark:border-zinc-800">
+                        <td className="px-3 py-2 font-mono">{r.pair} · {r.interval}</td>
+                        <td className="px-3 py-2"><DirectionBadge direction={r.direction} /></td>
+                        <td className="px-3 py-2"><StatusBadge status={r.status} />{r.closed_early && <span className="ml-1 text-xs text-zinc-500">early exit</span>}</td>
+                        <td className="num px-3 py-2">
+                          {r.outcome_pct_move != null ? `${r.outcome_pct_move >= 0 ? "+" : ""}${r.outcome_pct_move.toFixed(3)}%` : "—"}
                         </td>
-                        <td className="px-3 py-1.5"><DirectionBadge direction={s.direction} /></td>
-                        <td className="num px-3 py-1.5">{s.entry_price.toFixed(5)}</td>
-                        <td className="num px-3 py-1.5">{s.target_price.toFixed(5)}</td>
-                        <td className="num px-3 py-1.5">{s.stop_price.toFixed(5)}</td>
-                        <td className="num px-3 py-1.5">{s.confidence_pct.toFixed(0)}%</td>
-                        <td className={`px-3 py-1.5 ${s.size_tier === "LARGE" ? "text-amber-600 dark:text-amber-400" : ""}`}>
-                          {s.size_tier}
-                        </td>
-                        <td className="px-3 py-1.5"><StatusBadge status={s.status} /></td>
-                        <td className="num px-3 py-1.5">
-                          {s.outcome_pct_move != null
-                            ? `${s.outcome_pct_move >= 0 ? "+" : ""}${s.outcome_pct_move.toFixed(3)}%`
-                            : "—"}
-                        </td>
+                        <td className="px-3 py-2 text-xs">{ago(r.outcome_timestamp)}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             )}
-          </div>
-        ))}
-      </div>
-    </section>
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+function comboLine(c: LiveComboStatus): { text: string; tone: string } {
+  if (c.policy_state === "none") return { text: "No trained policy", tone: "text-zinc-400" };
+  if (c.policy_state === "stale") return { text: "Policy needs retraining (old format)", tone: "text-zinc-400" };
+  if (c.policy_state === "excluded") {
+    const ret = c.policy_eval?.total_return_pct;
+    return { text: `Paused — lost ${ret != null ? Math.abs(ret).toFixed(0) : "?"}% in backtest`, tone: "text-rose-600 dark:text-rose-400" };
+  }
+  const d = c.decision;
+  if (!d) return { text: "Not checked yet", tone: "text-zinc-400" };
+  switch (d.outcome) {
+    case "signal":
+      return { text: "Signal open ↑", tone: "text-emerald-600 dark:text-emerald-400" };
+    case "hold": {
+      const q = d.q_values ?? {};
+      const hold = Math.round(((q.HOLD ?? 0) + (q.EXIT ?? 0)) * 100);
+      return { text: `Waiting (HOLD ${hold}%)`, tone: "text-zinc-500" };
+    }
+    case "blocked":
+      return { text: "Setup blocked by safety check", tone: "text-amber-600 dark:text-amber-400" };
+    case "excluded":
+      return { text: "Paused by backtest result", tone: "text-rose-600 dark:text-rose-400" };
+    case "error":
+      return { text: `Error: ${d.detail ?? "unknown"}`, tone: "text-rose-600 dark:text-rose-400" };
+  }
+}
+
+function ComboGrid({ combos }: { combos: LiveComboStatus[] }) {
+  const pairs = Array.from(new Set(combos.map((c) => c.pair)));
+  const intervals = Array.from(new Set(combos.map((c) => c.interval)));
+  return (
+    <div className="mt-2 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+      <table className="w-full text-left text-xs">
+        <thead className="table-head uppercase">
+          <tr>
+            <th className="px-3 py-2">Pair</th>
+            {intervals.map((iv) => <th key={iv} className="px-3 py-2">{iv}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {pairs.map((pair) => (
+            <tr key={pair} className="border-t border-zinc-100 align-top dark:border-zinc-800">
+              <td className="px-3 py-2 font-mono text-sm">{pair}</td>
+              {intervals.map((iv) => {
+                const c = combos.find((x) => x.pair === pair && x.interval === iv);
+                if (!c) return <td key={iv} />;
+                const line = comboLine(c);
+                return (
+                  <td key={iv} className="px-3 py-2" title={c.decision?.detail ?? undefined}>
+                    <div className={line.tone}>{line.text}</div>
+                    <div className="mt-0.5 text-zinc-400">
+                      checked {ago(c.decision?.checked_at ?? null)}
+                      {c.policy_state === "outdated" && " · retrain pending"}
+                    </div>
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-zinc-500">
+      {label}
+      {children}
+    </label>
   );
 }
