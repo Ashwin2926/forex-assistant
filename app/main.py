@@ -74,7 +74,7 @@ from app.services.ml_training_data import get_ml_reference_signals
 from app.services.rl_engine import (
     compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
-    RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT,
+    RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT, live_exclusion_reason,
     is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE, OpenPosition,
     policy_config_matches,
 )
@@ -1681,7 +1681,7 @@ async def get_live_dashboard(recent_hours: int = 24):
                 eval_run = await backtest_runs_collection.find_one({"run_id": policy_doc.get("eval_run_id")})
                 if policy_doc.get("feature_names") != RL_FEATURE_NAMES:
                     policy_state = "stale"
-                elif eval_run and (eval_run.get("total_return_pct") or 0) <= STRONG_LOSS_RETURN_PCT:
+                elif live_exclusion_reason(eval_run) is not None:
                     policy_state = "excluded"
                 elif not policy_config_matches(eval_run, interval, pair):
                     policy_state = "outdated"  # still serves, but needs a retrain under current settings
@@ -1689,6 +1689,7 @@ async def get_live_dashboard(recent_hours: int = 24):
                     policy_state = "active"
                 if eval_run:
                     eval_summary = {
+                        "reason": live_exclusion_reason(eval_run),
                         "total_return_pct": eval_run.get("total_return_pct"),
                         "hit_rate_pct": eval_run.get("hit_rate_pct"),
                         "trades": eval_run.get("directional_signals"),
@@ -2076,28 +2077,20 @@ async def _create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_S
         raise HTTPException(status_code=400, detail=str(e))
     _stage(f"PPO action chosen: {action}")
 
-    # Live-exclusion gate: a policy whose latest training-time backtest showed a clear losing
-    # edge (same STRONG_LOSS_RETURN_PCT threshold GET /rl/insights already flags as
-    # "critical") doesn't get to trade live, even though it keeps training normally in the
+    # Live-exclusion gate: a policy whose latest training-time backtest didn't show a
+    # profitable edge on its unseen test slice (rl_engine.live_exclusion_reason) doesn't get
+    # to trade live, even though it keeps training normally in the
     # background (the once-daily cron retrain and _check_and_retrain_degraded_policies's
     # degradation-triggered retrain are both untouched by this). Self-correcting, not a
     # manual toggle someone has to remember to flip back -- this re-checks the LATEST
     # policy's own eval fresh on every call, so the next retrain that clears the threshold
     # re-enables live signals automatically.
     eval_run = await backtest_runs_collection.find_one({"run_id": policy.eval_run_id})
-    excluded_return = eval_run.get("total_return_pct") if eval_run else None
-    if excluded_return is not None and excluded_return <= STRONG_LOSS_RETURN_PCT:
+    excluded = live_exclusion_reason(eval_run)
+    if excluded is not None:
         # No pending signal to retire here -- if one existed, it was already resolved or
         # returned as still-open above, before this policy was even loaded.
-        return {
-            "signal": None, "q_values": q_values,
-            "excluded_reason": (
-                f"Latest training run lost {abs(excluded_return):.0f}% of a simulated $50 "
-                f"start (hit rate {eval_run.get('hit_rate_pct')}%) -- excluded from live "
-                f"signals until a retrain clears this. Training continues normally in the "
-                f"background; this re-checks fresh every call, so it re-enables automatically."
-            ),
-        }
+        return {"signal": None, "q_values": q_values, "excluded_reason": excluded}
 
     # EXIT is only meaningful with an open position (see rl_engine.ACTIONS' own comment) --
     # nothing stops a trained policy from still greedily preferring it while flat for some

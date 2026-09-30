@@ -619,7 +619,11 @@ export interface LiveComboStatus {
   pair: string;
   interval: string;
   policy_state: "none" | "stale" | "excluded" | "outdated" | "active";
-  policy_eval: { total_return_pct: number | null; hit_rate_pct: number | null; trades: number | null } | null;
+  policy_eval: {
+    // Why the policy may not produce live signals (lost money / too few trades on unseen data), null if it may.
+    reason: string | null;
+    total_return_pct: number | null; hit_rate_pct: number | null; trades: number | null;
+  } | null;
   last_candle_at: string | null;
   decision: {
     outcome: "signal" | "hold" | "blocked" | "excluded" | "error";

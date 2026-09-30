@@ -6,6 +6,16 @@ Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README
 
 ## 2026-09-30
 
+**First retrain under the new settings: short-interval policies now trade, but lose on unseen
+data.** Test-slice results: EUR/USD 5min -0.8% (almost no trades), 15min -10.6% (41% hit),
+1h -86% (39%); GBP/USD 5min no trades, 15min -98% (33%), 1h -63% (40%); USD/JPY 5min -97%
+(32%). At 1.5:1 reward:risk, break-even needs roughly a 40%+ hit rate after spread. So:
+- **Live bar raised** (`rl_engine.live_exclusion_reason`): a policy needs a positive test-slice
+  return over 20+ trades to produce live signals (was: not worse than -30%). Otherwise the
+  dashboard shows it as paused with the reason.
+- **Spreads set from the owner's RoboForex Pro demo** (London session readings): EUR/USD 1.4,
+  GBP/USD 1.5, USD/JPY 1.9 (was 1.0), AUD/USD 1.6 pips. Retrained 5min/15min/1h under them.
+
 **Dashboard is now the landing page, built for "open it and trade".** `/` redirects to
 `/dashboard` (was `/trading-signals`, which fired 20 fresh consensus POSTs in parallel on every
 visit and was almost always empty). New read-only `GET /dashboard/live`:

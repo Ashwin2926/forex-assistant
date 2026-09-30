@@ -29,11 +29,16 @@ def compute_atr_target_stop(
 # every expectancy number computed with this should be read as an upper bound on the real
 # edge, not a validated one -- real spreads also widen outside major sessions and around
 # news, which a single fixed number per pair can't capture.
+#
+# 2026-09-30: replaced the generic guesses (EUR 1.0 / GBP 1.5 / JPY 1.0 / AUD 1.5 pips) with
+# readings from the owner's RoboForex Pro (MT5, spread-only, no commission) demo account during
+# the London session: EUR/USD 14 points, GBP/USD 13, USD/JPY 19, AUD/USD 15-16. London is one
+# of the tighter times of day, so each is rounded up slightly rather than taken at its minimum.
 TYPICAL_SPREAD_PRICE: dict[str, float] = {
-    "EUR/USD": 0.00010,  # ~1.0 pip
-    "GBP/USD": 0.00015,  # ~1.5 pips
-    "USD/JPY": 0.010,    # ~1.0 pip -- JPY pip size is 0.01, not 0.0001
-    "AUD/USD": 0.00015,  # ~1.5 pips
+    "EUR/USD": 0.00014,  # 1.4 pips
+    "GBP/USD": 0.00015,  # 1.5 pips (1.3 measured)
+    "USD/JPY": 0.019,    # 1.9 pips -- JPY pip size is 0.01, not 0.0001
+    "AUD/USD": 0.00016,  # 1.6 pips
 }
 DEFAULT_SPREAD_PRICE = 0.00015  # fallback for any pair not listed above
 

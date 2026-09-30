@@ -241,8 +241,12 @@ function comboLine(c: LiveComboStatus): { text: string; tone: string } {
   if (c.policy_state === "none") return { text: "No trained policy", tone: "text-zinc-400" };
   if (c.policy_state === "stale") return { text: "Policy needs retraining (old format)", tone: "text-zinc-400" };
   if (c.policy_state === "excluded") {
-    const ret = c.policy_eval?.total_return_pct;
-    return { text: `Paused — lost ${ret != null ? Math.abs(ret).toFixed(0) : "?"}% in backtest`, tone: "text-rose-600 dark:text-rose-400" };
+    const ev = c.policy_eval;
+    const ret = ev?.total_return_pct;
+    const text = ret != null && ret <= 0
+      ? `Paused — ${ret.toFixed(0)}% on test data (${ev?.trades ?? 0} trades)`
+      : `Paused — only ${ev?.trades ?? 0} test trades`;
+    return { text, tone: "text-rose-600 dark:text-rose-400" };
   }
   const d = c.decision;
   if (!d) return { text: "Not checked yet", tone: "text-zinc-400" };
@@ -284,7 +288,7 @@ function ComboGrid({ combos }: { combos: LiveComboStatus[] }) {
                 if (!c) return <td key={iv} />;
                 const line = comboLine(c);
                 return (
-                  <td key={iv} className="px-3 py-2" title={c.decision?.detail ?? undefined}>
+                  <td key={iv} className="px-3 py-2" title={c.policy_eval?.reason ?? c.decision?.detail ?? undefined}>
                     <div className={line.tone}>{line.text}</div>
                     <div className="mt-0.5 text-zinc-400">
                       checked {ago(c.decision?.checked_at ?? null)}

@@ -57,6 +57,33 @@ def is_usable_warm_start(eval_run: Optional[dict]) -> bool:
     return return_pct is None or return_pct > STRONG_LOSS_RETURN_PCT
 
 
+# Live-signal bar: a policy only produces live signals if its own test-slice eval (unseen,
+# chronologically later data) made money over a meaningful number of trades. Was only "didn't
+# lose more than STRONG_LOSS_RETURN_PCT" -- after the 2026-09-30 retrain, policies that trade
+# again but lose on the test slice (e.g. EUR/USD/15min -10.6%) still passed that and would
+# have shown up on the dashboard as tradeable. A dashboard meant for placing real trades
+# should only show signals from a policy with evidence of an edge.
+LIVE_MIN_RETURN_PCT = 0.0
+LIVE_MIN_TRADES = 20
+
+
+def live_exclusion_reason(eval_run: Optional[dict]) -> Optional[str]:
+    """Why this policy may not produce live signals, or None if it may (see LIVE_MIN_*)."""
+    if not eval_run:
+        return "No test-slice evaluation found for this policy."
+    ret = eval_run.get("total_return_pct")
+    trades = eval_run.get("directional_signals") or 0
+    hit = eval_run.get("hit_rate_pct")
+    if trades < LIVE_MIN_TRADES:
+        return f"Only {trades} trades on unseen test data (need {LIVE_MIN_TRADES}+) -- not enough evidence."
+    if ret is None or ret <= LIVE_MIN_RETURN_PCT:
+        return (
+            f"Lost money on unseen test data ({ret}% of a simulated $50 start over {trades} trades, "
+            f"hit rate {hit}%) -- paused until a retrain is profitable."
+        )
+    return None
+
+
 # baseline_return_pct for when the latest stored policy can't be served at all -- trained under
 # an older state feature set, so choose_action_ppo rejects it and POST /rl/signal 400s on every
 # call. Any newly trained, compatible policy beats a policy that can't run, so it must always
