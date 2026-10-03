@@ -96,21 +96,36 @@ def load_backtest_signals_archive() -> list[dict]:
     filters live ones (see is_current_smc_signal) -- defensive, since every file here should
     already be freshly rebuilt, but a future partial/interrupted rebuild could leave an old
     file sitting next to fresh ones.
+
+    Cached in memory, keyed by each file's name/size/mtime (2026-10-03): this used to re-read
+    all 16 Parquet files on every call, and get_ml_reference_signals is awaited directly in
+    POST /rl/signal's request handler, so the read ran on the event loop. keep-fresh.yml kept
+    showing one /rl/signal call answer, then the next few hang to the gateway's 524 with
+    app/main.py's 90s _run_native timeout never firing -- i.e. the event loop itself was stuck,
+    which a stalled pyarrow read in a process that also runs torch/XGBoost would explain. The
+    files only change on a redeploy, so after the first read this is a dict lookup.
+    use_threads=False keeps pyarrow's own thread pool out of the web process entirely.
     """
     if not ARCHIVE_DIR.exists():
         return []
+    paths = [p for p in sorted(ARCHIVE_DIR.iterdir()) if p.name in _VALID_ARCHIVE_FILENAMES]
+    key = tuple((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+    if _archive_cache["key"] == key:
+        return list(_archive_cache["rows"])
     rows: list[dict] = []
-    for path in sorted(ARCHIVE_DIR.iterdir()):
-        if path.name not in _VALID_ARCHIVE_FILENAMES:
-            continue
-        df = pd.read_parquet(path, columns=_ARCHIVE_COLUMNS)
+    for path in paths:
+        df = pd.read_parquet(path, columns=_ARCHIVE_COLUMNS, use_threads=False)
         for record in df.to_dict("records"):
             record["strategy_calls"] = json.loads(record["strategy_calls"])
             rows.append(record)
     rows = [r for r in rows if is_current_smc_signal(r)]
     if len(rows) > MAX_BACKTEST_SIGNALS:
         rows = random.sample(rows, MAX_BACKTEST_SIGNALS)
-    return rows
+    _archive_cache["key"], _archive_cache["rows"] = key, rows
+    return list(rows)
+
+
+_archive_cache: dict = {"key": None, "rows": []}
 
 
 async def get_ml_reference_signals(signals_collection) -> list[dict]:

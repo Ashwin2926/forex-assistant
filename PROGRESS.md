@@ -4,6 +4,27 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-10-03
+
+**keep-fresh.yml failing 30 of 35 runs since 09-30 -- backend still freezing, two fixes.** Same
+pattern every time: one `/rl/signal` call answers, then the next several hang to the gateway's
+524 (and once even DB-only `GET /ingest/due` and every `/ingest/*` call timed out for ~8 min),
+then it recovers or the replica restarts (502). The 90s `_run_native` timeout from 09-30 never
+fired in these, so the event loop itself was blocked, not just the native worker thread.
+- `ml_training_data.load_backtest_signals_archive` re-read all 16 Parquet files on every call,
+  directly on the event loop (awaited inside `/rl/signal`). Now cached in memory, keyed by
+  file name/size/mtime, and read with `use_threads=False` (605ms -> 0.26ms when cached).
+- `_rl_state_from_candles` computed strategy votes for all ~500 bars and used only the last:
+  ~2.8s of GIL-holding pure Python per call, starving the event loop. Now votes on the last
+  `STATE_WINDOW_BARS + 1` rows (6ms; identical state, checked on 432 random windows).
+Still unverified: if freezes continue after this, the FastAPI Cloud memory graph / restart
+reasons for 10-01 00:38-00:47 and 10-03 01:44-01:58 UTC are the next thing to look at.
+
+**Data bug found (not fixed yet): EUR/USD and GBP/USD 1day candles are broken before 2024**
+(open typically 30-40 pips from the previous close; intraday intervals and USD/JPY/AUD/USD daily
+are clean). Likely explains GBP/USD/1day's +2610% RL result. Fix planned: build 1day bars from
+1h, closing 17:00 New York, then retrain the 1day policies.
+
 ## 2026-09-30
 
 **First retrain under the new settings: short-interval policies now trade, but lose on unseen

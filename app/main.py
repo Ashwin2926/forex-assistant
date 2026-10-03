@@ -73,7 +73,7 @@ from app.services.ml_model import train_hit_classifier, predict_hit_probability
 from app.services.ml_training_data import get_ml_reference_signals
 from app.services.rl_engine import (
     compute_strategy_vote_states, rl_config_profile, full_rl_state,
-    position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE,
+    position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE, STATE_WINDOW_BARS,
     RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT, live_exclusion_reason,
     is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE, OpenPosition,
     policy_config_matches,
@@ -867,7 +867,12 @@ def _rl_state_from_candles(
     """
     df = pd.DataFrame(docs)
     indicator_df = add_all_indicators(df, config)
-    states = compute_strategy_vote_states(indicator_df, config)
+    # Only the latest bar's state is used, and each bar's state reads at most the last
+    # STATE_WINDOW_BARS rows -- so vote on just that tail (identical last state) instead of all
+    # ~500 bars. Measured 2026-10-03: ~2.8s of GIL-holding pure Python per call for the full
+    # history vs ~6ms for the tail, on the same thread serving every other request.
+    tail = indicator_df.iloc[-(STATE_WINDOW_BARS + 1):].reset_index(drop=True)
+    states = compute_strategy_vote_states(tail, config)
 
     latest = indicator_df.iloc[-1]
     calls = [fn(indicator_df, config) for fn in STRATEGIES]
