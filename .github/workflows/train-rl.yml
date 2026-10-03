@@ -132,9 +132,12 @@ jobs:
   # in parallel -- running this once per matrix entry would mean 20 redundant calls instead
   # of one. needs: train + if: always() so a prune still happens even if some combos failed,
   # same reasoning rebuild-backtests.yml's own chained retrain already documents.
+  # Full runs only (schedule, POST /rl/train-all, a blank manual dispatch) -- not a
+  # single-combo dispatch. Several single-combo runs finishing together each fired this at the
+  # backend at once (2026-10-03), and the overlapping prunes froze it for ~10 minutes.
   prune:
     needs: train
-    if: always()
+    if: always() && !(inputs.pair && inputs.interval)
     runs-on: ubuntu-latest
     env:
       API_BASE: https://forex-assistant.fastapicloud.dev

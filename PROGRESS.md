@@ -46,6 +46,13 @@ calling daily direction better than a coin flip. `GET /dashboard/scorecard?since
 signals per source/pair/interval since go-live (2026-09-30) -- closed/open, win rate, average
 and total net % (outcome_pct_move is already net of spread).
 
+**Overlapping prunes froze the backend (05:09-05:20 UTC).** The 8 single-combo train-rl.yml runs
+dispatched today each ran the `prune` job on finish, firing `POST /rl/prune-history` at the
+backend several times at once; every other call (including `/ingest/1day`) hung until they
+cleared. Prune now runs only for full runs (schedule / train-all / blank dispatch), the endpoint
+measures model sizes with `$bsonSize` instead of downloading every old model, and the writes run
+in the background behind a lock so only one prune writes at a time.
+
 **5min long-training test:** dispatched all 4 pairs at 250k timesteps (vs 50k) to settle
 whether 5min can ever beat costs.
 

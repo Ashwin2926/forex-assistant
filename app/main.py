@@ -1948,16 +1948,22 @@ async def prune_rl_history(confirm: bool = False, keep_latest_n: int = 1):
 
     for pair in settings.pairs_list:
         for interval in RL_INTERVALS:
-            docs = await ppo_policies_collection.find(
-                {"pair": pair, "interval": interval}, {"model_bytes": 1, "eval_run_id": 1}
-            ).sort("created_at", -1).to_list(length=None)
+            # Model size via $bsonSize instead of downloading every old policy's model_bytes
+            # just to measure it (2026-10-03: overlapping prunes froze the backend).
+            docs = await ppo_policies_collection.aggregate([
+                {"$match": {"pair": pair, "interval": interval}},
+                {"$sort": {"created_at": -1}},
+                {"$project": {"eval_run_id": 1, "model_size": {
+                    "$cond": [{"$ifNull": ["$model_bytes", False]}, {"$bsonSize": {"m": "$model_bytes"}}, None],
+                }}},
+            ]).to_list(length=None)
             for d in docs[:keep_latest_n]:
                 if d.get("eval_run_id"):
                     kept_eval_run_ids.add(d["eval_run_id"])
             for d in docs[keep_latest_n:]:
-                if d.get("model_bytes") is not None:
+                if d.get("model_size") is not None:
                     stripped_policy_ids.append(d["_id"])
-                    policies_size_before += len(d["model_bytes"])
+                    policies_size_before += d["model_size"]
                 if d.get("eval_run_id"):
                     prunable_eval_run_ids.add(d["eval_run_id"])
 
@@ -1976,13 +1982,30 @@ async def prune_rl_history(confirm: bool = False, keep_latest_n: int = 1):
     if not confirm:
         return result
 
-    if stripped_policy_ids:
-        await ppo_policies_collection.update_many(
-            {"_id": {"$in": stripped_policy_ids}}, {"$unset": {"model_bytes": ""}}
-        )
-    if prunable_eval_run_ids:
-        await backtest_signals_collection.delete_many({"run_id": {"$in": list(prunable_eval_run_ids)}})
+    async def _apply() -> None:
+        if _prune_lock.locked():
+            return  # a prune is already running; this one's work is a subset of it
+        async with _prune_lock:
+            if stripped_policy_ids:
+                await ppo_policies_collection.update_many(
+                    {"_id": {"$in": stripped_policy_ids}}, {"$unset": {"model_bytes": ""}}
+                )
+            if prunable_eval_run_ids:
+                await backtest_signals_collection.delete_many({"run_id": {"$in": list(prunable_eval_run_ids)}})
+
+    # Returned before the writes finish (a large delete_many can take minutes on Atlas), and
+    # only one prune writes at a time -- see _prune_lock.
+    task = asyncio.create_task(_apply())
+    _prune_tasks.add(task)  # keep a reference so it isn't garbage-collected mid-run
+    task.add_done_callback(_prune_tasks.discard)
+    result["applied"] = "in background"
     return result
+
+
+# One prune at a time: overlapping update_many/delete_many runs from several training runs
+# finishing together froze the backend on 2026-10-03.
+_prune_lock = asyncio.Lock()
+_prune_tasks: set = set()
 
 
 async def _record_rl_decision(pair: str, interval: str, outcome: str, detail=None, q_values=None, signal_id=None) -> None:
