@@ -24,6 +24,11 @@ def load_archived_candles(pair: str, interval: str) -> pd.DataFrame:
     it since slow archive reads have already caused gateway timeouts on the endpoints that
     call this (see scripts/export_candles.py's own docstring for the numbers).
     """
+    if interval == "1day":
+        # The committed *_1day.parquet files hold the provider's broken daily feed for
+        # EUR/USD and GBP/USD -- always derive daily bars from the 1h archive instead.
+        from app.services.daily_candles import daily_from_hourly
+        return daily_from_hourly(load_archived_candles(pair, "1h"))
     path = ARCHIVE_DIR / f"{_slug(pair)}_{interval}.parquet"
     columns = ["timestamp", "open", "high", "low", "close", "volume"]
     if not path.exists():
@@ -52,6 +57,15 @@ async def load_full_candle_history(pair: str, interval: str) -> list[dict]:
     """
     from app.core.database import candles_collection
 
+    if interval == "1day":
+        # Built from 1h, never the provider's daily feed -- see app/services/daily_candles.py.
+        from app.services.daily_candles import daily_from_hourly
+        hourly = pd.DataFrame(await load_full_candle_history(pair, "1h"))
+        daily = daily_from_hourly(hourly)
+        daily["pair"] = pair
+        daily["interval"] = interval
+        return daily.to_dict("records")
+
     archive_df = load_archived_candles(pair, interval)
 
     cursor = candles_collection.find(
@@ -79,6 +93,11 @@ def load_full_candle_history_sync(db, pair: str, interval: str) -> pd.DataFrame:
     archive-merged-with-Mongo, Mongo-wins-on-overlap semantics; returns a DataFrame directly
     (not list[dict]) since every sync caller immediately wants a DataFrame anyway.
     """
+    if interval == "1day":
+        # Built from 1h, never the provider's daily feed -- see app/services/daily_candles.py.
+        from app.services.daily_candles import daily_from_hourly
+        return daily_from_hourly(load_full_candle_history_sync(db, pair, "1h"))
+
     mongo_docs = list(
         db["candles"].find(
             {"pair": pair, "interval": interval}, {"_id": 0, "pair": 0, "interval": 0}

@@ -71,6 +71,8 @@ def live_exclusion_reason(eval_run: Optional[dict]) -> Optional[str]:
     """Why this policy may not produce live signals, or None if it may (see LIVE_MIN_*)."""
     if not eval_run:
         return "No test-slice evaluation found for this policy."
+    if eval_run.get("interval") == "1day" and not eval_run.get("daily_candles_from_1h"):
+        return "Trained on the provider's broken daily candles -- paused until retrained on daily bars built from 1h data."
     ret = eval_run.get("total_return_pct")
     trades = eval_run.get("directional_signals") or 0
     hit = eval_run.get("hit_rate_pct")
@@ -336,6 +338,8 @@ def policy_config_matches(eval_run: Optional[dict], interval: str, pair: str) ->
     """
     if not eval_run:
         return False
+    if interval == "1day" and not eval_run.get("daily_candles_from_1h"):
+        return False  # trained on the provider's broken daily feed -- see daily_candles.py
     target, stop = rl_atr_mults(interval, pair)
     return (
         eval_run.get("target_atr_mult") == target

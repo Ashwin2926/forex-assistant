@@ -63,6 +63,9 @@ from app.models.schemas import (
 )
 from app.services.data_fetcher import fetch_and_store, backfill_batch, catch_up_batch, interval_due
 from app.services.candle_archive import load_full_candle_history, load_archived_candles
+from app.services.daily_candles import daily_from_hourly
+from app.services.daily_plan import build_daily_plan
+from pymongo import UpdateOne
 from app.services.indicators import atr as compute_atr_series, add_all_indicators
 from app.services.signal_engine import compute_atr_target_stop, default_config_for, spread_cost_pct
 from app.services.backtester import run_consensus_backtest
@@ -288,6 +291,34 @@ async def cancel_candle_catchup_job(job_id: str):
     return CandleCatchupJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 
+async def _rebuild_daily_candles(pair: str) -> str:
+    """
+    Replaces this pair's 1day candles in candles_collection with bars built from its full 1h
+    history (archive + Mongo) -- see app/services/daily_candles.py for why the provider's
+    daily feed isn't used. Upserts every finished day and deletes any 1day doc that isn't one
+    of them (the old provider bars, stamped at 00:00 UTC instead of the 17:00 New York open).
+    """
+    hourly = pd.DataFrame(await load_full_candle_history(pair, "1h"))
+    daily = await _run_native(daily_from_hourly, hourly)
+    if daily.empty:
+        return "no 1h history to build from"
+    ops = [
+        UpdateOne(
+            {"pair": pair, "interval": "1day", "timestamp": row.timestamp.to_pydatetime()},
+            {"$set": {"open": float(row.open), "high": float(row.high), "low": float(row.low),
+                      "close": float(row.close), "volume": float(row.volume)}},
+            upsert=True,
+        )
+        for row in daily.itertuples(index=False)
+    ]
+    await candles_collection.bulk_write(ops, ordered=False)
+    keep = [t.to_pydatetime() for t in daily["timestamp"]]
+    removed = await candles_collection.delete_many(
+        {"pair": pair, "interval": "1day", "timestamp": {"$nin": keep}}
+    )
+    return f"{len(ops)} daily candles rebuilt from 1h (latest opens {keep[-1]:%Y-%m-%d %H:%M} UTC), {removed.deleted_count} old removed"
+
+
 @app.post("/ingest/{interval}")
 async def ingest(interval: str, output_size: int = 300):
     """
@@ -306,6 +337,13 @@ async def ingest(interval: str, output_size: int = 300):
     """
     results = {}
     for i, pair in enumerate(settings.pairs_list):
+        if interval == "1day":
+            # Built from the stored 1h candles, not fetched -- see app/services/daily_candles.py.
+            try:
+                results[pair] = await _rebuild_daily_candles(pair)
+            except Exception as e:
+                results[pair] = f"error: {e}"
+            continue
         if i > 0:
             await asyncio.sleep(2)
         try:
@@ -1728,6 +1766,79 @@ async def get_live_dashboard(recent_hours: int = 24):
     recent.sort(key=lambda r: r["outcome_timestamp"], reverse=True)
 
     return {"generated_at": now, "open": open_rows, "combos": combos, "recent": recent}
+
+
+@app.get("/dashboard/daily-plan")
+async def get_daily_plan():
+    """
+    Per pair: expected range for today and the reference levels price tends to visit -- see
+    app/services/daily_plan.py for what's included and why there's no direction. Read-only,
+    DB-only.
+    """
+    plans = []
+    for pair in settings.pairs_list:
+        daily = await candles_collection.find(
+            {"pair": pair, "interval": "1day"}, {"_id": 0, "timestamp": 1, "high": 1, "low": 1, "close": 1},
+        ).sort("timestamp", -1).limit(30).to_list(length=30)
+        if not daily:
+            plans.append({"pair": pair, "error": "no daily candles yet"})
+            continue
+        today_open = max(c["timestamp"] for c in daily) + timedelta(days=1)
+        hourly = await candles_collection.find(
+            {"pair": pair, "interval": "1h", "timestamp": {"$gte": today_open}}, {"_id": 0, "high": 1, "low": 1},
+        ).to_list(length=None)
+        latest = await candles_collection.find_one(
+            {"pair": pair, "interval": "5min"}, {"_id": 0, "close": 1, "timestamp": 1}, sort=[("timestamp", -1)],
+        )
+        plans.append(build_daily_plan(
+            pair, daily, hourly, latest["close"] if latest else None, latest["timestamp"] if latest else None,
+        ))
+    return {"generated_at": datetime.utcnow(), "pairs": plans}
+
+
+@app.get("/dashboard/scorecard")
+async def get_scorecard(since: str = "2026-09-30"):
+    """
+    How live signals have actually turned out since `since` (YYYY-MM-DD), per source and
+    pair/interval: resolved trades, wins (net move > 0 after spread), win rate, average and
+    total net % move. outcome_pct_move is already net of spread (outcome_scoring). The live
+    test of whether the system works -- don't read much into any row under ~30 trades.
+    """
+    try:
+        start = datetime.strptime(since, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="since must be 'YYYY-MM-DD'.")
+    rows = []
+    totals = {"trades": 0, "wins": 0, "sum_pct": 0.0, "open": 0}
+    for source, coll in (("rl", rl_signals_collection), ("consensus", consensus_signals_collection)):
+        docs = await coll.find(
+            {"source": "live", "timestamp": {"$gte": start}, "status": {"$in": ["hit", "miss", "expired", "pending"]}},
+            {"_id": 0, "pair": 1, "interval": 1, "status": 1, "outcome_pct_move": 1},
+        ).to_list(length=None)
+        groups: dict[tuple[str, str], dict] = {}
+        for doc in docs:
+            g = groups.setdefault((doc["pair"], doc["interval"]), {"trades": 0, "wins": 0, "sum_pct": 0.0, "open": 0})
+            if doc["status"] == "pending":
+                g["open"] += 1
+                continue
+            move = doc.get("outcome_pct_move") or 0.0
+            g["trades"] += 1
+            g["wins"] += 1 if move > 0 else 0
+            g["sum_pct"] += move
+        for (pair, interval), g in sorted(groups.items()):
+            rows.append({
+                "source": source, "pair": pair, "interval": interval,
+                "trades": g["trades"], "open": g["open"], "wins": g["wins"],
+                "win_rate_pct": round(g["wins"] / g["trades"] * 100, 1) if g["trades"] else None,
+                "avg_net_pct": round(g["sum_pct"] / g["trades"], 4) if g["trades"] else None,
+                "total_net_pct": round(g["sum_pct"], 4),
+            })
+            for k in totals:
+                totals[k] += g[k]
+    totals["win_rate_pct"] = round(totals["wins"] / totals["trades"] * 100, 1) if totals["trades"] else None
+    totals["avg_net_pct"] = round(totals["sum_pct"] / totals["trades"], 4) if totals["trades"] else None
+    totals["sum_pct"] = round(totals["sum_pct"], 4)
+    return {"since": since, "rows": rows, "totals": totals}
 
 
 @app.post("/rl/reset")

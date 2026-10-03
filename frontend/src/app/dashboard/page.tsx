@@ -2,13 +2,18 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { LiveComboStatus, LiveDashboardResponse, LiveOpenSignal } from "@/lib/types";
+import type {
+  DailyPlan, DailyPlanResponse, LiveComboStatus, LiveDashboardResponse, LiveOpenSignal, ScorecardResponse,
+} from "@/lib/types";
 import { DirectionBadge, StatusBadge } from "@/components/Badges";
 
 // Read-only page (GET /dashboard/live never generates signals), so refreshing often is cheap.
 // New signals come from keep-fresh.yml's cron as candles close.
 const REFRESH_MS = 60_000;
 const SETTINGS_KEY = "dashboard-sizing";
+// When the current settings went live (spread-aware stops, profitable-on-test-data gate) --
+// the scorecard counts live results from here.
+const GO_LIVE = "2026-09-30";
 
 // Same sizing convention as /trading-signals and rl_engine.usd_per_unit: USD account, and
 // USD/JPY is the only one of the 4 pairs not quoted in USD.
@@ -51,6 +56,8 @@ function entryVerdict(s: LiveOpenSignal): { label: string; tone: string } {
 
 export default function DashboardPage() {
   const [data, setData] = useState<LiveDashboardResponse | null>(null);
+  const [plan, setPlan] = useState<DailyPlanResponse | null>(null);
+  const [score, setScore] = useState<ScorecardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [balance, setBalance] = useState(10_000);
@@ -77,7 +84,13 @@ export default function DashboardPage() {
   async function load() {
     try {
       setError(null);
-      setData(await api.getLiveDashboard());
+      const [live, dailyPlan, scorecard] = await Promise.allSettled([
+        api.getLiveDashboard(), api.getDailyPlan(), api.getScorecard(GO_LIVE),
+      ]);
+      if (dailyPlan.status === "fulfilled") setPlan(dailyPlan.value);
+      if (scorecard.status === "fulfilled") setScore(scorecard.value);
+      if (live.status === "rejected") throw live.reason;
+      setData(live.value);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Couldn't reach the backend -- it may be restarting. Retrying every minute.");
     } finally {
@@ -193,6 +206,8 @@ export default function DashboardPage() {
             )}
           </section>
 
+          {plan && <DailyPlanSection plan={plan} />}
+
           <section>
             <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">What each pair/interval is saying</h2>
             <ComboGrid combos={data.combos} />
@@ -231,9 +246,127 @@ export default function DashboardPage() {
               </div>
             )}
           </section>
+          {score && <ScorecardSection score={score} />}
         </>
       )}
     </div>
+  );
+}
+
+function DailyPlanSection({ plan }: { plan: DailyPlanResponse }) {
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Today&apos;s plan</h2>
+      <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+        How far each pair typically moves today and the levels price usually reaches — no direction call: in testing
+        (2020–2026) no rule predicted the day&apos;s direction better than a coin flip. Day runs 5pm–5pm New York.
+      </p>
+      <div className="mt-2 grid gap-3 sm:grid-cols-2">
+        {plan.pairs.map((p) => <DailyPlanCard key={p.pair} p={p} />)}
+      </div>
+    </section>
+  );
+}
+
+function DailyPlanCard({ p }: { p: DailyPlan }) {
+  if (p.error || !p.expected_range_pips || p.price == null) {
+    return (
+      <div className="card p-3 text-sm">
+        <span className="font-mono">{p.pair}</span> <span className="text-zinc-400">— {p.error ?? "no data"}</span>
+      </div>
+    );
+  }
+  const [lo, hi] = p.expected_range_pips;
+  const used = p.today_range_pips ?? 0;
+  const pct = Math.min(100, Math.round((used / (p.atr_pips || 1)) * 100));
+  const d = priceDigits(p.pair);
+  return (
+    <div className="card p-3">
+      <div className="flex items-baseline justify-between">
+        <span className="font-mono text-sm font-semibold">{p.pair}</span>
+        <span className="num text-sm">{p.price.toFixed(d)}</span>
+      </div>
+      <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-300">
+        Typical day <span className="num font-medium">{p.atr_pips}</span> pips (usually {lo}–{hi})
+      </div>
+      <div className="mt-1 flex items-center gap-2">
+        <div className="h-1.5 flex-1 rounded bg-zinc-200 dark:bg-zinc-700">
+          <div
+            className={`h-1.5 rounded ${pct >= 100 ? "bg-amber-500" : "bg-sky-500"}`}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+        <span className="num text-xs text-zinc-500">
+          {p.today_range_pips == null ? "not started" : `${used} moved (${pct}%)`}
+        </span>
+      </div>
+      <table className="mt-2 w-full text-xs">
+        <tbody>
+          {(p.levels ?? []).map((lv) => (
+            <tr key={lv.name} className="border-t border-zinc-100 dark:border-zinc-800">
+              <td className="py-1 text-zinc-600 dark:text-zinc-300">{lv.name}</td>
+              <td className="num py-1 text-right">{lv.price.toFixed(d)}</td>
+              <td className={`num py-1 text-right ${lv.distance_pips >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                {lv.distance_pips >= 0 ? "+" : ""}{lv.distance_pips}p
+              </td>
+              <td className="py-1 pl-2 text-right text-zinc-400">{lv.touched_today ? "✓ hit today" : ""}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ScorecardSection({ score }: { score: ScorecardResponse }) {
+  const t = score.totals;
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+        Live results since {score.since}
+        <span className="font-normal text-zinc-500">
+          {" "}· {t.trades} closed{t.win_rate_pct != null ? `, ${t.win_rate_pct}% wins, ${t.avg_net_pct! >= 0 ? "+" : ""}${t.avg_net_pct}% avg per trade` : ""}, {t.open} open
+        </span>
+      </h2>
+      <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+        Every live signal scored against real prices, after spread. This is the real test of whether the system works —
+        judge a row only after ~30+ closed trades, and by average result, not win rate.
+      </p>
+      {score.rows.length === 0 ? (
+        <p className="mt-2 text-sm text-zinc-500">No live signals since {score.since} yet.</p>
+      ) : (
+        <div className="mt-2 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+          <table className="w-full text-left text-sm">
+            <thead className="table-head text-xs uppercase">
+              <tr>
+                <th className="px-3 py-2">Pair · TF</th>
+                <th className="px-3 py-2">Source</th>
+                <th className="px-3 py-2">Closed</th>
+                <th className="px-3 py-2">Open</th>
+                <th className="px-3 py-2">Wins</th>
+                <th className="px-3 py-2">Avg / trade</th>
+                <th className="px-3 py-2">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {score.rows.map((r) => (
+                <tr key={`${r.source}-${r.pair}-${r.interval}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                  <td className="px-3 py-2 font-mono">{r.pair} · {r.interval}</td>
+                  <td className="px-3 py-2 text-xs text-zinc-500">{r.source === "rl" ? "RL" : "Consensus"}</td>
+                  <td className="num px-3 py-2">{r.trades}</td>
+                  <td className="num px-3 py-2">{r.open}</td>
+                  <td className="num px-3 py-2">{r.win_rate_pct != null ? `${r.win_rate_pct}%` : "—"}</td>
+                  <td className={`num px-3 py-2 ${(r.avg_net_pct ?? 0) >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                    {r.avg_net_pct != null ? `${r.avg_net_pct >= 0 ? "+" : ""}${r.avg_net_pct.toFixed(3)}%` : "—"}
+                  </td>
+                  <td className="num px-3 py-2">{r.total_net_pct >= 0 ? "+" : ""}{r.total_net_pct.toFixed(3)}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 

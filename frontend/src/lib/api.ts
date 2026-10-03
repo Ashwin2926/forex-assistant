@@ -1,4 +1,4 @@
-import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, DailySignalsResponse, LiveDashboardResponse, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicyCoverageRow, RLSignal, RLTrainAllJob, RunAllFlowsJob, Signal } from "./types";
+import type { BacktestRebuildJob, BacktestRun, CandleCatchupJob, CandlePoint, ConsensusBacktestResult, ConsensusCheckResult, ConsensusSignal, DailyPlanResponse, DailySignalsResponse, LiveDashboardResponse, MLPrediction, MLTrainResult, PaperTrade, PaperTradeAccount, PaperTradeResult, PPOPolicy, PPOTrainDiagnostics, RLAccuracy, RLInsights, RLLearningCurve, RLMemorySummary, RLPolicyCoverageRow, RLSignal, RLTrainAllJob, RunAllFlowsJob, ScorecardResponse, Signal } from "./types";
 import { clearToken, getToken } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://forex-assistant.fastapicloud.dev";
@@ -232,6 +232,16 @@ export const api = {
   // get_live_dashboard in app/main.py.
   getLiveDashboard() {
     return request<LiveDashboardResponse>("/dashboard/live");
+  },
+
+  // Expected range + key levels per pair for today; no direction (see app/services/daily_plan.py).
+  getDailyPlan() {
+    return request<DailyPlanResponse>("/dashboard/daily-plan");
+  },
+
+  // Live signal results since `since` (YYYY-MM-DD), net of spread.
+  getScorecard(since?: string) {
+    return request<ScorecardResponse>(`/dashboard/scorecard${since ? `?since=${since}` : ""}`);
   },
 
   // Today's (or a given day's) full signal log per pair -- see the endpoint's own docstring.

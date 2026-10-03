@@ -26,10 +26,28 @@ dropped by the network between runs was reused and waited on indefinitely. `data
 sets `maxIdleTimeMS=60s`, `socketTimeoutMS=60s`, `connectTimeoutMS=10s`,
 `serverSelectionTimeoutMS=15s`.
 
-**Data bug found (not fixed yet): EUR/USD and GBP/USD 1day candles are broken before 2024**
-(open typically 30-40 pips from the previous close; intraday intervals and USD/JPY/AUD/USD daily
-are clean). Likely explains GBP/USD/1day's +2610% RL result. Fix planned: build 1day bars from
-1h, closing 17:00 New York, then retrain the 1day policies.
+**1day candles now built from 1h data (`app/services/daily_candles.py`).** The provider's daily
+feed was broken for EUR/USD and GBP/USD before 2024 (open typically 30-40 pips from the previous
+close; intraday intervals and USD/JPY/AUD/USD daily were clean) -- likely behind GBP/USD/1day's
++2610% RL result. Daily bars close at 17:00 New York (MT5 convention), stamped with their open
+time like every other interval; only finished days are kept. Rebuilt day-to-day gaps: median
+1-1.5 pips (was 30-40). Used everywhere: `load_archived_candles(..., "1day")` and both
+`load_full_candle_history*` derive from 1h, and `POST /ingest/1day` now rebuilds the stored 1day
+candles from 1h (deleting the old provider bars) instead of calling Twelve Data. History is now
+2020+ (where 1h starts), ~1,700 days per pair. 1day evals record `daily_candles_from_1h`;
+1day policies without it are treated as outdated (`policy_config_matches`) and paused from live
+signals (`live_exclusion_reason`) until retrained.
+
+**Dashboard: "Today's plan" and "Live results".** `GET /dashboard/daily-plan`
+(`app/services/daily_plan.py`): per pair, the typical daily range (14-day ATR, with 0.5-1.5x
+band), how much of it today has used, and yesterday's/last week's high and low with distance in
+pips -- the parts that tested reliable. No direction: the 2026-09-30 backtest found no rule
+calling daily direction better than a coin flip. `GET /dashboard/scorecard?since=`: live
+signals per source/pair/interval since go-live (2026-09-30) -- closed/open, win rate, average
+and total net % (outcome_pct_move is already net of spread).
+
+**5min long-training test:** dispatched all 4 pairs at 250k timesteps (vs 50k) to settle
+whether 5min can ever beat costs.
 
 ## 2026-09-30
 

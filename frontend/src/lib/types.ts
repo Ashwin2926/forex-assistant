@@ -652,3 +652,48 @@ export interface LiveDashboardResponse {
   combos: LiveComboStatus[];
   recent: LiveRecentResult[];
 }
+
+// GET /dashboard/daily-plan -- see app/services/daily_plan.py.
+export interface DailyPlanLevel {
+  name: string;
+  price: number;
+  // Signed: + = above the current price.
+  distance_pips: number;
+  touched_today: boolean;
+}
+
+export interface DailyPlan {
+  pair: string;
+  error?: string;
+  price?: number;
+  price_at?: string | null;
+  day_opened_at?: string;
+  atr_pips?: number;
+  expected_range_pips?: [number, number];
+  today_range_pips?: number | null;
+  levels?: DailyPlanLevel[];
+}
+
+export interface DailyPlanResponse {
+  generated_at: string;
+  pairs: DailyPlan[];
+}
+
+// GET /dashboard/scorecard
+export interface ScorecardRow {
+  source: "rl" | "consensus";
+  pair: string;
+  interval: string;
+  trades: number;
+  open: number;
+  wins: number;
+  win_rate_pct: number | null;
+  avg_net_pct: number | null;
+  total_net_pct: number;
+}
+
+export interface ScorecardResponse {
+  since: string;
+  rows: ScorecardRow[];
+  totals: { trades: number; wins: number; open: number; sum_pct: number; win_rate_pct: number | null; avg_net_pct: number | null };
+}

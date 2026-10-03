@@ -354,6 +354,7 @@ def _evaluate_policy(
         expectancy_pct=round(sum(all_pcts) / len(all_pcts), 4) if all_pcts else None,
         rule_stats=[], starting_balance=starting_balance, ending_balance=ending_balance,
         total_return_pct=total_return_pct,
+        daily_candles_from_1h=True if interval == "1day" else None,
     )
     return eval_run, trade_signals
 

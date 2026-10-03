@@ -220,6 +220,10 @@ class BacktestRun(BaseModel):
     starting_balance: Optional[float] = None
     ending_balance: Optional[float] = None
     total_return_pct: Optional[float] = None
+    # Set on RL 1day evals trained/evaluated on daily candles built from 1h data
+    # (app/services/daily_candles.py). 1day policies without it were trained on the provider's
+    # broken daily feed and are treated as outdated (rl_engine.policy_config_matches).
+    daily_candles_from_1h: Optional[bool] = None
 
 
 class MLCalibrationBucket(BaseModel):
