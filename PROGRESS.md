@@ -17,8 +17,14 @@ fired in these, so the event loop itself was blocked, not just the native worker
 - `_rl_state_from_candles` computed strategy votes for all ~500 bars and used only the last:
   ~2.8s of GIL-holding pure Python per call, starving the event loop. Now votes on the last
   `STATE_WINDOW_BARS + 1` rows (6ms; identical state, checked on 432 random windows).
-Still unverified: if freezes continue after this, the FastAPI Cloud memory graph / restart
-reasons for 10-01 00:38-00:47 and 10-03 01:44-01:58 UTC are the next thing to look at.
+Verified with a dispatched keep-fresh run (37094705849): 23 of 24 `/rl/signal` calls answered in
+~1s each (was 6-15s), but the FIRST call still hung to a 524 with no 503 -- and on 10-01 even
+DB-only `GET /ingest/due` had hung. That pattern (whichever request comes first after an idle
+gap, then all fast) points at the Mongo connection pool: `AsyncIOMotorClient` had pymongo's
+defaults (no socket timeout, idle connections kept forever), so a pooled connection silently
+dropped by the network between runs was reused and waited on indefinitely. `database.py` now
+sets `maxIdleTimeMS=60s`, `socketTimeoutMS=60s`, `connectTimeoutMS=10s`,
+`serverSelectionTimeoutMS=15s`.
 
 **Data bug found (not fixed yet): EUR/USD and GBP/USD 1day candles are broken before 2024**
 (open typically 30-40 pips from the previous close; intraday intervals and USD/JPY/AUD/USD daily

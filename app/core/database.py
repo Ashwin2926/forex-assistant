@@ -3,7 +3,20 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-client = AsyncIOMotorClient(settings.mongodb_uri)
+# Timeouts/idle limit added 2026-10-03. With pymongo's defaults (no socket timeout, idle pooled
+# connections kept forever) a pooled connection silently dropped by the network between
+# keep-fresh.yml runs (20+ min apart) was reused and the request waited on it indefinitely:
+# the first call of a run hung to the gateway's 524, even DB-only GET /ingest/due, then
+# everything after it was fast. maxIdleTimeMS retires idle connections before reuse;
+# socketTimeoutMS turns any remaining dead socket into an error (reads are retried once on a
+# fresh connection) instead of a hang. 60s is far above any single operation here.
+client = AsyncIOMotorClient(
+    settings.mongodb_uri,
+    maxIdleTimeMS=60_000,
+    socketTimeoutMS=60_000,
+    connectTimeoutMS=10_000,
+    serverSelectionTimeoutMS=15_000,
+)
 db = client[settings.mongodb_db_name]
 
 # Collections
