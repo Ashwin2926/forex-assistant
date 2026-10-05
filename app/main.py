@@ -111,11 +111,21 @@ NATIVE_CALL_TIMEOUT_S = 90
 
 
 async def _run_native(fn, *args, **kwargs):
+    global _NATIVE_EXECUTOR
     loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(_NATIVE_EXECUTOR, functools.partial(fn, *args, **kwargs))
+    executor = _NATIVE_EXECUTOR
+    future = loop.run_in_executor(executor, functools.partial(fn, *args, **kwargs))
     try:
         return await asyncio.wait_for(future, timeout=NATIVE_CALL_TIMEOUT_S)
     except asyncio.TimeoutError:
+        # The worker thread is stuck. Every later call would queue behind it and time out too
+        # (keep-fresh runs 10-03..10-05: whole runs of 503s after one stuck call), so abandon
+        # it and give the next call a fresh thread. The stuck thread can't be killed; it just
+        # stays parked until the process restarts.
+        if _NATIVE_EXECUTOR is executor:
+            print(f"[native] {getattr(fn, '__name__', fn)} stuck >{NATIVE_CALL_TIMEOUT_S}s -- replacing worker thread", flush=True)
+            _NATIVE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="native")
+            executor.shutdown(wait=False)  # calls already queued on it time out on their own
         raise HTTPException(
             status_code=503,
             detail=f"{getattr(fn, '__name__', 'native call')} took over {NATIVE_CALL_TIMEOUT_S}s "

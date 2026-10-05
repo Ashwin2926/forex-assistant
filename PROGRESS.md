@@ -4,6 +4,18 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-10-05
+
+**Weekend keep-fresh: 20 of 32 runs failed after the 10-03 fixes, mostly HTTP 503.** 503 is
+`_run_native`'s own 90s timeout: one native (torch/XGBoost/pandas) call hangs on the single
+worker thread and every later call queues behind it and times out too, often for a whole run
+or several -- the single-thread design from 09-30 turned one stuck call into an outage. Some
+524s (event loop blocked) and a few 500s too. `_run_native` now abandons a stuck worker thread
+and gives the next call a fresh one. Root cause of the hang itself still unknown -- needs the
+FastAPI Cloud logs (`[native] ... stuck` / `[rl/signal ...]` stage lines) for one failing window,
+e.g. 10-04 13:53-14:05 UTC. Candidate next step: run PPO inference in numpy (export the policy
+MLP's weights at training time) so live requests never touch torch.
+
 ## 2026-10-03
 
 **keep-fresh.yml failing 30 of 35 runs since 09-30 -- backend still freezing, two fixes.** Same
