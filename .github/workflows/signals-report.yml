@@ -1,0 +1,46 @@
+name: Signals report
+
+# Read-only table of recent live RL signals straight from MongoDB, bypassing the backend --
+# works even while FastAPI Cloud is hung (the debug-call.yml route goes through the API).
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "How many days back to list"
+        required: false
+        default: "7"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+      DAYS: ${{ inputs.days || '7' }}
+    steps:
+      - run: pip install --quiet pymongo
+      - name: List signals
+        shell: python
+        run: |
+          import os
+          from datetime import datetime, timedelta
+          from pymongo import MongoClient
+
+          db = MongoClient(os.environ["MONGODB_URI"], serverSelectionTimeoutMS=15000)[os.environ["MONGODB_DB_NAME"]]
+          since = datetime.utcnow() - timedelta(days=int(os.environ["DAYS"]))
+          query = {"source": {"$ne": "backtest"}, "$or": [{"timestamp": {"$gte": since}}, {"status": "pending"}]}
+          fields = {"_id": 0, "state": 0, "q_values": 0}
+          rows = list(db["rl_signals"].find(query, fields).sort("timestamp", -1))
+          print(f"{len(rows)} live RL signals since {since:%Y-%m-%d %H:%M} UTC (plus any still pending)")
+          print("| Signal time (UTC) | Pair | TF | Dir | Size | Entry | Stop | Target | Status | Outcome | Closed (UTC) | Memory |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+          for r in rows:
+              move = r.get("outcome_pct_move")
+              closed = r.get("outcome_timestamp")
+              print(
+                  f"| {r['timestamp']:%Y-%m-%d %H:%M} | {r['pair']} | {r['interval']} | {r['direction']} | {r.get('size_tier', '')} "
+                  f"| {r['entry_price']:.5g} | {r['stop_price']:.5g} | {r['target_price']:.5g} | {r.get('status')} "
+                  f"| {'' if move is None else f'{move:+.3f}%'} | {'' if closed is None else f'{closed:%Y-%m-%d %H:%M}'} "
+                  f"| {r.get('memory_override') or ''} |"
+              )
