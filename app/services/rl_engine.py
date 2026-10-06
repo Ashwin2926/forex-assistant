@@ -76,11 +76,12 @@ def live_exclusion_reason(eval_run: Optional[dict]) -> Optional[str]:
     ret = eval_run.get("total_return_pct")
     trades = eval_run.get("directional_signals") or 0
     hit = eval_run.get("hit_rate_pct")
+    start = eval_run.get("starting_balance") or DEFAULT_STARTING_BALANCE
     if trades < LIVE_MIN_TRADES:
         return f"Only {trades} trades on unseen test data (need {LIVE_MIN_TRADES}+) -- not enough evidence."
     if ret is None or ret <= LIVE_MIN_RETURN_PCT:
         return (
-            f"Lost money on unseen test data ({ret}% of a simulated $50 start over {trades} trades, "
+            f"Lost money on unseen test data ({ret}% of a simulated ${start:g} start over {trades} trades, "
             f"hit rate {hit}%) -- paused until a retrain is profitable."
         )
     return None
