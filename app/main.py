@@ -2121,6 +2121,16 @@ async def _create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_S
     policy = PPOPolicy(**{k: v for k, v in policy_doc.items() if k != "_id"})
     _stage("policy loaded")
 
+    # Excluded combos with nothing open can't produce a signal anyway -- answer before the
+    # heavy state computation below (most of keep-fresh's load, and what was hanging the
+    # backend into 524s). An open signal still goes the full path so it keeps being tracked.
+    early_eval_run = await backtest_runs_collection.find_one({"run_id": policy.eval_run_id})
+    early_excluded = live_exclusion_reason(early_eval_run)
+    if early_excluded is not None and not await rl_signals_collection.find_one(
+        {"pair": pair, "interval": interval, "status": "pending"}, {"_id": 1},
+    ):
+        return {"signal": None, "q_values": None, "excluded_reason": early_excluded}
+
     config = default_config_for(rl_config_profile(interval), pair)
     cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
     docs = await cursor.to_list(length=500)
