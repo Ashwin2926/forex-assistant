@@ -25,4 +25,5 @@ jobs:
     steps:
       - name: Call the path
         run: |
-          curl -s -X "${{ inputs.method }}" -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE${{ inputs.path }}" | python3 -m json.tool
+          curl -s -o body.txt -w 'HTTP %{http_code} in %{time_total}s\n' -X "${{ inputs.method }}" -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE${{ inputs.path }}"
+          python3 -m json.tool body.txt || head -c 2000 body.txt
