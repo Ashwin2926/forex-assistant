@@ -31,7 +31,7 @@ interface ActionableSignal {
 }
 
 export default function TradingSignalsPage() {
-  const [accountBalance, setAccountBalance] = useState(10000);
+  const [accountBalance, setAccountBalance] = useState(100);
   const [riskPercent, setRiskPercent] = useState(1);
   const [loading, setLoading] = useState(false);
   const [signals, setSignals] = useState<ActionableSignal[]>([]);

@@ -26,7 +26,7 @@ ACTIONS = ["HOLD", "BUY_SMALL", "BUY_LARGE", "SELL_SMALL", "SELL_LARGE", "EXIT"]
 # Starting guesses, not backtested -- same caveat as every other unvalidated constant in this
 # project (PROXIMITY_ATR_MULT, SMC_WICK_BODY_MULT, etc.).
 RISK_FRACTION_BY_TIER = {"SMALL": 0.01, "LARGE": 0.03}  # % of current balance risked
-DEFAULT_STARTING_BALANCE = 50.0
+DEFAULT_STARTING_BALANCE = 100.0  # system-wide account size for training and live signals
 MIN_VIABLE_BALANCE = 1.0  # below this, ruin -- can't size a real position, walk/episode ends
 RUIN_REWARD = -10.0  # large fixed penalty when a trade would wipe the balance out entirely
 
@@ -346,6 +346,16 @@ def policy_config_matches(eval_run: Optional[dict], interval: str, pair: str) ->
         and eval_run.get("stop_atr_mult") == stop
         and eval_run.get("max_lookforward") == rl_max_lookforward(interval)
     )
+
+
+def policy_balance_matches(eval_run: Optional[dict]) -> bool:
+    """
+    Whether a prior policy was evaluated at the current system-wide DEFAULT_STARTING_BALANCE.
+    Its weights are still a fine warm start (the balance feature is a log ratio, scale-free),
+    but a policy from an older balance shouldn't block its replacement -- a mismatch makes its
+    return a STALE_POLICY_BASELINE so the first retrain at the new balance always takes over.
+    """
+    return bool(eval_run) and eval_run.get("starting_balance") == DEFAULT_STARTING_BALANCE
 
 
 # How many rows of tail context each bar's strategy evaluation gets -- comfortably covers

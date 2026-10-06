@@ -96,7 +96,7 @@ export default function RLPage() {
   const [interval, setInterval_] = useState<string>("1h");
   const [totalTimesteps, setTotalTimesteps] = useState(50_000);
   const [trainFrac, setTrainFrac] = useState(0.7);
-  const [startingBalance, setStartingBalance] = useState(50);
+  const [startingBalance, setStartingBalance] = useState(100);
   // Advanced/optional -- override rl_engine.rl_atr_mults(interval, pair)'s configured
   // default for this one training run. Blank (the normal case) means "use the default";
   // both fields must be filled to send an override (see api.trainRLPolicy). Exists for
@@ -115,7 +115,7 @@ export default function RLPage() {
   const [coverageLoading, setCoverageLoading] = useState(true);
   const [coverageOpen, setCoverageOpen] = useState(true);
 
-  const [currentBalance, setCurrentBalance] = useState(50);
+  const [currentBalance, setCurrentBalance] = useState(100);
 
   const [recentSignals, setRecentSignals] = useState<RLSignal[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
@@ -413,7 +413,7 @@ export default function RLPage() {
           log-growth (the same objective the Kelly criterion is built on, which also naturally
           punishes oversized bets that risk ruin). One independent policy per pair{" "}
           <em>and</em> interval, trained on historical candle replay starting from a chosen
-          balance (default $50) — not live signal outcomes. Every trade still uses a fixed
+          balance (default $100) — not live signal outcomes. Every trade still uses a fixed
           1.5:1 target:stop ATR ratio regardless of size tier, so it can never risk more than
           it stands to gain. This project&apos;s RL agent was linear Q-learning before PPO
           replaced it — the very first PPO policy for each pair/interval started fresh, with

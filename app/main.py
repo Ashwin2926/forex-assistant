@@ -79,7 +79,7 @@ from app.services.rl_engine import (
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE, STATE_WINDOW_BARS,
     RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT, live_exclusion_reason,
     is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE, OpenPosition,
-    policy_config_matches,
+    policy_config_matches, policy_balance_matches,
 )
 from app.services.case_memory import (
     memory_summary, memory_gate, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
@@ -973,6 +973,11 @@ async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None,
         # Trained under different target/stop/lookforward settings -- live serving would
         # size its trades with geometry it never learned, so treat it like a stale policy.
         return None, None, STALE_POLICY_BASELINE
+    if not policy_balance_matches(eval_run):
+        # Trained at an older default balance: weights still usable, but always replace it.
+        if not is_usable_warm_start(eval_run):
+            return None, None, STALE_POLICY_BASELINE
+        return prev["policy_id"], prev["model_bytes"], STALE_POLICY_BASELINE
     if not is_usable_warm_start(eval_run):
         return None, None, 0.0
     return prev["policy_id"], prev["model_bytes"], eval_run.get("total_return_pct") or 0.0
@@ -1077,7 +1082,7 @@ async def train_rl(
     threshold, learning how to weight the same STRATEGIES instead of using a hand-picked
     REQUIRED_WEIGHT_FRACTION, AND how much to risk on each trade (2 size tiers, see
     rl_engine.RISK_FRACTION_BY_TIER) against a compounding account balance starting at
-    `starting_balance` (default $50). One independent policy per pair, not shared across
+    `starting_balance` (default $100). One independent policy per pair, not shared across
     pairs. Persists both the learned PPOPolicy and its test-slice evaluation (a real
     BacktestRun, profile="rl_ppo", including starting_balance/ending_balance/total_return_pct
     alongside the usual hit_rate/expectancy) so it's directly comparable to every other
@@ -1736,7 +1741,7 @@ async def get_live_dashboard(recent_hours: int = 24):
                     policy_state = "stale"
                 elif live_exclusion_reason(eval_run) is not None:
                     policy_state = "excluded"
-                elif not policy_config_matches(eval_run, interval, pair):
+                elif not policy_config_matches(eval_run, interval, pair) or not policy_balance_matches(eval_run):
                     policy_state = "outdated"  # still serves, but needs a retrain under current settings
                 else:
                     policy_state = "active"

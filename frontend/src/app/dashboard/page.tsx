@@ -10,7 +10,7 @@ import { DirectionBadge, StatusBadge } from "@/components/Badges";
 // Read-only page (GET /dashboard/live never generates signals), so refreshing often is cheap.
 // New signals come from keep-fresh.yml's cron as candles close.
 const REFRESH_MS = 60_000;
-const SETTINGS_KEY = "dashboard-sizing";
+const SETTINGS_KEY = "dashboard-sizing-v2"; // v2: default balance moved to $100
 // When the current settings went live (spread-aware stops, profitable-on-test-data gate) --
 // the scorecard counts live results from here.
 const GO_LIVE = "2026-09-30";
@@ -22,6 +22,15 @@ function lotSize(pair: string, entry: number, stop: number, riskUsd: number): nu
   if (stopDistance === 0) return 0;
   const usdPerUnit = pair === "USD/JPY" ? 1 / entry : 1;
   return riskUsd / (stopDistance * usdPerUnit) / 100_000;
+}
+
+const MIN_LOT = 0.01; // smallest MT5 position on the RoboForex Pro account
+
+// USD risked by a position of `lots` -- shows what the broker's minimum lot really risks
+// when the % risk sizing comes out smaller than it (common on a $100 account).
+function riskForLots(pair: string, entry: number, stop: number, lots: number): number {
+  const usdPerUnit = pair === "USD/JPY" ? 1 / entry : 1;
+  return lots * 100_000 * Math.abs(entry - stop) * usdPerUnit;
 }
 
 function priceDigits(pair: string): number {
@@ -60,7 +69,7 @@ export default function DashboardPage() {
   const [score, setScore] = useState<ScorecardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [balance, setBalance] = useState(10_000);
+  const [balance, setBalance] = useState(100);
   const [riskPct, setRiskPct] = useState(1);
 
   useEffect(() => {
@@ -175,6 +184,8 @@ export default function DashboardPage() {
                       const d = priceDigits(s.pair);
                       const verdict = entryVerdict(s);
                       const reward = riskUsd * (Math.abs(s.target_price - s.entry_price) / Math.abs(s.entry_price - s.stop_price || 1));
+                      const lots = lotSize(s.pair, s.entry_price, s.stop_price, riskUsd);
+                      const shownRisk = lots >= MIN_LOT ? riskUsd : riskForLots(s.pair, s.entry_price, s.stop_price, MIN_LOT);
                       return (
                         <tr key={`${s.source}-${s.signal_id}`} className="border-t border-zinc-100 dark:border-zinc-800">
                           <td className="px-3 py-2 font-mono">{s.pair} · {s.interval}</td>
@@ -186,11 +197,24 @@ export default function DashboardPage() {
                           </td>
                           <td className="num px-3 py-2">{s.target_price.toFixed(d)}</td>
                           <td className="num px-3 py-2">{s.stop_price.toFixed(d)}</td>
-                          <td className="num px-3 py-2">{lotSize(s.pair, s.entry_price, s.stop_price, riskUsd).toFixed(2)}</td>
+                          <td className="num px-3 py-2">
+                            {lots >= MIN_LOT ? (
+                              lots.toFixed(2)
+                            ) : (
+                              <span className="text-amber-600 dark:text-amber-400" title={`Your risk % sizes to ${lots.toFixed(3)} lots, below the ${MIN_LOT} minimum`}>
+                                {MIN_LOT.toFixed(2)}*
+                              </span>
+                            )}
+                          </td>
                           <td className="px-3 py-2 text-xs">
-                            <span className="text-rose-600 dark:text-rose-400">-${riskUsd.toFixed(0)}</span>
+                            <span className="text-rose-600 dark:text-rose-400">-${shownRisk.toFixed(2)}</span>
                             {" / "}
-                            <span className="text-emerald-600 dark:text-emerald-400">+${reward.toFixed(0)}</span>
+                            <span className="text-emerald-600 dark:text-emerald-400">+${(riskUsd > 0 ? (reward * shownRisk) / riskUsd : 0).toFixed(2)}</span>
+                            {lots < MIN_LOT && (
+                              <div className="text-amber-600 dark:text-amber-400">
+                                * min lot = {((shownRisk / balance) * 100).toFixed(1)}% of balance
+                              </div>
+                            )}
                           </td>
                           <td className="px-3 py-2 text-xs">{formatAge(s.age_minutes)}</td>
                           <td className="px-3 py-2 text-xs text-zinc-500">

@@ -45,7 +45,7 @@ from app.services.ml_features import is_current_smc_signal
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import (
     rl_config_profile, RL_FEATURE_NAMES, is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE,
-    policy_config_matches,
+    policy_config_matches, policy_balance_matches,
 )
 from app.services.signal_engine import default_config_for
 
@@ -56,7 +56,7 @@ DEFAULT_PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"]
 RL_INTERVALS = ["5min", "15min", "1h", "4h", "1day"]
 
 
-DEFAULT_STARTING_BALANCE = 50.0
+DEFAULT_STARTING_BALANCE = 100.0
 
 
 def pairs_list() -> list[str]:
@@ -79,6 +79,11 @@ def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, by
     eval_run = db["backtest_runs"].find_one({"run_id": prev.get("eval_run_id")})
     if not policy_config_matches(eval_run, interval, pair):
         return None, None, STALE_POLICY_BASELINE
+    if not policy_balance_matches(eval_run):
+        # Trained at an older default balance: weights still usable, but always replace it.
+        if not is_usable_warm_start(eval_run):
+            return None, None, STALE_POLICY_BASELINE
+        return prev["policy_id"], prev["model_bytes"], STALE_POLICY_BASELINE
     if not is_usable_warm_start(eval_run):
         return None, None, 0.0
     return prev["policy_id"], prev["model_bytes"], eval_run.get("total_return_pct") or 0.0
