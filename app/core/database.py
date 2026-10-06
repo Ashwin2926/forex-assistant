@@ -1,4 +1,7 @@
+import time
+
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import ConfigurationError
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -10,13 +13,31 @@ settings = get_settings()
 # everything after it was fast. maxIdleTimeMS retires idle connections before reuse;
 # socketTimeoutMS turns any remaining dead socket into an error (reads are retried once on a
 # fresh connection) instead of a hang. 60s is far above any single operation here.
-client = AsyncIOMotorClient(
-    settings.mongodb_uri,
-    maxIdleTimeMS=60_000,
-    socketTimeoutMS=60_000,
-    connectTimeoutMS=10_000,
-    serverSelectionTimeoutMS=15_000,
-)
+def _make_client() -> AsyncIOMotorClient:
+    return AsyncIOMotorClient(
+        settings.mongodb_uri,
+        maxIdleTimeMS=60_000,
+        socketTimeoutMS=60_000,
+        connectTimeoutMS=10_000,
+        serverSelectionTimeoutMS=15_000,
+    )
+
+
+# A mongodb+srv:// URI is DNS-resolved right here, at import. On 2026-10-06 a FastAPI Cloud
+# replica restarted while the platform's internal DNS was timing out, raised
+# ConfigurationError from this line, and the app never came up (every route 404) until
+# someone redeployed. Retry with backoff (~2.5 min total) so a transient DNS outage delays
+# startup instead of killing it.
+for _attempt in range(6):
+    try:
+        client = _make_client()
+        break
+    except ConfigurationError as e:
+        if _attempt == 5:
+            raise
+        _wait = 5 * 2 ** _attempt
+        print(f"MongoDB URI resolution failed ({e}); retrying in {_wait}s", flush=True)
+        time.sleep(_wait)
 db = client[settings.mongodb_db_name]
 
 # Collections
