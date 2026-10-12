@@ -301,15 +301,35 @@ async def cancel_candle_catchup_job(job_id: str):
     return CandleCatchupJob(**{k: v for k, v in doc.items() if k != "_id"})
 
 
-async def _rebuild_daily_candles(pair: str) -> str:
+# How much recent 1h history the routine (incremental) daily rebuild reads.
+DAILY_REBUILD_RECENT_DAYS = 14
+
+
+async def _rebuild_daily_candles(pair: str, full: bool = False) -> str:
     """
-    Replaces this pair's 1day candles in candles_collection with bars built from its full 1h
-    history (archive + Mongo) -- see app/services/daily_candles.py for why the provider's
-    daily feed isn't used. Upserts every finished day and deletes any 1day doc that isn't one
-    of them (the old provider bars, stamped at 00:00 UTC instead of the 17:00 New York open).
+    Rebuilds this pair's 1day candles in candles_collection from its 1h candles -- see
+    app/services/daily_candles.py for why the provider's daily feed isn't used.
+
+    full=True reads the pair's whole 1h history (archive + Mongo), upserts every finished day
+    and deletes any 1day doc that isn't one of them (the old provider bars, stamped at 00:00
+    UTC instead of the 17:00 New York open) -- a one-off migration. The routine call only
+    reads the last DAILY_REBUILD_RECENT_DAYS of 1h bars and upserts those days: the full
+    version took ~2 min for 4 pairs, timed out keep-fresh's /ingest/1day call, kept running
+    server-side and failed every consensus/ML call queued behind it (2026-10-12) -- and since
+    the timed-out ingest was never recorded as done, every run repeated it.
     """
-    hourly = pd.DataFrame(await load_full_candle_history(pair, "1h"))
-    daily = await _run_native(daily_from_hourly, hourly)
+    if full:
+        hourly = pd.DataFrame(await load_full_candle_history(pair, "1h"))
+    else:
+        since = datetime.utcnow() - timedelta(days=DAILY_REBUILD_RECENT_DAYS)
+        hourly = pd.DataFrame(await candles_collection.find(
+            {"pair": pair, "interval": "1h", "timestamp": {"$gte": since}}, {"_id": 0},
+        ).sort("timestamp", 1).to_list(length=None))
+    daily = await _run_native(daily_from_hourly, hourly) if not hourly.empty else pd.DataFrame()
+    if not full and not daily.empty:
+        # The window's first day may start mid-session -- only upsert days whose open bar
+        # is inside the window, so a partial rebuild can't overwrite a complete stored day.
+        daily = daily[daily["timestamp"] >= hourly["timestamp"].min()]
     if daily.empty:
         return "no 1h history to build from"
     ops = [
@@ -323,6 +343,8 @@ async def _rebuild_daily_candles(pair: str) -> str:
     ]
     await candles_collection.bulk_write(ops, ordered=False)
     keep = [t.to_pydatetime() for t in daily["timestamp"]]
+    if not full:
+        return f"{len(ops)} recent daily candles rebuilt from 1h (latest opens {keep[-1]:%Y-%m-%d %H:%M} UTC)"
     removed = await candles_collection.delete_many(
         {"pair": pair, "interval": "1day", "timestamp": {"$nin": keep}}
     )
@@ -330,11 +352,13 @@ async def _rebuild_daily_candles(pair: str) -> str:
 
 
 @app.post("/ingest/{interval}")
-async def ingest(interval: str, output_size: int = 300):
+async def ingest(interval: str, output_size: int = 300, full_rebuild: bool = False):
     """
     Pull latest candles for all configured pairs at the given interval.
     interval: '5min', '15min', '1h', '4h', '1day'
     output_size: candles to fetch per pair (Twelve Data allows up to 5000 on the free tier).
+    full_rebuild (1day only): rebuild every daily bar from the whole 1h history instead of
+    just the last couple of weeks -- slow, see _rebuild_daily_candles.
     Backtest optimization (train/test split) needs more history than a single live signal
     does — raise this when you want a meaningful split, e.g. ?output_size=2000.
 
@@ -350,7 +374,7 @@ async def ingest(interval: str, output_size: int = 300):
         if interval == "1day":
             # Built from the stored 1h candles, not fetched -- see app/services/daily_candles.py.
             try:
-                results[pair] = await _rebuild_daily_candles(pair)
+                results[pair] = await _rebuild_daily_candles(pair, full=full_rebuild)
             except Exception as e:
                 results[pair] = f"error: {e}"
             continue
