@@ -12,8 +12,9 @@ entry to the recorded close and checks:
   - target touched before an early exit      -> should have been a full target hit
   - a candle touching both levels            -> resolved as a miss by label_outcome's
     conservative rule; the 1h candles inside it say which really came first
-Candles may have changed since scoring (e.g. the 2026-10-14 daily-candle de-dup), so a
-mismatch on an older 1day signal can be the candle data, not the scorer.
+Candles may have changed since scoring: 1day signals opened before the 2026-10-03 switch to
+1h-built daily bars were scored on the old 00:00 UTC provider bars, which no longer exist
+(2026-10-14 de-dup), so their replays use differently-aligned bars and are approximate.
 """
 import os
 from collections import Counter
@@ -73,8 +74,12 @@ def main():
         end = s.get("outcome_timestamp")
         check = "-"
         if end is not None:
+            # label_outcome stamps a target/stop close with the bar that touched it, so that bar
+            # counts. An early exit or expiry is stamped with the bar that was still forming at
+            # decision time -- its final high/low partly happened AFTER the exit, so stop there.
+            upper = {"$lte": end} if how in ("target reached", "stop reached") else {"$lt": end}
             candles = list(db["candles"].find(
-                {"pair": s["pair"], "interval": s["interval"], "timestamp": {"$gt": s["timestamp"], "$lte": end}},
+                {"pair": s["pair"], "interval": s["interval"], "timestamp": {"$gt": s["timestamp"], **upper}},
                 sort=[("timestamp", 1)],
             ))
             problems = []
