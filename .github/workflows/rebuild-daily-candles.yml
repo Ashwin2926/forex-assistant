@@ -1,0 +1,38 @@
+name: Rebuild daily candles from 1h
+
+# Manual only. Rebuilds every stored 1day candle from the full 1h history (archive + Mongo)
+# and deletes stored 1day docs that aren't one of them -- e.g. provider bars stamped 00:00 UTC
+# that the old candle catch-up wrote next to the 17:00-New-York bars. See
+# scripts/rebuild_daily_candles.py. Runs here, not via POST /ingest/1day?full_rebuild=true,
+# because that read all 1h history inside FastAPI Cloud and timed out (2026-10-12).
+# Run with confirm=false first and read the report.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'true' to apply. Anything else is a dry run that only reports."
+        required: false
+        default: "false"
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+      FOREX_PAIRS: ${{ secrets.FOREX_PAIRS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install pymongo==4.9.1 pandas==2.2.3 pyarrow==17.0.0
+      - name: Rebuild
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          args=()
+          if [ "$CONFIRM" = "true" ]; then args+=(--confirm); fi
+          python scripts/rebuild_daily_candles.py "${args[@]}"

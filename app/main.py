@@ -182,7 +182,15 @@ async def _run_candle_catchup_job(job_id: str) -> None:
         if doc is None:
             return  # cancelled (or otherwise no longer running) -- stop here
         try:
-            outcome = await catch_up_batch(pair, interval)
+            if interval == "1day":
+                # Daily bars are built from 1h, never fetched (see daily_candles.py) -- fetching
+                # here wrote provider bars stamped 00:00 UTC alongside the 17:00-NY ones, so
+                # every day was stored twice (found 2026-10-14 after a catch-up on 10-12).
+                # RL_INTERVALS lists 1h before 1day, so the 1h bars this builds from are
+                # already caught up by this point in the loop.
+                outcome = {"rebuilt": await _rebuild_daily_candles(pair)}
+            else:
+                outcome = await catch_up_batch(pair, interval)
             results.append({"pair": pair, "interval": interval, "ok": True, **outcome})
         except Exception as e:
             results.append({"pair": pair, "interval": interval, "ok": False, "error": str(e)})
@@ -404,6 +412,14 @@ async def ingest_backfill(interval: str, start_date: str = "2010-01-01", max_cal
     progress is just "the earliest candle already stored" (see backfill_batch), so call this
     repeatedly (.github/workflows/backfill-history.yml does) until every pair's "done" is true.
     """
+    if interval == "1day":
+        # Same reason as _run_candle_catchup_job's 1day branch: provider daily bars would be
+        # stored next to the 1h-built ones. Deep daily history comes from backfilling 1h.
+        raise HTTPException(
+            status_code=400,
+            detail="1day candles are built from 1h (see daily_candles.py) -- backfill 1h instead, "
+                   "then POST /ingest/1day?full_rebuild=true.",
+        )
     results = {}
     for i, pair in enumerate(settings.pairs_list):
         if i > 0:
