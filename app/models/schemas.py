@@ -224,6 +224,9 @@ class BacktestRun(BaseModel):
     # (app/services/daily_candles.py). 1day policies without it were trained on the provider's
     # broken daily feed and are treated as outdated (rl_engine.policy_config_matches).
     daily_candles_from_1h: Optional[bool] = None
+    # Set on RL evals run under the no-early-exit rule (2026-10-14: trades end only at target,
+    # stop or expiry). Policies without it are outdated (rl_engine.policy_exit_rule_matches).
+    no_early_exit: Optional[bool] = None
 
 
 class MLCalibrationBucket(BaseModel):

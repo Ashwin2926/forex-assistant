@@ -78,8 +78,8 @@ from app.services.rl_engine import (
     compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE, STATE_WINDOW_BARS,
     RISK_FRACTION_BY_TIER, RL_FEATURE_NAMES, STRONG_LOSS_RETURN_PCT, live_exclusion_reason,
-    is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE, OpenPosition,
-    policy_config_matches, policy_balance_matches,
+    is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE,
+    policy_config_matches, policy_balance_matches, policy_exit_rule_matches,
 )
 from app.services.case_memory import (
     memory_summary, memory_gate, nearest_cases, explain_divergence, find_diverging_neighbor, RESOLVED_STATUSES,
@@ -1013,8 +1013,9 @@ async def _find_warm_start_policy(pair: str, interval: str) -> tuple[str | None,
         # Trained under different target/stop/lookforward settings -- live serving would
         # size its trades with geometry it never learned, so treat it like a stale policy.
         return None, None, STALE_POLICY_BASELINE
-    if not policy_balance_matches(eval_run):
-        # Trained at an older default balance: weights still usable, but always replace it.
+    if not policy_balance_matches(eval_run) or not policy_exit_rule_matches(eval_run):
+        # Trained at an older default balance or under the old early-exit rule: weights
+        # still usable, but always replace it.
         if not is_usable_warm_start(eval_run):
             return None, None, STALE_POLICY_BASELINE
         return prev["policy_id"], prev["model_bytes"], STALE_POLICY_BASELINE
@@ -1781,7 +1782,8 @@ async def get_live_dashboard(recent_hours: int = 24):
                     policy_state = "stale"
                 elif live_exclusion_reason(eval_run) is not None:
                     policy_state = "excluded"
-                elif not policy_config_matches(eval_run, interval, pair) or not policy_balance_matches(eval_run):
+                elif not policy_config_matches(eval_run, interval, pair) or not policy_balance_matches(eval_run) \
+                        or not policy_exit_rule_matches(eval_run):
                     policy_state = "outdated"  # still serves, but needs a retrain under current settings
                 else:
                     policy_state = "active"
@@ -2125,18 +2127,16 @@ async def _create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_S
     endpoint first checks whether it has genuinely resolved against real candles
     (resolve_rl_signal_real_outcome -- the hard target/stop/expiry backstop, unchanged); if
     so, that real outcome is recorded and a fresh decision proceeds below as normal. If it's
-    still open per that check, the agent gets one more say: fresh position-context state is
-    built (bars held, unrealized P&L, ATR distance to each backstop -- see
-    rl_engine.OpenPosition/position_features) and passed to choose_action_ppo again. An EXIT
-    action closes the trade early right there (status hit/miss by the sign of the realized
-    move, closed_early=True) and a fresh decision proceeds below; anything else and the
-    still-open pending signal is simply returned as-is. This replaced an earlier design that
+    still open, it is returned as-is -- the agent can NOT close it early (no learned EXIT
+    since 2026-10-14); it closes only at target, stop, or expiry after the policy's own
+    max_lookforward bars (marked "expired" at the current close), matching training. This
+    replaced an earlier design that
     re-evaluated on every call and marked the old signal "superseded" the moment a new
     decision disagreed with it (including trivial cases like entry_price ticking a fraction on
     a moving price) -- that meant live inference was re-deciding far more often than the
     policy was ever trained to, which is what actually drove the high supersede rate GET
-    /rl/accuracy showed, not policy quality. Waiting for genuine resolution (or a deliberate
-    learned EXIT) instead keeps live behavior consistent with training.
+    /rl/accuracy showed, not policy quality. Waiting for genuine resolution (target, stop or
+    expiry) instead keeps live behavior consistent with training.
 
     pair: query param (e.g. ?pair=EUR/USD) — a path param would break on the literal '/'.
     """
@@ -2207,53 +2207,18 @@ async def _create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_S
             await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": real_outcome})
             pending = None
         else:
-            # Still open per the hard target/stop/expiry backstop -- give the agent a chance
-            # to exit early anyway (the learned-exit architecture, see rl_engine.OpenPosition).
-            # Position context is reconstructed from the pending signal's own stored fields
-            # rather than a separate persisted collection; atr_val is recomputed fresh off the
-            # latest candles (close enough bar-to-bar, and avoids a new field purely for this).
-            # max_lookforward here is policy.max_lookforward -- what this policy's own training
-            # run used for position_bars_held_frac (rl_engine.LOOKFORWARD_BY_INTERVAL at the
-            # time, 20 for every policy trained before that existed), NOT
-            # LIVE_MAX_LOOKFORWARD_BY_INTERVAL, which is a live-only window for the real-candle
-            # backstop check above and would otherwise feed the agent a bars-held fraction it
-            # never saw in training.
-            atr_val = float(compute_atr_series(df, config.atr_period).iloc[-1])
+            # Still open per the hard target/stop/expiry backstop. The agent can't close it
+            # early (EXIT is a no-op while a position is open since 2026-10-14 -- early exits
+            # were banking ~+0.2% "hits" against ~0.6% targets); the trade rides to target,
+            # stop, or the policy's own max_lookforward expiry, the same rule training and
+            # evaluation use (ppo_engine.ForexTradingEnv / _evaluate_policy's "expired").
+            # max_lookforward here is policy.max_lookforward, NOT LIVE_MAX_LOOKFORWARD_BY_
+            # INTERVAL (the longer live-only window resolve_rl_signal_real_outcome checks).
             bars_held = await candles_collection.count_documents({
                 "pair": pair, "interval": interval,
                 "timestamp": {"$gt": pending["timestamp"], "$lte": latest_timestamp},
             })
-            if bars_held == 0:
-                # No new candle since entry -- this call landed on the same bar the trade
-                # opened on (keep-fresh.yml re-checks 4h/1day many times per bar). The
-                # training env only ever consults EXIT from the bar AFTER entry, so letting
-                # the agent exit here was out-of-distribution, and it did so constantly
-                # (confirmed live 2026-09-28: EUR/USD/1day opened and "closed early" 4x on the
-                # same 09-26 candle, each a ~-0.01% spread-only "miss" polluting accuracy).
-                pending["_id"] = str(pending["_id"])
-                return {"signal": pending, "q_values": pending.get("q_values"), "memory": None}
-            position = OpenPosition(
-                direction=pending["direction"], tier=pending["size_tier"], entry_price=pending["entry_price"],
-                target_price=pending["target_price"], stop_price=pending["stop_price"], atr_val=atr_val,
-                units=pending["position_size_units"], entry_balance=pending["balance_at_signal"], pair=pair,
-                bars_held=bars_held,
-            )
-            exit_state = full_rl_state(
-                market_state, balance, policy.starting_balance, position, current_price, policy.max_lookforward,
-            )
-            # Training closes a position at market once it has been open max_lookforward bars
-            # (ForexTradingEnv.step / _evaluate_policy's "expired") -- do the same live, rather
-            # than holding for the much longer LIVE_MAX_LOOKFORWARD_BY_INTERVAL window with a
-            # bars_held_frac pinned at 1.0 the policy never saw past.
-            timed_out = bars_held >= policy.max_lookforward
-            exit_action = "EXIT"
-            if not timed_out:
-                try:
-                    exit_action, _exit_q_values = await _run_native(choose_action_ppo, policy, exit_state)
-                except ValueError as e:
-                    raise HTTPException(status_code=400, detail=str(e))
-
-            if exit_action != "EXIT":
+            if bars_held < policy.max_lookforward:
                 # Still holding -- don't re-decide a new trade, just hand back the live view.
                 pending["_id"] = str(pending["_id"])
                 return {"signal": pending, "q_values": pending.get("q_values"), "memory": None}
@@ -2263,12 +2228,12 @@ async def _create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_S
                 pct_move = -pct_move
             pct_move -= spread_cost_pct(pair, pending["entry_price"])
             await rl_signals_collection.update_one({"_id": pending["_id"]}, {"$set": {
-                "status": "expired" if timed_out else ("hit" if pct_move >= 0 else "miss"),
+                "status": "expired",
                 "outcome_price": round(current_price, 5),
                 "outcome_timestamp": latest_timestamp,
                 "outcome_pct_move": round(pct_move, 5),
                 "candles_to_outcome": bars_held,
-                "closed_early": not timed_out,
+                "closed_early": False,
             }})
             pending = None
             # Falls through to decide a fresh signal below, same as a hard-backstop resolution.

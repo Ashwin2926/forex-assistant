@@ -53,9 +53,10 @@ class ForexTradingEnv(gym.Env):
     via rl_engine._open_position and HOLD/EXIT are both no-ops; while a position is open,
     every bar first checks the hard target/stop backstop (rl_engine._check_bar_backstop) and
     max_lookforward expiry, closing via rl_engine._close_position if either trips, and
-    otherwise reads the agent's own action -- EXIT closes early at that bar's close, anything
-    else (including a BUY/SELL, since only one position is held at a time) counts as staying
-    in the trade. Reward is 0 on every bar that doesn't close a position and the real
+    otherwise stays in the trade whatever the agent picks. EXIT no longer closes early
+    (2026-10-14): live early exits were banking ~+0.2% wins against ~0.6% targets, so a trade
+    now ends only at target, stop or max_lookforward expiry; EXIT stays in rl.ACTIONS only so
+    saved policies keep their 6-action shape, and is just another no-op. Reward is 0 on every bar that doesn't close a position and the real
     log-balance-growth reward (unchanged formula, see _close_position) on the bar that does --
     a real change from the old one-decision-one-reward shape, since a trade can now span many
     bars before either the agent or a hard backstop ends it.
@@ -140,7 +141,7 @@ class ForexTradingEnv(gym.Env):
                 _status, outcome_price = backstop
                 reward, self._balance = rl._close_position(self._position, outcome_price, self._balance)
                 self._position = None
-            elif self._position.bars_held >= self.max_lookforward or action == "EXIT":
+            elif self._position.bars_held >= self.max_lookforward:
                 outcome_price = float(candle["close"])
                 reward, self._balance = rl._close_position(self._position, outcome_price, self._balance)
                 self._position = None
@@ -245,12 +246,9 @@ def _evaluate_policy(
     a given observation (flat: no position open -- see select_action) -- the only thing that differs between callers.
 
     Bar-by-bar walk mirroring ForexTradingEnv.step's own mechanics (see its docstring): once a
-    position opens, action_fn is re-consulted every subsequent bar it survives, so an EXIT can
-    end it early instead of always riding to target/stop/expiry. A closed-early trade counts
-    toward hit_rate_pct by the sign of its realized pct_move -- usually a win taken early, per
-    the same reasoning app/models/schemas.py's RLSignal.closed_early docstring uses for the
-    live dashboard's own accounting -- rather than being excluded from the denominator the way
-    a "superseded" trade is.
+    position opens it rides to target, stop or max_lookforward expiry -- EXIT is ignored while
+    a position is open (no early exits since 2026-10-14), so a "hit" always means the target
+    was actually reached.
     """
     hold_count = 0
     hits = misses = expired = 0
@@ -264,14 +262,13 @@ def _evaluate_policy(
     entry_i: Optional[int] = None
     i = test_start
     while i <= test_last:
-        current_price = float(df.loc[i, "close"]) if position is not None else None
-        obs = np.asarray(
-            rl.full_rl_state(market_states[i], balance, starting_balance, position, current_price, max_lookforward),
-            dtype=np.float32,
-        )
-        action = action_fn(obs, position is None)
-
         if position is None:
+            # The policy is only consulted while flat -- an open position can't be exited early.
+            obs = np.asarray(
+                rl.full_rl_state(market_states[i], balance, starting_balance, None, None, max_lookforward),
+                dtype=np.float32,
+            )
+            action = action_fn(obs, True)
             if action in ("HOLD", "EXIT"):
                 hold_count += 1
                 i += 1
@@ -284,13 +281,10 @@ def _evaluate_policy(
         candle = df.loc[i]
         position.bars_held += 1
         backstop = rl._check_bar_backstop(candle, position.direction, position.target_price, position.stop_price)
-        closed_early = False
         if backstop is not None:
             status, outcome_price = backstop
         elif position.bars_held >= max_lookforward:
             status, outcome_price = "expired", float(candle["close"])
-        elif action == "EXIT":
-            status, outcome_price, closed_early = None, float(candle["close"]), True
         else:
             i += 1
             continue  # still open, reward/outcome not yet determined
@@ -303,9 +297,6 @@ def _evaluate_policy(
         if direction == "SELL":
             pct_move = -pct_move
         pct_move -= spread_cost_pct(pair, entry_price)
-
-        if closed_early:
-            status = "hit" if pct_move >= 0 else "miss"
 
         units, target_price, stop_price = position.units, position.target_price, position.stop_price
         balance_before = balance
@@ -355,6 +346,7 @@ def _evaluate_policy(
         rule_stats=[], starting_balance=starting_balance, ending_balance=ending_balance,
         total_return_pct=total_return_pct,
         daily_candles_from_1h=True if interval == "1day" else None,
+        no_early_exit=True,
     )
     return eval_run, trade_signals
 

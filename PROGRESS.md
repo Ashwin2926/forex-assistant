@@ -6,6 +6,14 @@ Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README
 
 ## 2026-10-14
 
+**No more early exits.** The outcome audit (`audit-signal-outcomes.yml`) found only 3 of 19
+live "hits" actually reached the target -- 16 were the agent's learned EXIT banking ~+0.2%
+against ~0.6% targets. EXIT is now a no-op while a position is open in live `POST
+/rl/signal`, `ForexTradingEnv.step` and `_evaluate_policy`: a trade ends only at target,
+stop, or the policy's max_lookforward expiry (marked `expired`). New evals carry
+`no_early_exit=True`; older policies show as outdated and the next Train all replaces them
+(`rl_engine.policy_exit_rule_matches`).
+
 **Daily candles de-duplicated.** Daily bars have been built from 1h (17:00 New York open) since
 10-03, but the manual candle catch-up (`POST /ingest/catch-up`) still fetched the provider's
 daily feed (00:00 UTC) -- after a catch-up on 10-12 every recent day was stored twice, plus

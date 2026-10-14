@@ -17,9 +17,9 @@ from app.services.ml_model import fit_hit_classifier
 # project's real, limited candle history, PPO included.
 #
 # EXIT (added for the learned-exit architecture, see PROGRESS.md) is a no-op when flat --
-# only meaningful once a position is open, where it lets the agent close out earlier than
-# the fixed target/stop backstops instead of always riding a trade to one of those two
-# outcomes or expiry. See _check_bar_backstop/_open_position/_close_position below for the
+# originally let the agent close an open position early. Since 2026-10-14 it is a no-op
+# everywhere (trades ride to target/stop/expiry -- early exits were banking tiny wins); kept
+# in the action list so saved policies keep their 6-action output shape. See _check_bar_backstop/_open_position/_close_position below for the
 # per-bar mechanics this enables, replacing the old one-shot _take_action_sized.
 ACTIONS = ["HOLD", "BUY_SMALL", "BUY_LARGE", "SELL_SMALL", "SELL_LARGE", "EXIT"]
 
@@ -357,6 +357,17 @@ def policy_balance_matches(eval_run: Optional[dict]) -> bool:
     return a STALE_POLICY_BASELINE so the first retrain at the new balance always takes over.
     """
     return bool(eval_run) and eval_run.get("starting_balance") == DEFAULT_STARTING_BALANCE
+
+
+def policy_exit_rule_matches(eval_run: Optional[dict]) -> bool:
+    """
+    Whether a prior policy was evaluated under the current no-early-exit rule (2026-10-14:
+    EXIT is ignored while a position is open; trades end only at target, stop or expiry --
+    see ppo_engine.ForexTradingEnv). Older evals let EXIT bank small early wins, so their
+    returns aren't comparable; treated like policy_balance_matches -- weights stay a usable
+    warm start, but the first retrain under the new rule always takes over.
+    """
+    return bool(eval_run) and bool(eval_run.get("no_early_exit"))
 
 
 # How many rows of tail context each bar's strategy evaluation gets -- comfortably covers

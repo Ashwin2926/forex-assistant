@@ -45,7 +45,7 @@ from app.services.ml_features import is_current_smc_signal
 from app.services.ppo_engine import train_ppo_policy
 from app.services.rl_engine import (
     rl_config_profile, RL_FEATURE_NAMES, is_usable_warm_start, should_keep_new_policy, STALE_POLICY_BASELINE,
-    policy_config_matches, policy_balance_matches,
+    policy_config_matches, policy_balance_matches, policy_exit_rule_matches,
 )
 from app.services.signal_engine import default_config_for
 
@@ -79,8 +79,9 @@ def find_warm_start_policy(db, pair: str, interval: str) -> tuple[str | None, by
     eval_run = db["backtest_runs"].find_one({"run_id": prev.get("eval_run_id")})
     if not policy_config_matches(eval_run, interval, pair):
         return None, None, STALE_POLICY_BASELINE
-    if not policy_balance_matches(eval_run):
-        # Trained at an older default balance: weights still usable, but always replace it.
+    if not policy_balance_matches(eval_run) or not policy_exit_rule_matches(eval_run):
+        # Trained at an older default balance or under the old early-exit rule: weights
+        # still usable, but always replace it.
         if not is_usable_warm_start(eval_run):
             return None, None, STALE_POLICY_BASELINE
         return prev["policy_id"], prev["model_bytes"], STALE_POLICY_BASELINE
