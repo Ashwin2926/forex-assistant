@@ -143,6 +143,26 @@ jobs:
       API_BASE: https://forex-assistant.fastapicloud.dev
       AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
     steps:
+      # Safety net for the RL page's progress record: each matrix job reports its own combo
+      # and the last one to report marks the job done (scripts/train_rl.py), but a matrix
+      # job that crashes or times out never reports, which would leave it "running" forever.
+      - name: Finalize train-all job record
+        if: inputs.job_id != ''
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          pip install --quiet pymongo==4.9.1
+          python3 -c "
+          import os
+          from datetime import datetime
+          from pymongo import MongoClient
+          jobs = MongoClient(os.environ['MONGODB_URI'])[os.environ['MONGODB_DB_NAME']]['rl_train_jobs']
+          r = jobs.update_one({'job_id': os.environ['JOB_ID'], 'status': 'running'},
+                              {'\$set': {'status': 'done', 'finished_at': datetime.utcnow()}})
+          doc = jobs.find_one({'job_id': os.environ['JOB_ID']}, {'status': 1, 'completed': 1, 'total': 1})
+          print('finalized now' if r.modified_count else 'already finished', doc)"
       - name: Prune RL history
         run: |
           curl -sf -X POST -H "X-Service-Token: $AUTOMATION_TOKEN" "$API_BASE/rl/prune-history?confirm=true"

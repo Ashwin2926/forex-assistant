@@ -185,9 +185,14 @@ def main():
     exit_code = 0
     for pair, interval in combos:
         if job_id:
+            # Only an explicit cancel stops us. train-rl.yml runs one combo per matrix job, all
+            # reporting into the same job doc, so "done" here can't mean "skip": it used to,
+            # when the first matrix job to finish marked the whole job done (2026-10-14: the RL
+            # page showed 1 of 20 results, and a matrix job queued behind it would have
+            # silently skipped training).
             job_doc = db["rl_train_jobs"].find_one({"job_id": job_id}, {"status": 1})
-            if not job_doc or job_doc.get("status") != "running":
-                print(f"Job {job_id} is no longer running (cancelled) -- stopping before {pair}/{interval}.")
+            if job_doc and job_doc.get("status") == "cancelled":
+                print(f"Job {job_id} was cancelled -- stopping before {pair}/{interval}.")
                 break
         print(f"Training {pair}/{interval}...")
         try:
@@ -214,13 +219,15 @@ def main():
             print(f"  FAILED: {e}")
         if job_id:
             db["rl_train_jobs"].update_one(
-                {"job_id": job_id, "status": "running"},
+                {"job_id": job_id, "status": {"$ne": "cancelled"}},
                 {"$push": {"results": cell}, "$inc": {"completed": 1}},
             )
 
     if job_id:
+        # Done only once every combo -- across all parallel matrix jobs -- has reported. If a
+        # matrix job dies without reporting, train-rl.yml's prune job finalizes the doc.
         db["rl_train_jobs"].update_one(
-            {"job_id": job_id, "status": "running"},
+            {"job_id": job_id, "status": "running", "$expr": {"$gte": ["$completed", "$total"]}},
             {"$set": {"status": "done", "finished_at": datetime.utcnow()}},
         )
 

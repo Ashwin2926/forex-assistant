@@ -1,0 +1,34 @@
+name: Repair train-all job record
+
+# Manual only. Rebuilds a Train-all job's per-combo results on the RL page from what training
+# actually wrote -- see scripts/repair_train_job.py. Dry run unless confirm=true.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "rl_train_jobs job id (blank = most recent job)"
+        required: false
+      confirm:
+        description: "Type 'true' to write. Anything else is a dry run."
+        required: false
+        default: "false"
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet pymongo==4.9.1
+      - name: Repair
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          args=()
+          if [ -n "$JOB_ID" ]; then args+=(--job-id "$JOB_ID"); fi
+          if [ "$CONFIRM" = "true" ]; then args+=(--confirm); fi
+          python scripts/repair_train_job.py "${args[@]}"
