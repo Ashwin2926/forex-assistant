@@ -4,6 +4,20 @@ Running log of infrastructure/backend/frontend work on this project, most recent
 Ruleset tuning history (backtest sweeps, per-pair overrides) lives in the README and
 `signal_engine.py` instead — this file is for deploys, bugs, and ops.
 
+## 2026-10-14
+
+**Daily candles de-duplicated.** Daily bars have been built from 1h (17:00 New York open) since
+10-03, but the manual candle catch-up (`POST /ingest/catch-up`) still fetched the provider's
+daily feed (00:00 UTC) -- after a catch-up on 10-12 every recent day was stored twice, plus
+provider weekend bars, roughly doubling the bar count live 1day signals see (30-bar expiries
+firing ~2x early) and letting one move be scored against two overlapping bars. Also found:
+the 10-12 `full_rebuild` had written every 1h-built bar but never reached its delete step, so
+4,999 old provider bars per pair (2007-2026) were still in Mongo. Fixed: catch-up rebuilds 1day
+from 1h, `/ingest/backfill/1day` is refused, and new `rebuild-daily-candles.yml`
+(`scripts/rebuild_daily_candles.py`, dry run by default) does the full rebuild on a runner
+instead of the server. Applied: 4,999 deleted per pair, ~1,722 1h-built bars kept (2020-on);
+the old provider history is still in `data/candles/*_1day.parquet`.
+
 ## 2026-10-05
 
 **Weekend keep-fresh: 20 of 32 runs failed after the 10-03 fixes, mostly HTTP 503.** 503 is
