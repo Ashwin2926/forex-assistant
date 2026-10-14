@@ -1,0 +1,26 @@
+name: Audit signal outcomes
+
+# Read-only. For every closed live RL signal: whether it closed at its target, its stop, by an
+# early exit, or by expiry -- and a replay of the stored candles checking the recorded result
+# matches what price actually did. See scripts/audit_signal_outcomes.py.
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "How many days back to audit"
+        required: false
+        default: "60"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+      DAYS: ${{ inputs.days || '60' }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet pymongo==4.9.1
+      - name: Audit
+        run: python scripts/audit_signal_outcomes.py
