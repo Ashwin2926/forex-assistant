@@ -1,0 +1,52 @@
+name: Keep-fresh heartbeat
+
+# GitHub's `schedule` trigger is best-effort and repeatedly went silent for hours (e.g.
+# 2026-10-19: no keep-fresh run from 05:41 to 10:05 UTC, so no candles or signals), while
+# workflow_dispatch has always started immediately. This job stays running and dispatches
+# keep-fresh.yml at :03/:23/:43 past every hour (just after 1h/4h candles close), then hands
+# over to a fresh copy of itself before the 6-hour job limit. Its own schedule only restarts
+# it if the chain ever breaks; keep-fresh.yml keeps its schedule as a second backup.
+# Free on a public repo; on a private one this burns ~720 runner-minutes a day.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 */2 * * *"
+
+concurrency:
+  group: keep-fresh-heartbeat
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Dispatch keep-fresh at :03/:23/:43 for ~5.5 hours
+        run: |
+          dispatch() {
+            curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/actions/workflows/$1/dispatches" -d '{"ref":"master"}'
+          }
+          end=$(( $(date +%s) + 330 * 60 ))
+          while :; do
+            now=$(date +%s)
+            # seconds until the next :03, :23 or :43
+            k=$(( ((now / 60) % 60 - 3 + 60) % 20 )); sec=$(( now % 60 ))
+            wait=$(( (20 - k) * 60 - sec ))
+            [ $(( now + wait )) -ge $end ] && break
+            sleep "$wait"
+            if dispatch keep-fresh.yml; then echo "$(date -u +%H:%M) keep-fresh dispatched"
+            else echo "::warning::keep-fresh dispatch failed"; fi
+          done
+      - name: Hand over to a fresh heartbeat
+        if: always()
+        run: |
+          curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/keep-fresh-heartbeat.yml/dispatches" -d '{"ref":"master"}' \
+            && echo "next heartbeat queued" || echo "::warning::handover failed -- the 2-hourly schedule restarts it"

@@ -36,6 +36,11 @@ on:
     - cron: "11 0 * * *"    # + 1day candles, once daily at 00:11 UTC
   workflow_dispatch: {}
 
+# Heartbeat dispatches and the backup schedule can land close together -- queue, don't overlap.
+concurrency:
+  group: keep-fresh
+  cancel-in-progress: false
+
 jobs:
   ingest-and-score:
     runs-on: ubuntu-latest
