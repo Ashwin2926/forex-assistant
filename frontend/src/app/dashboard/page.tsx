@@ -52,15 +52,26 @@ function formatAge(minutes: number): string {
   return `${Math.round(minutes / 1440)}d`;
 }
 
-// A trade that has already covered most of the way to target (or is close to its stop) is no
-// longer the setup it was at entry -- flag it instead of presenting it as fresh.
-function entryVerdict(s: LiveOpenSignal): { label: string; tone: string } {
-  if (s.progress_r == null) return { label: "no price", tone: "text-zinc-400" };
-  const rr = Math.abs(s.target_price - s.entry_price) / Math.abs(s.entry_price - s.stop_price || 1);
-  if (s.progress_r <= -0.5) return { label: "near stop — skip", tone: "text-rose-600 dark:text-rose-400" };
-  if (s.progress_r >= rr * 0.5) return { label: "ran — skip", tone: "text-zinc-500" };
-  if (Math.abs(s.progress_r) <= 0.25) return { label: "at entry", tone: "text-emerald-600 dark:text-emerald-400" };
-  return { label: s.progress_r > 0 ? "moved in favour" : "slightly against", tone: "text-amber-600 dark:text-amber-400" };
+// Where price is now relative to the signal's entry, in trader terms. A trade that has
+// already covered a good part of the way to target (or is close to its stop) is no longer the
+// setup it was at entry -- the reward left is smaller but the stop is just as far away.
+const MISSED_AT_R = 0.3; // moved this many R toward target -> entry missed
+
+function pipsFromEntry(s: LiveOpenSignal): number | null {
+  if (s.current_price == null) return null;
+  const pip = s.pair.includes("JPY") ? 0.01 : 0.0001;
+  const sign = s.direction === "BUY" ? 1 : -1;
+  return Math.round((sign * (s.current_price - s.entry_price)) / pip);
+}
+
+function entryVerdict(s: LiveOpenSignal): { label: string; tone: string; skip: boolean; missed: boolean } {
+  if (s.progress_r == null) return { label: "no live price", tone: "text-zinc-400", skip: false, missed: false };
+  const p = s.progress_r;
+  if (p <= -0.5) return { label: "near stop — skip", tone: "text-rose-600 dark:text-rose-400", skip: true, missed: false };
+  if (p >= MISSED_AT_R) return { label: "ENTRY MISSED — skip", tone: "font-semibold text-rose-600 dark:text-rose-400", skip: true, missed: true };
+  if (p >= 0.15) return { label: "late — use limit at entry", tone: "text-amber-600 dark:text-amber-400", skip: false, missed: false };
+  if (p <= -0.15) return { label: "better than entry", tone: "text-emerald-600 dark:text-emerald-400", skip: false, missed: false };
+  return { label: "at entry — take it", tone: "text-emerald-600 dark:text-emerald-400", skip: false, missed: false };
 }
 
 export default function DashboardPage() {
@@ -115,8 +126,7 @@ export default function DashboardPage() {
 
   const riskUsd = balance * (riskPct / 100);
   const tradeable = data?.open.filter((s) => {
-    const v = entryVerdict(s).label;
-    return v !== "ran — skip" && v !== "near stop — skip";
+    return !entryVerdict(s).skip;
   }) ?? [];
 
   return (
@@ -156,7 +166,7 @@ export default function DashboardPage() {
         <>
           <section>
             <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-              Open signals <span className="font-normal text-zinc-500">· {tradeable.length} still near entry, {data.open.length} open</span>
+              Open signals <span className="font-normal text-zinc-500">· {tradeable.length} still enterable, {data.open.length - tradeable.length} missed or near stop</span>
             </h2>
             {data.open.length === 0 ? (
               <p className="mt-2 rounded-md bg-zinc-50 px-4 py-3 text-sm text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
@@ -187,13 +197,18 @@ export default function DashboardPage() {
                       const lots = lotSize(s.pair, s.entry_price, s.stop_price, riskUsd);
                       const shownRisk = lots >= MIN_LOT ? riskUsd : riskForLots(s.pair, s.entry_price, s.stop_price, MIN_LOT);
                       return (
-                        <tr key={`${s.source}-${s.signal_id}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                        <tr key={`${s.source}-${s.signal_id}`} className={`border-t border-zinc-100 dark:border-zinc-800 ${verdict.skip ? "opacity-50" : ""}`}>
                           <td className="px-3 py-2 font-mono">{s.pair} · {s.interval}</td>
                           <td className="px-3 py-2"><DirectionBadge direction={s.direction} /></td>
                           <td className="num px-3 py-2">{s.entry_price.toFixed(d)}</td>
                           <td className="num px-3 py-2">
                             {s.current_price?.toFixed(d) ?? "—"}
-                            <div className={`text-xs ${verdict.tone}`}>{verdict.label}</div>
+                            <div className={`text-xs ${verdict.tone}`}>
+                              {verdict.label}
+                              {pipsFromEntry(s) != null && pipsFromEntry(s) !== 0 && (
+                                <span className="text-zinc-500"> · {pipsFromEntry(s)! > 0 ? "+" : ""}{pipsFromEntry(s)} pips</span>
+                              )}
+                            </div>
                           </td>
                           <td className="num px-3 py-2">{s.target_price.toFixed(d)}</td>
                           <td className="num px-3 py-2">{s.stop_price.toFixed(d)}</td>
