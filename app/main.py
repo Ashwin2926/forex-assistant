@@ -1746,6 +1746,14 @@ def _live_signal_row(s: dict, source: str, current_price: Optional[float], now: 
     }
 
 
+def _live_price(latest_close: dict, pair: str, interval: str) -> Optional[float]:
+    """Freshest stored close for the pair -- the 5min one, not the signal's own interval: a
+    1day signal's latest 1day candle is the last finished day, so its close is stale for "now"
+    (it showed every 1day signal as still exactly "at entry")."""
+    price = latest_close.get((pair, "5min"), (None,))[0]
+    return price if price is not None else latest_close.get((pair, interval), (None,))[0]
+
+
 @app.get("/dashboard/live")
 async def get_live_dashboard(recent_hours: int = 24):
     """
@@ -1804,9 +1812,9 @@ async def get_live_dashboard(recent_hours: int = 24):
 
     open_rows = []
     async for s in rl_signals_collection.find({"source": "live", "status": "pending"}):
-        open_rows.append(_live_signal_row(s, "rl", latest_close.get((s["pair"], s["interval"]), (None,))[0], now))
+        open_rows.append(_live_signal_row(s, "rl", _live_price(latest_close, s["pair"], s["interval"]), now))
     async for s in consensus_signals_collection.find({"source": "live", "status": "pending"}):
-        open_rows.append(_live_signal_row(s, "consensus", latest_close.get((s["pair"], s["interval"]), (None,))[0], now))
+        open_rows.append(_live_signal_row(s, "consensus", _live_price(latest_close, s["pair"], s["interval"]), now))
     open_rows.sort(key=lambda r: r["timestamp"], reverse=True)
 
     since = now - timedelta(hours=recent_hours)
