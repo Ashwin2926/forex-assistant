@@ -61,7 +61,7 @@ from app.models.schemas import (
     LoginRequest, RuleConfig, Signal, RLSignal, RLTrainAllJob, RLTrainAllCell, RunAllFlowsJob, RLInsightFinding,
     PPOPolicy, MLTrainResult, BacktestRebuildJob, CandleCatchupJob, CandleCatchupCell,
 )
-from app.services.data_fetcher import fetch_and_store, backfill_batch, catch_up_batch, interval_due
+from app.services.data_fetcher import fetch_and_store, backfill_batch, catch_up_batch, interval_due, INTERVAL_MINUTES
 from app.services.candle_archive import load_full_candle_history, load_archived_candles
 from app.services.daily_candles import daily_from_hourly
 from app.services.daily_plan import build_daily_plan
@@ -2172,9 +2172,15 @@ async def _create_rl_signal(interval: str, pair: str, balance: float = DEFAULT_S
         return {"signal": None, "q_values": None, "excluded_reason": early_excluded}
 
     config = default_config_for(rl_config_profile(interval), pair)
-    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(500)
-    docs = await cursor.to_list(length=500)
+    cursor = candles_collection.find({"pair": pair, "interval": interval}).sort("timestamp", -1).limit(501)
+    docs = await cursor.to_list(length=501)
     docs.reverse()
+    # fetch_and_store also stores the still-forming bar; the policy was trained on finished
+    # bars only, so decide on the last CLOSED one (keep-fresh runs just after each 1h/4h close).
+    if docs and docs[-1]["timestamp"] + timedelta(minutes=INTERVAL_MINUTES.get(interval, 0)) > datetime.utcnow():
+        docs.pop()
+    else:
+        docs = docs[-500:]
 
     min_needed = max(config.ema_slow, MIN_WARMUP_BARS)
     if len(docs) < min_needed:

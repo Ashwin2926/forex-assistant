@@ -81,9 +81,10 @@ def memory_summary(target_state: list[float], candidates: list[dict], k: int = D
     one. expired_pct is still reported separately so that distinction stays visible.
     """
     nearest = nearest_cases(target_state, candidates, k)
+    pool_size = sum(1 for c in candidates if c.get("state") and len(c["state"]) == len(target_state))
     if not nearest:
         return {
-            "cases_found": 0, "hit_rate_pct": None, "avg_pct_move": None,
+            "cases_found": 0, "pool_size": pool_size, "hit_rate_pct": None, "avg_pct_move": None,
             "expired_pct": None, "avg_distance": None, "nearest": [],
         }
 
@@ -95,6 +96,7 @@ def memory_summary(target_state: list[float], candidates: list[dict], k: int = D
 
     return {
         "cases_found": len(nearest),
+        "pool_size": pool_size,
         "hit_rate_pct": round(hits / decided * 100, 1) if decided else None,
         "avg_pct_move": round(sum(pct_moves) / len(pct_moves), 4) if pct_moves else None,
         "expired_pct": round(expired / len(nearest) * 100, 1),
@@ -133,6 +135,7 @@ def explain_divergence(
 # not independently tuned -- same caveat as every other unvalidated constant in this project;
 # revisit once enough gated/ungated live signals exist to compare.
 MIN_CASES_FOR_GATING = 5
+MIN_POOL_FOR_GATING = 50  # same-direction resolved cases needed before the gate acts at all
 # Below this historical hit rate among similar past cases, memory says "don't take this trade
 # at all" -- roughly "clearly losing," not just "below breakeven."
 BLOCK_HIT_RATE_FLOOR = 25.0
@@ -178,6 +181,11 @@ def memory_gate(memory: dict, size_tier: str) -> tuple[str, Optional[str]]:
     cases_found = memory.get("cases_found", 0)
     hit_rate_pct = memory.get("hit_rate_pct")
     if cases_found < MIN_CASES_FOR_GATING or hit_rate_pct is None:
+        return size_tier, None
+    # "Nearest" means nothing in a tiny pool: on 2026-10-19 the whole same-direction pool was
+    # 8 old BUY cases (1 hit), so every BUY on every pair/interval matched those same 8 and
+    # was blocked -- the system could effectively only SELL.
+    if memory.get("pool_size", 0) < MIN_POOL_FOR_GATING:
         return size_tier, None
 
     policy_hit_rate_pct = memory.get("policy_hit_rate_pct")
