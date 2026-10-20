@@ -1,3 +1,4 @@
+import math
 from datetime import timedelta
 from typing import Optional
 import pandas as pd
@@ -210,8 +211,33 @@ async def resolve_rl_signal_real_outcome(
         .limit(window)
     )
     future_docs = await future_cursor.to_list(length=window)
+
+    hourly_seen = False
+    if doc["interval"] in HOURLY_RESOLVED_INTERVALS:
+        # Stop/target touches are found on 1h candles (including the still-forming one), so a
+        # 4h/1day trade closes within the hour instead of when its own bar finishes -- a 1day
+        # trade used to sit "open" for up to a day after hitting its stop. Same trade rules:
+        # first touch wins, a candle touching both counts as the stop, and the window still
+        # ends after `window` of the signal's own bars.
+        bar = timedelta(minutes=INTERVAL_MINUTES[doc["interval"]])
+        entry_time = doc["timestamp"] + bar  # decided at the signal bar's close
+        span = {"$gte": entry_time}
+        if len(future_docs) >= window:
+            span["$lt"] = future_docs[window - 1]["timestamp"] + bar
+        hourly = await candles_collection.find(
+            {"pair": doc["pair"], "interval": "1h", "timestamp": span},
+        ).sort("timestamp", 1).to_list(length=None)
+        if hourly:
+            hourly_seen = True
+            status, outcome_price, outcome_timestamp, _ = label_outcome(
+                pd.DataFrame(hourly), doc["direction"], doc["target_price"], doc["stop_price"], len(hourly) + 1,
+            )
+            if status in ("hit", "miss"):
+                bars = math.ceil((outcome_timestamp + timedelta(hours=1) - entry_time) / bar)
+                return _rl_outcome_fields(doc, status, outcome_price, outcome_timestamp, max(1, bars)), True
+
     if not future_docs:
-        return None, False
+        return None, hourly_seen
 
     future_df = pd.DataFrame(future_docs)
     status, outcome_price, outcome_timestamp, candles_to_outcome = label_outcome(
@@ -219,7 +245,15 @@ async def resolve_rl_signal_real_outcome(
     )
     if status == "pending":
         return None, True
+    return _rl_outcome_fields(doc, status, outcome_price, outcome_timestamp, candles_to_outcome), True
 
+
+# Signal timeframes whose open trades are checked against 1h candles (see
+# resolve_rl_signal_real_outcome). 5min/15min/1h already resolve on candles at least as fine.
+HOURLY_RESOLVED_INTERVALS = {"4h", "1day"}
+
+
+def _rl_outcome_fields(doc: dict, status: str, outcome_price: float, outcome_timestamp, candles_to_outcome) -> dict:
     pct_move = ((outcome_price - doc["entry_price"]) / doc["entry_price"]) * 100
     if doc["direction"] == "SELL":
         pct_move = -pct_move
@@ -231,7 +265,7 @@ async def resolve_rl_signal_real_outcome(
         "outcome_timestamp": outcome_timestamp,
         "outcome_pct_move": round(pct_move, 5),
         "candles_to_outcome": candles_to_outcome,
-    }, True
+    }
 
 
 async def score_pending_rl_signals(max_lookforward: Optional[int] = None) -> dict:
