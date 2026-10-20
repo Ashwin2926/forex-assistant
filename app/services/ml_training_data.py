@@ -222,7 +222,7 @@ async def load_rl_trade_rows(fresh: bool = False) -> list[dict]:
     return list(rows)
 
 
-async def get_ml_reference_signals(signals_collection, fresh: bool = False) -> list[dict]:
+async def get_ml_reference_signals(signals_collection, fresh: bool = False, include_rl: bool = False) -> list[dict]:
     """
     Live resolved signals (Mongo) UNION archived backtest signals (Parquet) UNION resolved RL
     trades (see load_rl_trade_rows) -- the shared data
@@ -237,4 +237,11 @@ async def get_ml_reference_signals(signals_collection, fresh: bool = False) -> l
     # is_current_smc_signal's own docstring for why a stale-shaped record can't just be
     # included as extra data.
     live_signals = [s for s in live_signals if is_current_smc_signal(s)]
-    return live_signals + load_backtest_signals_archive() + await load_rl_trade_rows(fresh)
+    rows = live_signals + load_backtest_signals_archive()
+    # RL trades only for POST /ml/train (evaluation) for now: feeding them into the live
+    # /rl/signal path on 2026-10-20 coincided with every active-combo call 502/524ing, and the
+    # RL policies were trained against the consensus-only classifier anyway. Switch the live
+    # path (and train_rl.py) over together only once /ml/train's calibration earns it.
+    if include_rl:
+        rows += await load_rl_trade_rows(fresh)
+    return rows

@@ -852,7 +852,7 @@ async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
-    signals = await get_ml_reference_signals(consensus_signals_collection, fresh=force)
+    signals = await get_ml_reference_signals(consensus_signals_collection, fresh=force, include_rl=True)
 
     if not force:
         last_run = await ml_runs_collection.find_one(sort=[("created_at", -1)])
