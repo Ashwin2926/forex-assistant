@@ -873,7 +873,9 @@ async def train_ml_model(train_frac: float = 0.7, force: bool = False):
             return result
 
     try:
-        result = train_hit_classifier(signals, train_frac=train_frac)
+        # Off the event loop: with RL trades in the reference set this is thousands of rows,
+        # and blocking the loop for ~30s got the backend restarted mid-request (2026-10-20).
+        result = await _run_native(train_hit_classifier, signals, train_frac)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

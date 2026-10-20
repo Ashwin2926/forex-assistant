@@ -138,6 +138,7 @@ _archive_cache: dict = {"key": None, "rows": []}
 # market state since this change, saved to ML_RL_TRADES_COLLECTION). Their state starts with the same 5 strategy votes (signed,
 # BUY-positive) and atr_pct the ML features are built from (rl_engine.RL_MARKET_FEATURE_NAMES).
 MAX_RL_TRADES = 5000  # same reasoning as MAX_BACKTEST_SIGNALS; sampled deterministically
+RL_TRADES_LOAD_CAP = 50_000  # most recent; select_rl_rows then samples MAX_RL_TRADES of them
 RL_ROWS_TTL_SECONDS = 1800  # the set only grows nightly; don't reload it on every signal call
 RL_TRADE_QUERY = {"status": {"$in": list(RESOLVED_STATUSES)}, f"state.{len(STRATEGY_NAMES)}": {"$exists": True}}
 RL_TRADE_PROJECTION = {"_id": 0, "pair": 1, "interval": 1, "timestamp": 1, "direction": 1, "status": 1, "state": 1}
@@ -203,12 +204,14 @@ async def load_rl_trade_rows(fresh: bool = False) -> list[dict]:
     if not fresh and _rl_rows_cache["at"] is not None and time.monotonic() - _rl_rows_cache["at"] < RL_ROWS_TTL_SECONDS:
         return list(_rl_rows_cache["rows"])
     from app.core.database import db, rl_signals_collection
-    # Sampled and trimmed IN Mongo: 2026-10-20 the first load pulled every saved RL trade with
-    # its full state into the web process and the backend was killed mid-request (502s), most
-    # likely out of memory. Only the votes + atr_pct are needed, and only MAX_RL_TRADES rows.
+    # Trimmed IN Mongo to the votes + atr_pct actually used, and capped -- keeps the web
+    # process's memory flat as the saved trades grow.
+    # No $sample: select_rl_rows' fixed-seed sample keeps the cached ML fit stable between
+    # reloads (a random draw would force a refit inside a signal request every 30 min).
     pipeline = [
         {"$match": RL_TRADE_QUERY},
-        {"$sample": {"size": MAX_RL_TRADES}},
+        {"$sort": {"timestamp": -1}},
+        {"$limit": RL_TRADES_LOAD_CAP},
         {"$project": {**{k: 1 for k in RL_TRADE_PROJECTION if k not in ("_id", "state")}, "_id": 0,
                       "state": {"$slice": ["$state", len(STRATEGY_NAMES) + 1]}}},
     ]

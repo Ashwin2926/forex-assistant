@@ -32,7 +32,10 @@ LEARNING_RATE = 0.1
 
 
 def _to_xy(signals: list[dict]) -> tuple[list[list[float]], list[int]]:
-    X = [[extract_features(s)[name] for name in FEATURE_NAMES] for s in signals]
+    X = []
+    for s in signals:
+        features = extract_features(s)  # once per signal, not once per feature
+        X.append([features[name] for name in FEATURE_NAMES])
     # "hit" -> 1; "miss" and "expired" both -> 0 -- both mean the trade didn't actually pay
     # off, which is the real distinction this classifier needs to learn, not just "did it
     # touch the target specifically."
