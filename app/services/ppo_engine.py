@@ -323,6 +323,9 @@ def _evaluate_policy(
             candles_to_outcome=candles_to_outcome,
             size_tier=tier, risk_fraction=rl.RISK_FRACTION_BY_TIER[tier], balance_at_signal=round(balance_before, 2),
             position_size_units=round(units, 2),
+            # Market state at entry (votes, atr_pct, raw_*, ml scores): lets the ML hit
+            # classifier learn from RL trades too (ml_training_data.rl_trade_to_ml_row).
+            state=[round(float(x), 5) for x in market_states[entry_i]],
         ))
         entry_i = None
 

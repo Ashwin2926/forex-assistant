@@ -84,6 +84,8 @@ class Signal(BaseModel):
     risk_fraction: Optional[float] = None
     balance_at_signal: Optional[float] = None
     position_size_units: Optional[float] = None
+    # RL trade log only: the market state at entry (rl_engine.RL_MARKET_FEATURE_NAMES order).
+    state: list[float] = []
 
     # Set by create_signal's ML quality gate (main.py) -- the calibrated hit-probability
     # (app/services/ml_model.py) for whatever direction the rule engine picked, populated

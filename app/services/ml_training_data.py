@@ -33,12 +33,15 @@ too, same precedent as candle_archive.load_archived_candles.
 """
 import json
 import random
+import time
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
 from app.services.case_memory import RESOLVED_STATUSES
 from app.services.ml_features import KNOWN_PAIRS, KNOWN_INTERVALS, is_current_smc_signal
+from app.services.strategies import STRATEGY_NAMES
 
 ARCHIVE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "backtest_signals_archive"
 
@@ -128,9 +131,70 @@ def load_backtest_signals_archive() -> list[dict]:
 _archive_cache: dict = {"key": None, "rows": []}
 
 
+# RL trades as ML training rows (added 2026-10-20). Until then the classifier only learned
+# from resolved consensus signals, and none had resolved since 2026-09-26 -- every "retrain"
+# refit the same 632 archived rows. RL trades resolve all the time: live RLSignals, plus the
+# test-slice trades every nightly retrain logs to backtest_signals (each carrying its entry
+# market state since this change). Their state starts with the same 5 strategy votes (signed,
+# BUY-positive) and atr_pct the ML features are built from (rl_engine.RL_MARKET_FEATURE_NAMES).
+MAX_RL_TRADES = 5000  # same reasoning as MAX_BACKTEST_SIGNALS; sampled deterministically
+RL_ROWS_TTL_SECONDS = 1800  # the set only grows nightly; don't reload it on every signal call
+RL_TRADE_QUERY = {"status": {"$in": list(RESOLVED_STATUSES)}, f"state.{len(STRATEGY_NAMES)}": {"$exists": True}}
+RL_TRADE_PROJECTION = {"_id": 0, "pair": 1, "interval": 1, "timestamp": 1, "direction": 1, "status": 1, "state": 1}
+
+
+def rl_trade_to_ml_row(doc: dict) -> Optional[dict]:
+    """A resolved RL trade (live RLSignal or logged backtest trade) in the signal-like shape
+    extract_features() reads: one synthetic strategy_call per vote, atr_pct, and the same
+    weighted agreement confidence rl_engine.compute_ml_scores scores hypotheticals with
+    (consensus.direction_confidence; all strategy weights are 1.0)."""
+    state = doc.get("state") or []
+    n = len(STRATEGY_NAMES)
+    direction = doc.get("direction")
+    if len(state) <= n or direction not in ("BUY", "SELL"):
+        return None
+    calls, agreeing = [], 0.0
+    for name, vote in zip(STRATEGY_NAMES, state[:n]):
+        vote = float(vote)
+        call_direction = "BUY" if vote > 0 else "SELL" if vote < 0 else "HOLD"
+        calls.append({"strategy": name, "direction": call_direction, "strength": abs(vote)})
+        if call_direction == direction:
+            agreeing += abs(vote)
+    return {
+        "pair": doc.get("pair"), "interval": doc.get("interval"), "timestamp": doc.get("timestamp"),
+        "direction": direction, "status": doc.get("status"), "strategy_calls": calls,
+        "confidence": round(min(agreeing / n, 1.0) * 100, 1), "atr_pct": float(state[n]), "source": "rl",
+    }
+
+
+def select_rl_rows(docs: list[dict]) -> list[dict]:
+    rows = [r for r in (rl_trade_to_ml_row(d) for d in docs) if r and r["timestamp"] is not None]
+    rows.sort(key=lambda r: (r["timestamp"], r["pair"] or "", r["interval"] or "", r["direction"]))
+    if len(rows) > MAX_RL_TRADES:
+        # Fixed seed: the same stored trades always give the same sample, so the cached ML fit
+        # (ml_model._cached_fit) isn't invalidated by a fresh random draw on every reload.
+        rows = sorted(random.Random(0).sample(rows, MAX_RL_TRADES), key=lambda r: r["timestamp"])
+    return rows
+
+
+_rl_rows_cache: dict = {"at": None, "rows": []}
+
+
+async def load_rl_trade_rows() -> list[dict]:
+    if _rl_rows_cache["at"] is not None and time.monotonic() - _rl_rows_cache["at"] < RL_ROWS_TTL_SECONDS:
+        return list(_rl_rows_cache["rows"])
+    from app.core.database import backtest_signals_collection, rl_signals_collection
+    docs = await rl_signals_collection.find(RL_TRADE_QUERY, RL_TRADE_PROJECTION).to_list(length=None)
+    docs += await backtest_signals_collection.find(RL_TRADE_QUERY, RL_TRADE_PROJECTION).to_list(length=None)
+    rows = select_rl_rows(docs)
+    _rl_rows_cache["at"], _rl_rows_cache["rows"] = time.monotonic(), rows
+    return list(rows)
+
+
 async def get_ml_reference_signals(signals_collection) -> list[dict]:
     """
-    Live resolved signals (Mongo) UNION archived backtest signals (Parquet) -- the shared data
+    Live resolved signals (Mongo) UNION archived backtest signals (Parquet) UNION resolved RL
+    trades (see load_rl_trade_rows) -- the shared data
     source for every ML-classifier call site (create_consensus_signal's quality gate,
     POST /ml/train, POST /ml/predict, and both RL training's
     ml_reference_signals/frozen_ml_snapshot).
@@ -142,4 +206,4 @@ async def get_ml_reference_signals(signals_collection) -> list[dict]:
     # is_current_smc_signal's own docstring for why a stale-shaped record can't just be
     # included as extra data.
     live_signals = [s for s in live_signals if is_current_smc_signal(s)]
-    return live_signals + load_backtest_signals_archive()
+    return live_signals + load_backtest_signals_archive() + await load_rl_trade_rows()

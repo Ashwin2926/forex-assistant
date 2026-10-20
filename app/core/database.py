@@ -67,6 +67,15 @@ async def init_indexes():
     await signals_collection.create_index([("pair", 1), ("timestamp", -1)])
     await signals_collection.create_index([("status", 1)])
     await backtest_signals_collection.create_index([("run_id", 1), ("timestamp", 1)])
+    try:
+        # Only RL trades logged with their entry state (ml_training_data.RL_TRADE_QUERY) --
+        # keeps that lookup off a full scan of every archived backtest signal.
+        await backtest_signals_collection.create_index(
+            [("timestamp", 1)], name="rl_trades_with_state",
+            partialFilterExpression={"state.5": {"$exists": True}},
+        )
+    except Exception as e:  # an index problem must never stop the app from starting
+        print(f"rl_trades_with_state index not created: {e}", flush=True)
     await backtest_runs_collection.create_index([("run_id", 1)], unique=True)
     await backtest_runs_collection.create_index([("pair", 1), ("interval", 1), ("profile", 1), ("created_at", -1)])
     await paper_trades_collection.create_index([("status", 1)])
