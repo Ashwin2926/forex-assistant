@@ -203,8 +203,17 @@ async def load_rl_trade_rows(fresh: bool = False) -> list[dict]:
     if not fresh and _rl_rows_cache["at"] is not None and time.monotonic() - _rl_rows_cache["at"] < RL_ROWS_TTL_SECONDS:
         return list(_rl_rows_cache["rows"])
     from app.core.database import db, rl_signals_collection
-    docs = await rl_signals_collection.find(RL_TRADE_QUERY, RL_TRADE_PROJECTION).to_list(length=None)
-    docs += await db[ML_RL_TRADES_COLLECTION].find(RL_TRADE_QUERY, RL_TRADE_PROJECTION).to_list(length=None)
+    # Sampled and trimmed IN Mongo: 2026-10-20 the first load pulled every saved RL trade with
+    # its full state into the web process and the backend was killed mid-request (502s), most
+    # likely out of memory. Only the votes + atr_pct are needed, and only MAX_RL_TRADES rows.
+    pipeline = [
+        {"$match": RL_TRADE_QUERY},
+        {"$sample": {"size": MAX_RL_TRADES}},
+        {"$project": {**{k: 1 for k in RL_TRADE_PROJECTION if k not in ("_id", "state")}, "_id": 0,
+                      "state": {"$slice": ["$state", len(STRATEGY_NAMES) + 1]}}},
+    ]
+    docs = await rl_signals_collection.aggregate(pipeline).to_list(length=None)
+    docs += await db[ML_RL_TRADES_COLLECTION].aggregate(pipeline).to_list(length=None)
     rows = select_rl_rows(docs)
     _rl_rows_cache["at"], _rl_rows_cache["rows"] = time.monotonic(), rows
     return list(rows)
