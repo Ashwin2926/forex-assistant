@@ -42,6 +42,7 @@ from app.services.candle_archive import load_full_candle_history_sync
 from app.services.case_memory import RESOLVED_STATUSES
 from app.services.ml_training_data import (
     load_backtest_signals_archive, select_rl_rows, RL_TRADE_QUERY, RL_TRADE_PROJECTION,
+    ML_RL_TRADES_COLLECTION, ml_rl_trade_upserts,
 )
 from app.services.ml_features import is_current_smc_signal
 from app.services.ppo_engine import train_ppo_policy
@@ -102,7 +103,7 @@ def get_ml_reference_signals_sync(db) -> list[dict]:
     live_signals = list(db["consensus_signals"].find({"source": "live", "status": {"$in": list(RESOLVED_STATUSES)}}))
     live_signals = [s for s in live_signals if is_current_smc_signal(s)]
     rl_docs = list(db["rl_signals"].find(RL_TRADE_QUERY, RL_TRADE_PROJECTION))
-    rl_docs += list(db["backtest_signals"].find(RL_TRADE_QUERY, RL_TRADE_PROJECTION))
+    rl_docs += list(db[ML_RL_TRADES_COLLECTION].find(RL_TRADE_QUERY, RL_TRADE_PROJECTION))
     return live_signals + load_backtest_signals_archive() + select_rl_rows(rl_docs)
 
 
@@ -139,6 +140,9 @@ def run_one(db, pair: str, interval: str, total_timesteps: int, train_frac: floa
         warm_start_policy_id=warm_start_policy_id, warm_start_model_bytes=warm_start_model_bytes,
     )
 
+    ml_ops = ml_rl_trade_upserts(trade_signals)
+    if ml_ops:
+        db[ML_RL_TRADES_COLLECTION].bulk_write(ml_ops, ordered=False)
     kept = should_keep_new_policy(eval_run.total_return_pct, baseline_return_pct)
     if kept:
         if trade_signals:

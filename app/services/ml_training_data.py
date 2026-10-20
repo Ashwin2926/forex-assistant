@@ -135,7 +135,7 @@ _archive_cache: dict = {"key": None, "rows": []}
 # from resolved consensus signals, and none had resolved since 2026-09-26 -- every "retrain"
 # refit the same 632 archived rows. RL trades resolve all the time: live RLSignals, plus the
 # test-slice trades every nightly retrain logs to backtest_signals (each carrying its entry
-# market state since this change). Their state starts with the same 5 strategy votes (signed,
+# market state since this change, saved to ML_RL_TRADES_COLLECTION). Their state starts with the same 5 strategy votes (signed,
 # BUY-positive) and atr_pct the ML features are built from (rl_engine.RL_MARKET_FEATURE_NAMES).
 MAX_RL_TRADES = 5000  # same reasoning as MAX_BACKTEST_SIGNALS; sampled deterministically
 RL_ROWS_TTL_SECONDS = 1800  # the set only grows nightly; don't reload it on every signal call
@@ -177,21 +177,40 @@ def select_rl_rows(docs: list[dict]) -> list[dict]:
     return rows
 
 
+ML_RL_TRADES_COLLECTION = "ml_rl_trades"
+
+
+def ml_rl_trade_upserts(trade_signals) -> list:
+    """pymongo UpdateOne ops saving every RL eval trade (kept policy or not) to the ML's own
+    collection -- backtest_signals only keeps the CURRENT policies' trade logs (prune_rl_history),
+    so most trades would never reach the classifier. Keyed per bar+direction: nightly test
+    slices overlap, and the same bar/direction resolves the same way under the same geometry."""
+    from pymongo import UpdateOne
+    ops = []
+    for s in trade_signals:
+        d = s.model_dump() if hasattr(s, "model_dump") else s
+        if not d.get("state") or d.get("status") not in RESOLVED_STATUSES:
+            continue
+        key = {"pair": d["pair"], "interval": d["interval"], "timestamp": d["timestamp"], "direction": d["direction"]}
+        ops.append(UpdateOne(key, {"$set": {"status": d["status"], "state": d["state"]}}, upsert=True))
+    return ops
+
+
 _rl_rows_cache: dict = {"at": None, "rows": []}
 
 
-async def load_rl_trade_rows() -> list[dict]:
-    if _rl_rows_cache["at"] is not None and time.monotonic() - _rl_rows_cache["at"] < RL_ROWS_TTL_SECONDS:
+async def load_rl_trade_rows(fresh: bool = False) -> list[dict]:
+    if not fresh and _rl_rows_cache["at"] is not None and time.monotonic() - _rl_rows_cache["at"] < RL_ROWS_TTL_SECONDS:
         return list(_rl_rows_cache["rows"])
-    from app.core.database import backtest_signals_collection, rl_signals_collection
+    from app.core.database import db, rl_signals_collection
     docs = await rl_signals_collection.find(RL_TRADE_QUERY, RL_TRADE_PROJECTION).to_list(length=None)
-    docs += await backtest_signals_collection.find(RL_TRADE_QUERY, RL_TRADE_PROJECTION).to_list(length=None)
+    docs += await db[ML_RL_TRADES_COLLECTION].find(RL_TRADE_QUERY, RL_TRADE_PROJECTION).to_list(length=None)
     rows = select_rl_rows(docs)
     _rl_rows_cache["at"], _rl_rows_cache["rows"] = time.monotonic(), rows
     return list(rows)
 
 
-async def get_ml_reference_signals(signals_collection) -> list[dict]:
+async def get_ml_reference_signals(signals_collection, fresh: bool = False) -> list[dict]:
     """
     Live resolved signals (Mongo) UNION archived backtest signals (Parquet) UNION resolved RL
     trades (see load_rl_trade_rows) -- the shared data
@@ -206,4 +225,4 @@ async def get_ml_reference_signals(signals_collection) -> list[dict]:
     # is_current_smc_signal's own docstring for why a stale-shaped record can't just be
     # included as extra data.
     live_signals = [s for s in live_signals if is_current_smc_signal(s)]
-    return live_signals + load_backtest_signals_archive() + await load_rl_trade_rows()
+    return live_signals + load_backtest_signals_archive() + await load_rl_trade_rows(fresh)

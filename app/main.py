@@ -73,7 +73,7 @@ from app.services.strategies import STRATEGIES
 from app.services.consensus import check_consensus, direction_confidence
 from app.services.ml_features import extract_features, signal_like_features
 from app.services.ml_model import train_hit_classifier, predict_hit_probability
-from app.services.ml_training_data import get_ml_reference_signals
+from app.services.ml_training_data import get_ml_reference_signals, ml_rl_trade_upserts, ML_RL_TRADES_COLLECTION
 from app.services.rl_engine import (
     compute_strategy_vote_states, rl_config_profile, full_rl_state,
     position_size_units, rl_atr_mults, MIN_WARMUP_BARS, DEFAULT_STARTING_BALANCE, STATE_WINDOW_BARS,
@@ -852,7 +852,7 @@ async def train_ml_model(train_frac: float = 0.7, force: bool = False):
     if not 0 < train_frac < 1:
         raise HTTPException(status_code=400, detail="train_frac must be between 0 and 1 (exclusive).")
 
-    signals = await get_ml_reference_signals(consensus_signals_collection)
+    signals = await get_ml_reference_signals(consensus_signals_collection, fresh=force)
 
     if not force:
         last_run = await ml_runs_collection.find_one(sort=[("created_at", -1)])
@@ -1098,6 +1098,9 @@ async def _run_rl_training(
         warm_start_policy_id=warm_start_policy_id, warm_start_model_bytes=warm_start_model_bytes,
     )
 
+    ml_ops = ml_rl_trade_upserts(trade_signals)
+    if ml_ops:
+        await db[ML_RL_TRADES_COLLECTION].bulk_write(ml_ops, ordered=False)
     kept = should_keep_new_policy(eval_run.total_return_pct, baseline_return_pct)
     if kept:
         # Individual test-slice trades reuse backtest_signals_collection (same as
